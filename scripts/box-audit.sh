@@ -32,6 +32,42 @@ TIMER_DRIFT_SECS=104400       # 26h — flag if apt-daily.timer hasn't fired
 CMD_TIMEOUT=10
 T="/usr/bin/timeout --preserve-status $CMD_TIMEOUT"
 
+# --- File-integrity check (Lynis FINT-43xx analogue) ---------------------
+# Daily-delta check on a curated "crown jewels" list: hashes are stored
+# in a baseline JSON on first run, and any deviation on subsequent runs
+# is reported as a finding. Catches tampering with /etc/passwd, sudoers,
+# sshd_config, cron drop-ins, and authorized_keys — the files an attacker
+# touches first when establishing persistence.
+#
+# Files that don't exist (e.g. /etc/hosts.allow) are skipped silently.
+# Directories (e.g. /etc/cron.d/) are hashed by concatenating sorted
+# sha256 of all their regular files, so additions and removals both
+# surface.
+#
+# Baseline path is under /var/lib so systemd-tmpfiles doesn't sweep it.
+# The script runs as root, so /var/lib/box-audit/ is created with mode
+# 0755 on first run if it doesn't already exist.
+INTEGRITY_BASELINE_DIR="/var/lib/box-audit"
+INTEGRITY_BASELINE_FILE="$INTEGRITY_BASELINE_DIR/integrity-baseline.json"
+INTEGRITY_TARGETS=(
+    "/etc/passwd"
+    "/etc/shadow"
+    "/etc/group"
+    "/etc/gshadow"
+    "/etc/sudoers"
+    "/etc/sudoers.d"
+    "/etc/ssh/sshd_config"
+    "/etc/cron.d"
+    "/etc/cron.daily"
+    "/etc/cron.hourly"
+    "/etc/cron.weekly"
+    "/etc/cron.monthly"
+    "/etc/hosts"
+    "/etc/hosts.allow"
+    "/etc/hosts.deny"
+    "/root/.ssh/authorized_keys"
+)
+
 # --- CLI flags -----------------------------------------------------------
 # --json : emit machine-readable JSON to stdout (one object with findings[])
 #          instead of the human-readable Telegram-formatted text. Use when
@@ -565,17 +601,140 @@ report_maintenance() {
     echo "$out"
 }
 
+# --- File-integrity baseline -----------------------------------------------
+# Compute a sha256 for a single path. Files: direct sha256sum. Dirs:
+# sha256 of sorted sha256sums of regular files inside. Missing: empty
+# string (caller treats as "skip silently").
+#
+# Args: $1 = path
+# Echoes: "<sha256>" on stdout, exits 0 even on missing files (caller
+# checks emptiness).
+integrity_hash_path() {
+    local p="$1"
+    if [[ -f "$p" ]]; then
+        /usr/bin/sha256sum "$p" 2>/dev/null | /usr/bin/awk '{print $1}'
+    elif [[ -d "$p" ]]; then
+        # Concatenated sha256 of sorted per-file sha256sums. find -type f
+        # catches regular files only; -print0 + sort -z keeps paths with
+        # spaces correct.
+        /usr/bin/find "$p" -type f -print0 2>/dev/null \
+            | /usr/bin/sort -z \
+            | /usr/bin/xargs -0 /usr/bin/sha256sum 2>/dev/null \
+            | /usr/bin/sha256sum \
+            | /usr/bin/awk '{print $1}'
+    fi
+}
+
+# Build the current integrity snapshot as a JSON object printed to stdout.
+# Each key is the path; value is sha256 hex. Missing paths are omitted
+# (so the baseline tracks only what exists today).
+integrity_snapshot() {
+    {
+        /usr/bin/printf '{'
+        local first=1 path hash
+        for path in "${INTEGRITY_TARGETS[@]}"; do
+            hash=$(integrity_hash_path "$path")
+            [[ -z "$hash" ]] && continue
+            if [[ $first -eq 1 ]]; then first=0; else /usr/bin/printf ','; fi
+            /usr/bin/printf '"%s":"%s"' "$path" "$hash"
+        done
+        /usr/bin/printf '}'
+    }
+}
+
+# Compare current snapshot against the baseline on disk and emit findings
+# for any added, removed, or changed paths. On first run (no baseline),
+# write the current snapshot as the baseline and emit nothing — the user
+# shouldn't see "all crown jewels changed" on day one.
+report_integrity() {
+    local out=""
+
+    if [[ ! -d "$INTEGRITY_BASELINE_DIR" ]]; then
+        /usr/bin/mkdir -p "$INTEGRITY_BASELINE_DIR" 2>/dev/null || {
+            flag_degraded "could not create $INTEGRITY_BASELINE_DIR — integrity check skipped"
+            echo ""
+            return
+        }
+        /usr/bin/chmod 0755 "$INTEGRITY_BASELINE_DIR"
+    fi
+
+    local current
+    current=$(integrity_snapshot)
+
+    if [[ ! -f "$INTEGRITY_BASELINE_FILE" ]]; then
+        # First run — persist and stay silent.
+        /usr/bin/printf '%s' "$current" > "$INTEGRITY_BASELINE_FILE" 2>/dev/null \
+            || flag_degraded "could not write integrity baseline"
+        echo ""
+        return
+    fi
+
+    # Diff current against baseline. Pass the baseline path through the
+    # INTEGRITY_BASELINE_FILE env var so we don't have to escape it
+    # through multiple quoting layers. Python reads the snapshot from
+    # stdin (the pipe) and reads the baseline from disk. Note: we use
+    # python3 -c here, not <<HEREDOC, because a heredoc inside $(...)
+    # would consume stdin and shadow the printf pipe — this is the bug
+    # the previous version hit.
+    local diff
+    diff=$(INTEGRITY_BASELINE_FILE="$INTEGRITY_BASELINE_FILE" \
+        /usr/bin/printf '%s' "$current" \
+        | INTEGRITY_BASELINE_FILE="$INTEGRITY_BASELINE_FILE" /usr/bin/python3 -c '
+import sys, json, os
+cur = json.load(sys.stdin)
+try:
+    with open(os.environ["INTEGRITY_BASELINE_FILE"]) as f:
+        base = json.load(f)
+except Exception:
+    base = {}
+changes = []
+all_paths = set(cur) | set(base)
+for p in sorted(all_paths):
+    c = cur.get(p)
+    b = base.get(p)
+    if c is None and b is not None:
+        changes.append(("removed", p))
+    elif b is None and c is not None:
+        changes.append(("added", p))
+    elif c != b:
+        changes.append(("changed", p))
+for kind, path in changes:
+    print(kind + chr(9) + path)
+' 2>/dev/null)
+
+    if [[ -n "$diff" ]]; then
+        local n=0
+        while IFS=$'\t' read -r kind path; do
+            [[ -z "$kind" ]] && continue
+            case "$kind" in
+                added)   out="$out\n🔒 INTEGRITY: added $path" ;;
+                removed) out="$out\n🔒 INTEGRITY: removed $path" ;;
+                changed) out="$out\n🔒 INTEGRITY: changed $path" ;;
+            esac
+            n=$((n + 1))
+        done <<< "$diff"
+        # Persist the new snapshot so the next run's baseline is current.
+        /usr/bin/printf '%s' "$current" > "$INTEGRITY_BASELINE_FILE" 2>/dev/null
+        if [[ $n -gt 1 ]]; then
+            out="$out\n🔒 INTEGRITY: $n crown-jewel change(s) total (baseline updated)"
+        fi
+    fi
+
+    echo "$out"
+}
+
 main() {
     check_deps
 
-    local resources security system updates maintenance exit_code=0
+    local resources security system updates maintenance integrity exit_code=0
     resources=$(report_resources)
     security=$(report_security)
     system=$(report_system)
     updates=$(report_updates)
     maintenance=$(report_maintenance)
+    integrity=$(report_integrity)
 
-    local full_report="${resources}${security}${system}${updates}${maintenance}${DEGRADED}"
+    local full_report="${resources}${security}${system}${updates}${maintenance}${integrity}${DEGRADED}"
 
     if [[ "$OUTPUT_MODE" == "json" ]]; then
         # Build JSON. Walk the assembled text report line-by-line; for each
