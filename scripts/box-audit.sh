@@ -111,7 +111,16 @@ flag_degraded() {
 # --- Single-instance guard -------------------------------------------------
 # Prevents an overlapping run (e.g. a slow journalctl on a big journal)
 # from stacking up under cron. Skipped if no writable lock dir was found.
+#
+# Stale-lockfile handling: if the lockfile exists and is owned by a
+# different user (e.g. root's systemd run left it behind while luke is
+# testing interactively), we delete it before opening. flock is atomic
+# so this introduces no race — if another instance acquires between our
+# delete and our open, we'd just hit the flock -n failure below and exit.
 if [[ "$LOCK_ENABLED" == "yes" ]]; then
+    if [[ -f "$LOCK_FILE" ]] && [[ ! -O "$LOCK_FILE" ]]; then
+        /usr/bin/rm -f "$LOCK_FILE" 2>/dev/null
+    fi
     exec 200>"$LOCK_FILE"
     if ! /usr/bin/flock -n 200; then
         echo "sysadmin-healthcheck: another instance is already running, exiting" >&2
