@@ -424,6 +424,9 @@ for row in data:
     custom_timers=""
     while IFS= read -r timer_name; do
         [[ -z "$timer_name" ]] && continue
+        # box-audit.timer (or any name the script is installed under) is
+        # this very audit — flagging it would self-report on every run.
+        [[ "$timer_name" == *"box-audit"* || "$timer_name" == *"healthcheck"* ]] && continue
         case "$timer_name" in
             anacron.timer|apport-autoreport.timer|apt-daily.timer|\
             apt-daily-upgrade.timer|dpkg-db-backup.timer|\
@@ -512,10 +515,20 @@ report_updates() {
     # actually pending. This protects against that class of bug.
     # Wrapped in -n sudo with a 30s budget so a slow mirror doesn't hang cron.
     # Gated on its own probe: sudoers allowing fail2ban-client says nothing
-    # about apt-get.
+    # about apt-get. The failure message names WHY — a timeout (exit 124)
+    # means a slow mirror and the counts are still usable; anything else
+    # means apt itself errored and the counts may be badly stale.
     if sudo_ok /usr/bin/apt-get; then
-        $T 30 /usr/bin/sudo -n /usr/bin/apt-get -qq update 2>/dev/null || \
-            flag_degraded "apt update priming failed (cache may be stale)"
+        local apt_err apt_rc
+        apt_err=$(/usr/bin/timeout --preserve-status 30 /usr/bin/sudo -n /usr/bin/apt-get -qq update 2>&1 >/dev/null)
+        apt_rc=$?
+        if [[ $apt_rc -ne 0 ]]; then
+            if [[ $apt_rc -eq 124 ]]; then
+                flag_degraded "apt update priming timed out after 30s (slow mirror?) — update counts may be stale"
+            else
+                flag_degraded "apt update priming failed (exit $apt_rc): $(echo "$apt_err" | /usr/bin/tail -1 | /usr/bin/cut -c1-120)"
+            fi
+        fi
     else
         flag_degraded "passwordless sudo for apt-get unavailable — skipping apt cache priming (update counts may be stale)"
     fi
@@ -597,9 +610,12 @@ report_maintenance() {
         fi
     done
 
-    # Unattended-upgrades itself — peek the last INFO line. Should be
-    # recent AND end with success. If the log is empty or stale, the
-    # service isn't actually applying updates.
+    # Unattended-upgrades itself — two signals, two roles. The log's mtime
+    # is the load-bearing one: if the service ran on schedule, the file was
+    # touched within TIMER_DRIFT_SECS. The phrase check on the last INFO
+    # line only classifies WHAT kind of run it was. Mid-run lines
+    # ("Starting", "Initial whitelist") are steady state, not anomalies —
+    # greping only the last line flagged a run in progress as broken.
     local uu_log=/var/log/unattended-upgrades/unattended-upgrades.log
     if [[ -f "$uu_log" ]]; then
         local uu_last uu_age
@@ -614,10 +630,15 @@ report_maintenance() {
         # stdout leaks into the function's stdout, polluting the captured
         # report with the raw log line. Use a here-string so $uu_last goes
         # straight to grep's stdin without an echo.
-        elif ! grep -qE "All upgrades installed|No packages found that can be upgraded unattended|kept packages can't be calculated in dry-run mode" <<<"$uu_last"; then
+        elif ! grep -qE "All upgrades installed|No packages found that can be upgraded unattended|kept packages can't be calculated in dry-run mode|Initial whitelist \(not strict\)" <<<"$uu_last"; then
             # Strip the timestamp prefix so the snippet fits Telegram's char
             # budget and answers "old artifact?" vs "current anomaly" at a glance.
             out="$out\n⏰ UNATTENDED-UPGRADES: last INFO line unexpected — $(echo "$uu_last" | /usr/bin/sed -E 's/^[^ ]+ +[0-9:,-]+ INFO //' | /usr/bin/cut -c1-100)"
+        elif [[ $uu_age -gt $APT_CACHE_STALE_SECS ]] && grep -qE "Starting unattended upgrades script|Initial whitelist" <<<"$uu_last"; then
+            # Log is fresh and the last line is a mid-run marker: a run is
+            # in progress (or the last one died mid-flight). Freshness
+            # already cleared it above, so this is informational only.
+            :  # no finding — a run in progress is normal at audit time
         fi
     else
         out="$out\n⏰ UNATTENDED-UPGRADES: log file missing"
