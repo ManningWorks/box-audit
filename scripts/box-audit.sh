@@ -1,0 +1,593 @@
+#!/bin/bash
+# Luke Manning - System Health Check (NucBox / Hermes agent box)
+# Uses /usr/bin/sudo -n for fail2ban-client and docker (passwordless).
+# Note: /etc/sudoers.d/luke currently grants NOPASSWD: ALL — consider
+# tightening to just /usr/bin/fail2ban-client, /usr/bin/docker, /usr/bin/apt
+# (the last is needed only if you ever want this script to run apt itself).
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+# Safer defaults: -u (unset var = error), -o pipefail (catch silent pipe failures),
+# -o errtrace (ERR trap fires in functions/shell). NOT -e — many of our greps
+# legitimately return no matches, and -e would abort the script on those.
+set -uo pipefail -o errtrace
+
+# Thresholds
+DISK_THRESHOLD=85
+SWAP_THRESHOLD=70
+LOAD_THRESHOLD=3.0
+SSH_FAIL_THRESHOLD=15
+SUDO_FAIL_THRESHOLD=100
+UPDATE_THRESHOLD=20
+APT_CACHE_STALE_SECS=172800   # 48h — flag if apt cache hasn't refreshed
+TIMER_DRIFT_SECS=104400       # 26h — flag if apt-daily.timer hasn't fired
+
+# How long any single external command is allowed to run before we give up
+# on it and report it as degraded, rather than let cron hang indefinitely.
+# --preserve-status means timeout returns the inner command's exit code
+# (124 still means "we killed it"), so check logic can rely on real codes.
+CMD_TIMEOUT=10
+T="/usr/bin/timeout --preserve-status $CMD_TIMEOUT"
+
+# --- CLI flags -----------------------------------------------------------
+# --json : emit machine-readable JSON to stdout (one object with findings[])
+#          instead of the human-readable Telegram-formatted text. Use when
+#          piping into a webhook / Slack / Discord / Pushover / etc. so the
+#          downstream tool can format the message itself.
+# --help : show usage and exit 0.
+OUTPUT_MODE="text"   # "text" (default) or "json"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --json) OUTPUT_MODE="json"; shift ;;
+        --text) OUTPUT_MODE="text"; shift ;;
+        -h|--help)
+            /usr/bin/cat <<EOF
+Usage: $(/usr/bin/basename "$0") [--json|--text]
+
+  (default)  Human-readable report suitable for Telegram / Discord.
+  --json     Machine-readable JSON to stdout, e.g. for webhook delivery.
+
+Exit codes: 0 = all clear, 1 = findings present, 2 = setup error.
+EOF
+            exit 0
+            ;;
+        *) /usr/bin/echo "Unknown arg: $1 (try --help)" >&2; exit 2 ;;
+    esac
+done
+
+# --- JSON collector ------------------------------------------------------
+# Each report_*() function can push findings via json_push <severity> <id> <message>
+# In text mode this is a no-op; in json mode it's collected and emitted as
+# a single {"findings":[...]} object.
+JSON_FINDINGS=""
+JSON_COUNT=0
+
+json_push() {
+    # $1=severity (info|warn|error|degraded), $2=id (e.g. "disk.high"), $3=message
+    local severity="$1" id="$2" msg="$3"
+    JSON_COUNT=$((JSON_COUNT + 1))
+    # Build the entry by hand to avoid a hard jq/python3 dependency.
+    # Strings are escaped for JSON (backslash + double-quote only — the only
+    # characters our findings actually contain).
+    local safe_msg="${msg//\\/\\\\}"
+    safe_msg="${safe_msg//\"/\\\"}"
+    local safe_id="${id//\\/\\\\}"
+    safe_id="${safe_id//\"/\\\"}"
+    local entry="{\"severity\":\"${severity}\",\"id\":\"${safe_id}\",\"message\":\"${safe_msg}\"}"
+    if [[ -z "$JSON_FINDINGS" ]]; then
+        JSON_FINDINGS="$entry"
+    else
+        JSON_FINDINGS="${JSON_FINDINGS},${entry}"
+    fi
+}
+
+# Bind the lock to the script path, not the user, so concurrent runs as
+# different users (luke vs. root) can't stomp each other.
+LOCK_FILE="/tmp/sysadmin-healthcheck-$(/usr/bin/basename "$0" .sh).lock"
+# Track anything that couldn't run properly, so a silent/missing result
+# doesn't get reported as "all clear".
+DEGRADED=""
+
+flag_degraded() {
+    DEGRADED="$DEGRADED\n❓ DEGRADED: $1"
+}
+
+# --- Single-instance guard -------------------------------------------------
+# Prevents an overlapping run (e.g. a slow journalctl on a big journal)
+# from stacking up under cron.
+exec 200>"$LOCK_FILE"
+if ! /usr/bin/flock -n 200; then
+    echo "sysadmin-healthcheck: another instance is already running, exiting" >&2
+    exit 0
+fi
+
+# --- Dependency / privilege verification ------------------------------------
+# If a required binary is missing, or sudo isn't actually usable
+# non-interactively, the relevant checks below will silently return empty
+# results and look identical to "no issues". Catch that here instead.
+check_deps() {
+    local bin
+    for bin in df free awk ss systemctl journalctl apt find sudo fail2ban-client docker timeout flock stat; do
+        if ! command -v "$bin" >/dev/null 2>&1; then
+            flag_degraded "'$bin' not found on PATH — related checks skipped"
+        fi
+    done
+
+    if command -v sudo >/dev/null 2>&1; then
+        if ! /usr/bin/sudo -n true 2>/dev/null; then
+            flag_degraded "passwordless sudo not working — fail2ban/docker checks skipped"
+        fi
+    fi
+
+    # needrestart is optional but lets us detect long-running daemons linked
+    # against an old libc. If absent, the corresponding check is a no-op.
+    if ! command -v needrestart >/dev/null 2>&1; then
+        flag_degraded "needrestart not installed — running-with-old-libc check skipped (apt install needrestart)"
+    fi
+}
+
+report() {
+    printf '\n=== SYSTEM HEALTH REPORT - %s ===\n' "$(date '+%Y-%m-%d %H:%M')"
+    printf '%b\n' "$1"
+}
+
+gc() {
+    grep -ciE "$1" 2>/dev/null | tr -d ' \n' || echo "0"
+}
+
+report_resources() {
+    local disk_pct df_output swap_pct load out=""
+    disk_pct=$(df / --output=pcent -x tmpfs -x devtmpfs -x squashfs 2>/dev/null | tail -1 | tr -d ' %')
+    disk_pct=${disk_pct:-0}
+    df_output=$(df -h / --output=source,size,used,avail,pcent -x tmpfs -x devtmpfs -x squashfs 2>/dev/null | tail -1)
+    swap_pct=$(free | awk '/Swap:/ {if($2>0) printf "%.0f", $3/$2*100; else print "0"}')
+    swap_pct=${swap_pct:-0}
+    load=$(cat /proc/loadavg | awk '{print $1}')
+
+    [[ $disk_pct -gt $DISK_THRESHOLD ]] && out="$out\n⚠️ DISK: ${df_output} (${disk_pct}% used)"
+    [[ $swap_pct -gt $SWAP_THRESHOLD ]] && out="$out\n⚠️ SWAP: ${swap_pct}% used"
+    awk -v l="$load" -v thresh="$LOAD_THRESHOLD" 'BEGIN{exit !(l>thresh)}' && out="$out\n⚠️ LOAD: $load (high)"
+
+    [[ $disk_pct -gt $DISK_THRESHOLD ]] && json_push warn disk.high "${df_output} (${disk_pct}% used)"
+    [[ $swap_pct -gt $SWAP_THRESHOLD ]] && json_push warn swap.high "${swap_pct}% used"
+    awk -v l="$load" -v thresh="$LOAD_THRESHOLD" 'BEGIN{exit !(l>thresh)}' && json_push warn load.high "load ${load} (threshold ${LOAD_THRESHOLD})"
+
+    echo "$out"
+}
+
+report_security() {
+    local out=""
+
+    # fail2ban banned IPs
+    if /usr/bin/sudo -n true 2>/dev/null; then
+        local currently_banned
+        currently_banned=$($T /usr/bin/sudo /usr/bin/fail2ban-client status sshd 2>/dev/null | awk '/Currently banned/ {print $4}' | tr -d ' ')
+        local f2b_status=${PIPESTATUS[0]}
+        if [[ $f2b_status -ne 0 ]]; then
+            flag_degraded "fail2ban-client check failed or timed out (exit $f2b_status)"
+        elif [[ -n "$currently_banned" ]] && [[ "$currently_banned" != "0" ]]; then
+            out="$out\n🚨 fail2ban: $currently_banned IP(s) banned on sshd"
+        fi
+    fi
+
+    # SSH failures (last 24h)
+    local ssh_fails
+    ssh_fails=$($T /usr/bin/journalctl --since "24 hours ago" --facility=auth --no-pager 2>/dev/null | gc "Failed password|Invalid user")
+    [[ $ssh_fails -gt $SSH_FAIL_THRESHOLD ]] && out="$out\n⚠️ SSH: $ssh_fails failed auth attempts (24h)"
+
+    # sudo spam threshold (known gateway behavior, flag only if excessive)
+    local sudo_fails
+    sudo_fails=$($T /usr/bin/journalctl --since "24 hours ago" --facility=auth --priority=err --no-pager 2>/dev/null | gc "sudo.*true")
+    [[ $sudo_fails -gt $SUDO_FAIL_THRESHOLD ]] && out="$out\n⚠️ sudo: $sudo_fails auth failures (24h)"
+
+    # Open ports - flag unexpected ones, and who's listening on them
+    # 22(SSH) 53(DNS) 631(IPP) 5006(Actual) 5173(Vite) 8384(Syncthing HTTP)
+    # 9377(?) 22000(Syncthing BEP) 3000/3001(Next.js) 61271(?) 34042(Tailscale DERP)
+    # 8787(Hermes WebUI - hermes-webui/server.py, HERMES_WEBUI_PORT)
+    local known_ports="22 53 631 5006 5173 8384 9377 22000 3000 3001 61271 34042 8787"
+    local ss_output
+    ss_output=$($T /usr/bin/ss -tlnp 2>/dev/null | grep LISTEN)
+    local open_ports
+    open_ports=$(echo "$ss_output" | awk '{print $4}' | grep -oP ':\K\d+$' | sort -u | tr '\n' ' ')
+    for port in $open_ports; do
+        local known=0
+        for kp in $known_ports; do
+            [[ "$port" == "$kp" ]] && known=1 && break
+        done
+        if [[ $known -eq 0 ]]; then
+            local proc
+            proc=$(echo "$ss_output" | grep ":${port} " | grep -oP 'users:\(\("\K[^"]+' | head -1)
+            out="$out\n🆕 PORT: $port is open (not in baseline)${proc:+ [$proc]}"
+        fi
+    done
+
+    # Outbound connection anomaly — established connections to non-RFC1918,
+    # non-Tailscale IPs. Catches post-compromise C2 / data exfil from a
+    # process that has nothing legitimate to phone home.
+    #
+    # Allowed "remote" categories:
+    #   - 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16  (RFC1918 private)
+    #   - 100.64.0.0/10                              (Tailscale CGNAT)
+    #   - 127.0.0.0/8                                (loopback)
+    #   - link-local 169.254.0.0/16                  (DHCP fallback, unlikely outbound)
+    #   - IPv6 loopback + ULA fc00::/7 + link-local fe80::/10
+    #
+    # Anything else gets reported with the remote port so you can decide
+    # whether it's legit (e.g. syncthing discovery on 22067, Telegram API).
+    # Threshold of 25 to avoid alarm fatigue on a chatty gateway/hermes
+    # process that legitimately opens many short-lived HTTPS sockets.
+    local outbound_remote_count=0
+    local outbound_remote_sample=""
+    local ss_out
+    ss_out=$($T /usr/bin/ss -tnp state established 2>/dev/null)
+    if [[ -n "$ss_out" ]]; then
+        local remote_ips
+        remote_ips=$(echo "$ss_out" | awk 'NR>1 {print $5}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
+        local suspicious_ips=""
+        local ip
+        for ip in $remote_ips; do
+            # Skip RFC1918 + CGNAT + loopback
+            if [[ "$ip" =~ ^10\. ]] || [[ "$ip" =~ ^192\.168\. ]] \
+               || [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] \
+               || [[ "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\. ]] \
+               || [[ "$ip" =~ ^127\. ]]; then
+                continue
+            fi
+            suspicious_ips="$suspicious_ips $ip"
+        done
+        outbound_remote_count=$(echo "$suspicious_ips" | /usr/bin/wc -w)
+        outbound_remote_count=${outbound_remote_count:-0}
+        outbound_remote_sample=$(echo "$suspicious_ips" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -v '^$' | /usr/bin/head -5 | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')
+    fi
+    [[ $outbound_remote_count -gt 25 ]] && out="$out\n🌐 OUTBOUND: $outbound_remote_count non-LAN remote IP(s) connected: $outbound_remote_sample"
+
+    # SUID binary count — catches a rootkit that dropped a SUID binary to
+    # escalate. Standard Ubuntu desktop has ~18-25 SUID files (passwd,
+    # mount, su, sudo, etc.). A real jump means somebody added one.
+    local suid_count
+    suid_count=$($T /usr/bin/find / -xdev -perm -4000 -type f 2>/dev/null | /usr/bin/wc -l)
+    suid_count=${suid_count:-0}
+    # Baseline 18 measured 2026-09-14 on this box; flag if > 30 (50%+ growth).
+    [[ $suid_count -gt 30 ]] && out="$out\n🔓 SUID: $suid_count SUID binaries on disk (baseline ~18-25) — review for unauthorised additions"
+
+    echo "$out"
+}
+
+report_system() {
+    local out=""
+
+    # Failed systemd units
+    local failed_list failed_units
+    failed_list=$($T /usr/bin/systemctl list-units --type=service --state=failed --no-legend --plain --no-pager 2>/dev/null)
+    failed_units=$(echo "$failed_list" | grep -c . | tr -d ' \n')
+    failed_units=${failed_units:-0}
+    [[ $failed_units -gt 0 ]] && {
+        local units
+        units=$(echo "$failed_list" | awk '{print $1}' | head -5 | tr '\n' ' ')
+        out="$out\n🔴 SYSTEMD: $failed_units failed service(s): $units"
+    }
+
+    # Persistence check — non-standard systemd timers + user crontabs.
+    # Catches an attacker adding a cron job or timer to re-establish access
+    # after a reboot. Standard set is the Ubuntu desktop defaults:
+    #   anacron, apport-autoreport, apt-daily, apt-daily-upgrade,
+    #   dpkg-db-backup, e2scrub_all, fstrim, fwupd-refresh, logrotate,
+    #   man-db, motd-news, snapd.snap-repair, sysstat-collect,
+    #   sysstat-summary, systemd-tmpfiles-clean, ua-timer,
+    #   update-notifier-download, update-notifier-motd
+    # Anything outside that gets flagged with its name.
+    #
+    # Use JSON output and jq so we extract the actual `unit` field rather
+    # than miscounting the human-readable columns (which include the
+    # activates-target .service on the same line).
+    local timer_list custom_timers timer_name
+    timer_list=$($T /usr/bin/systemctl list-timers --all --no-pager --no-legend --output json 2>/dev/null \
+        | /usr/bin/python3 -c "import sys,json
+data = json.load(sys.stdin)
+for row in data:
+    u = row.get('unit','')
+    if u.endswith('.timer'):
+        print(u)" 2>/dev/null)
+    custom_timers=""
+    while IFS= read -r timer_name; do
+        [[ -z "$timer_name" ]] && continue
+        case "$timer_name" in
+            anacron.timer|apport-autoreport.timer|apt-daily.timer|\
+            apt-daily-upgrade.timer|dpkg-db-backup.timer|\
+            e2scrub_all.timer|fstrim.timer|fwupd-refresh.timer|\
+            logrotate.timer|man-db.timer|motd-news.timer|\
+            snapd.snap-repair.timer|sysstat-collect.timer|\
+            sysstat-summary.timer|systemd-tmpfiles-clean.timer|\
+            ua-timer.timer|update-notifier-download.timer|\
+            update-notifier-motd.timer)
+                # standard, ignore
+                ;;
+            *)
+                custom_timers="$custom_timers $timer_name"
+                ;;
+        esac
+    done <<< "$timer_list"
+    local custom_count
+    custom_count=$(echo "$custom_timers" | /usr/bin/wc -w)
+    custom_count=${custom_count:-0}
+    [[ $custom_count -gt 0 ]] && {
+        out="$out\n⏰ CUSTOM-TIMERS: $custom_count non-standard timer(s): $(echo "$custom_timers" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -v '^$' | /usr/bin/head -3 | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')"
+    }
+
+    # User crontab — flag if a non-empty user crontab exists. (You schedule
+    # via Hermes cron, not system cron, so anything here is suspicious.)
+    # `crontab -l` with no crontab prints "no crontab for <user>" to stdout,
+    # which a naive grep counts as 1 line. Filter that out first.
+    local user_cron_raw user_cron_entries
+    user_cron_raw=$($T /usr/bin/crontab -l 2>/dev/null | /usr/bin/grep -vE '^no crontab for ')
+    user_cron_entries=$(echo "$user_cron_raw" | /usr/bin/grep -cvE '^[[:space:]]*(#|$)')
+    user_cron_entries=${user_cron_entries:-0}
+    [[ $user_cron_entries -gt 0 ]] && out="$out\n📅 USER-CRON: $user_cron_entries entry/entries in $USER's crontab (Hermes schedules via its own cron — investigate)"
+
+    # /etc/cron.d/ — flag unknown drop-ins beyond the standard 3.
+    local cron_d_files
+    cron_d_files=$($T /usr/bin/ls /etc/cron.d/ 2>/dev/null | /usr/bin/sort -u)
+    local unexpected_cron=""
+    local f
+    for f in $cron_d_files; do
+        case "$f" in
+            anacron|e2scrub_all|sysstat|0hourly) ;;  # standard
+            *) unexpected_cron="$unexpected_cron $f" ;;
+        esac
+    done
+    local ucron_count
+    ucron_count=$(echo "$unexpected_cron" | /usr/bin/wc -w)
+    ucron_count=${ucron_count:-0}
+    [[ $ucron_count -gt 0 ]] && out="$out\n📅 /etc/cron.d/: unexpected drop-in(s): $(echo "$unexpected_cron" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -v '^$' | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')"
+
+    # Docker containers - use Docker's own health filter (containers with no
+    # HEALTHCHECK defined are correctly ignored, not false-flagged)
+    if /usr/bin/sudo -n true 2>/dev/null; then
+        local unhealthy unhealthy_names
+        unhealthy_names=$($T /usr/bin/sudo /usr/bin/docker ps --filter health=unhealthy --format '{{.Names}}' 2>/dev/null)
+        unhealthy=$(echo "$unhealthy_names" | grep -c . | tr -d ' \n')
+        unhealthy=${unhealthy:-0}
+        [[ $unhealthy -gt 0 ]] && out="$out\n🔴 DOCKER: $unhealthy unhealthy container(s): $(echo "$unhealthy_names" | tr '\n' ' ')"
+    fi
+
+    # Apport crashes
+    local crash_count
+    crash_count=$(find /var/crash -maxdepth 1 -type f 2>/dev/null | wc -l)
+    crash_count=${crash_count:-0}
+    [[ $crash_count -gt 0 ]] && {
+        local crash_files
+        crash_files=$(find /var/crash -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | head -3 | tr '\n' ' ')
+        out="$out\n💥 CORES: $crash_count crash dump(s): $crash_files"
+    }
+
+    # Kernel errors
+    local kerr
+    kerr=$($T /usr/bin/journalctl --since "24 hours ago" --priority=err --kernel --no-pager 2>/dev/null | grep -c "" | tr -d ' \n' || echo "0")
+    kerr=${kerr:-0}
+    [[ $kerr -gt 0 ]] && out="$out\n🔴 KERNEL: $kerr error(s) in last 24h"
+
+    echo "$out"
+}
+
+report_updates() {
+    local out=""
+    local updatable security kernel_security distro third_party
+
+    # Force a cache refresh before reading `apt list --upgradable`.
+    # Yesterday's incident: cache went stale, unattended-upgrades ran but
+    # saw an empty queue, our cron reported "0 security" while 28 were
+    # actually pending. This protects against that class of bug.
+    # Wrapped in -n sudo with a 30s budget so a slow mirror doesn't hang cron.
+    if /usr/bin/sudo -n true 2>/dev/null; then
+        $T 30 /usr/bin/sudo -n /usr/bin/apt-get -qq update 2>/dev/null || \
+            flag_degraded "apt update priming failed (cache may be stale)"
+    else
+        flag_degraded "passwordless sudo unavailable — skipping apt cache priming"
+    fi
+
+    # Cache apt output once
+    local apt_output
+    apt_output=$($T /usr/bin/apt list --upgradable 2>/dev/null | tail -n +2)
+    updatable=$(echo "$apt_output" | grep -c . | tr -d ' \n')
+    updatable=${updatable:-0}
+    security=$(echo "$apt_output" | grep -ci security | tr -d ' \n' || echo "0")
+    security=${security:-0}
+
+    # Kernel CVEs need a reboot to take effect — separate them so they don't
+    # get lost in the noise of generic "security" updates.
+    kernel_security=$(echo "$apt_output" | grep -ciE "^linux-(image|generic|headers|modules|hwe|aws|gcp|azure|kvm|raspi|nvidia|tools)" | tr -d ' \n' || echo "0")
+    kernel_security=${kernel_security:-0}
+
+    # Classify remaining by origin so the user knows what's left and why
+    # unattended-upgrades didn't auto-install it.
+    distro=$(echo "$apt_output" | grep -ciE "/noble(-updates|-security)? " | tr -d ' \n' || echo "0")
+    distro=${distro:-0}
+    third_party=$(echo "$apt_output" | grep -ciE "/(unknown|docker|github|tailscale|brave|vscode|signal|element|spotify|slack) " | tr -d ' \n' || echo "0")
+    third_party=${third_party:-0}
+
+    [[ $updatable -gt $UPDATE_THRESHOLD ]] && out="$out\n📦 UPDATES: $updatable packages upgradable (distro: $distro · 3rd-party: $third_party)"
+    [[ $security -gt 0 ]] && out="$out\n🔒 SECURITY: $security security update(s) pending"
+    [[ $kernel_security -gt 0 ]] && out="$out\n🛡️ KERNEL-CVE: $kernel_security kernel security package(s) — reboot required to apply"
+
+    echo "$out"
+}
+
+report_maintenance() {
+    local out=""
+
+    # Reboot required — surface the WHY by reading reboot-required.pkgs.
+    # This file names the packages whose on-disk version requires a reboot
+    # to be loaded by running processes (typically libc6, openssh, kernel).
+    if [[ -f /var/run/reboot-required ]]; then
+        local since
+        since=$(/usr/bin/stat -c %y /var/run/reboot-required 2>/dev/null | /usr/bin/cut -d. -f1)
+        local reason=""
+        if [[ -f /var/run/reboot-required.pkgs ]]; then
+            reason=$(/usr/bin/tr '\n' ' ' < /var/run/reboot-required.pkgs | /usr/bin/sed 's/ $//')
+        fi
+        out="$out\n🔁 REBOOT: required since ${since}${reason:+ ($reason)}"
+    fi
+
+    # apt cache freshness — /var/lib/apt/periodic/update-success-stamp is
+    # touched by apt-daily.timer whenever `apt update` succeeds. If it's
+    # older than APT_CACHE_STALE_SECS, the script's `apt list --upgradable`
+    # output could be missing recent security updates.
+    if [[ -f /var/lib/apt/periodic/update-success-stamp ]]; then
+        local age=$(( $(/usr/bin/date +%s) - $(/usr/bin/stat -c %Y /var/lib/apt/periodic/update-success-stamp) ))
+        if [[ $age -gt $APT_CACHE_STALE_SECS ]]; then
+            out="$out\n⏳ APT-CACHE: stale (${age}s / $((APT_CACHE_STALE_SECS / 3600))h since last apt update)"
+        fi
+    else
+        out="$out\n⏳ APT-CACHE: no update-success-stamp found — apt update has never succeeded?"
+    fi
+
+    # Timer health — apt-daily.timer and apt-daily-upgrade.timer should fire
+    # at least daily. If either hasn't, unattended-upgrades isn't running.
+    for t in apt-daily.timer apt-daily-upgrade.timer; do
+        local last_trigger
+        last_trigger=$($T /usr/bin/systemctl show "$t" --property=LastTriggerUSec --value 2>/dev/null)
+        if [[ "$last_trigger" == "n/a" ]] || [[ -z "$last_trigger" ]]; then
+            out="$out\n⏰ TIMER: $t has never fired"
+        else
+            # LastTriggerUSec is a human-readable timestamp in modern systemd.
+            # Convert to epoch seconds and compare against now.
+            local last_epoch
+            last_epoch=$($T /usr/bin/date -d "$last_trigger" +%s 2>/dev/null)
+            if [[ -n "$last_epoch" ]] && [[ "$last_epoch" =~ ^[0-9]+$ ]]; then
+                local drift=$(( $(/usr/bin/date +%s) - last_epoch ))
+                if [[ $drift -gt $TIMER_DRIFT_SECS ]]; then
+                    out="$out\n⏰ TIMER: $t hasn't fired in ${drift}s ($((drift / 3600))h)"
+                fi
+            fi
+        fi
+    done
+
+    # Unattended-upgrades itself — peek the last INFO line. Should be
+    # recent AND end with success. If the log is empty or stale, the
+    # service isn't actually applying updates.
+    local uu_log=/var/log/unattended-upgrades/unattended-upgrades.log
+    if [[ -f "$uu_log" ]]; then
+        local uu_last uu_age
+        # DEBUG lines come after the meaningful INFO ones, so grab the last INFO.
+        uu_last=$($T /usr/bin/grep -E "^20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2},[0-9]{3} INFO " "$uu_log" 2>/dev/null | /usr/bin/tail -n 1)
+        uu_age=$(( $(/usr/bin/date +%s) - $(/usr/bin/stat -c %Y "$uu_log") ))
+        if [[ -z "$uu_last" ]]; then
+            out="$out\n⏰ UNATTENDED-UPGRADES: no INFO line found in log"
+        elif [[ $uu_age -gt $TIMER_DRIFT_SECS ]]; then
+            out="$out\n⏰ UNATTENDED-UPGRADES: log not updated in ${uu_age}s — service may be broken"
+        elif ! echo "$uu_last" | /usr/bin/grep -qE "All upgrades installed|No packages found that can be upgraded unattended|kept packages can't be calculated in dry-run mode"; then
+            # Strip the timestamp prefix so the snippet fits Telegram's char
+            # budget and answers "old artifact?" vs "current anomaly" at a glance.
+            out="$out\n⏰ UNATTENDED-UPGRADES: last INFO line unexpected — $(echo "$uu_last" | /usr/bin/sed -E 's/^[^ ]+ +[0-9:,-]+ INFO //' | /usr/bin/cut -c1-100)"
+        fi
+    else
+        out="$out\n⏰ UNATTENDED-UPGRADES: log file missing"
+    fi
+
+    # needrestart — find daemons linked against an older libc / running an old
+    # kernel. These are running with the OLD security state in memory even
+    # though the new libc6 is on disk. `-p` is nagios plugin mode: exit 2 =
+    # CRITICAL (kernel or services need restart), 1 = WARNING, 0 = OK.
+    # We split kernel and services because kernel needs a reboot (different
+    # action) while services can be restarted individually.
+    local needrestart_bin
+    needrestart_bin=$(command -v needrestart)
+    if [[ -n "$needrestart_bin" ]] && /usr/bin/sudo -n true 2>/dev/null; then
+        local nr_out nr_rc
+        nr_out=$($T /usr/bin/sudo -n "$needrestart_bin" -b -p 2>/dev/null)
+        nr_rc=$?
+        if [[ $nr_rc -eq 2 ]]; then
+            # Parse out kernel version drift and service count
+            local kernel_line services_count
+            kernel_line=$(echo "$nr_out" | /usr/bin/grep -oE 'Kernel: [^,()]+' | /usr/bin/head -1)
+            services_count=$(echo "$nr_out" | /usr/bin/grep -oE 'Services: [0-9]+' | /usr/bin/grep -oE '[0-9]+')
+            # Kernel mismatch means a newer kernel is installed but we're
+            # still booting the old one — real reboot-required state.
+            if [[ -n "$kernel_line" ]]; then
+                out="$out\n🛡️ KERNEL-RESTART: $kernel_line (newer kernel on disk, current kernel still running)"
+            fi
+            if [[ -n "$services_count" ]] && [[ "$services_count" -gt 0 ]]; then
+                out="$out\n🔄 SERVICES-RESTART: $services_count service(s) running pre-upgrade libs (e.g. sshd, fail2ban) — restart or reboot"
+            fi
+        elif [[ $nr_rc -eq 1 ]]; then
+            # WARNING state (e.g. microcode outdated, sessions active) — surface too.
+            local warning_msg
+            warning_msg=$(echo "$nr_out" | /usr/bin/head -1)
+            [[ -n "$warning_msg" ]] && out="$out\n⚠️ NEEDRESTART-WARN: $warning_msg"
+        elif [[ $nr_rc -gt 2 ]]; then
+            flag_degraded "needrestart returned $nr_rc (expected 0, 1, or 2)"
+        fi
+    fi
+
+    echo "$out"
+}
+
+main() {
+    check_deps
+
+    local resources security system updates maintenance exit_code=0
+    resources=$(report_resources)
+    security=$(report_security)
+    system=$(report_system)
+    updates=$(report_updates)
+    maintenance=$(report_maintenance)
+
+    local full_report="${resources}${security}${system}${updates}${maintenance}${DEGRADED}"
+
+    if [[ "$OUTPUT_MODE" == "json" ]]; then
+        # Build JSON. Walk the assembled text report line-by-line; for each
+        # non-empty line, parse the leading emoji as severity and emit a
+        # structured finding. Lines without an emoji (e.g. blank lines or
+        # the SYSTEM HEALTH header) are skipped. The original text is also
+        # kept in raw_output for downstream consumers that prefer it.
+        local safe_report="${full_report}"
+        # report_* functions emit echo $out which preserves \n as escapes
+        # (no actual newlines). Convert them so we can iterate per finding.
+        local report_for_parsing="${safe_report//\\n/$'\n'}"
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            # Skip the DEGRADED entries; flag_degraded() handles them separately
+            [[ "$line" == *"❓ DEGRADED:"* ]] && continue
+            # Strip leading emoji + space; everything after is the message
+            local msg="${line}"
+            local id_prefix="info"
+            case "$msg" in
+                "🚨"*) id_prefix="alert" ;;
+                "🔒"*|"🛡️"*|"🔴"*|"💥"*|"🌐"*|"🔓"*|"⏰"*) id_prefix="warn" ;;
+                "⚠️"*) id_prefix="warn" ;;
+                "📅"*|"📦"*|"🆕"*|"🔄"*|"🔁"*) id_prefix="info" ;;
+            esac
+            msg=$(echo "$msg" | /usr/bin/sed -E 's/^[^ ]+ //')
+            # Generate a stable-ish id from the first few words of the message
+            local id
+            id=$(echo "$msg" | /usr/bin/awk '{for(i=1;i<=3 && i<=NF;i++) printf "%s_", tolower($i); print ""}' | /usr/bin/sed 's/_$//' | /usr/bin/tr -d ',' | /usr/bin/cut -c1-50)
+            json_push "$id_prefix" "$id" "$msg"
+        done <<< "$report_for_parsing"
+
+        local safe_report_json
+        safe_report_json=$(/usr/bin/printf '%s' "$safe_report" | /usr/bin/python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+        local status="ok"
+        [[ -n "$safe_report" ]] && status="findings"
+        /usr/bin/printf '{"status":"%s","timestamp":"%s","host":"%s","findings":[%s],"raw_output":%s}\n' \
+            "$status" \
+            "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "$(/usr/bin/hostname)" \
+            "$JSON_FINDINGS" \
+            "$safe_report_json"
+        [[ -z "$safe_report" ]] && exit_code=0 || exit_code=1
+    else
+        if [[ -z "$full_report" ]]; then
+            printf '\n=== SYSTEM HEALTH - %s ===\n' "$(date '+%Y-%m-%d %H:%M')"
+            echo "✅ All clear — no issues detected"
+        else
+            report "$full_report"
+            exit_code=1
+        fi
+    fi
+
+    return $exit_code
+}
+
+main
