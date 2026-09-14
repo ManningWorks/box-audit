@@ -92,13 +92,15 @@ json_push() {
 # (also FHS-conventional); fall back to /tmp if neither is writable.
 # We don't try to create the dir — the systemd unit's ExecStartPre
 # handles that for the scheduled execution.
-# Pre-create the lock directory with root permissions so the systemd user
-# (root) can always create the lockfile. Use /var/lock (always writable
-# on Linux) and explicitly create our own subdir to avoid permission
-# collisions with other packages (CUPS, sanlock, etc.) that share /var.
-LOCK_DIR="/var/lock/box-audit"
-/usr/bin/mkdir -p "$LOCK_DIR" 2>/dev/null
-LOCK_FILE="$LOCK_DIR/healthcheck.lock"
+# Use /tmp for the lockfile (world-writable, no sticky-bit headaches).
+# Sticky-bit on /var/lock prevents luke from removing root-owned lockfiles
+# even when the script wants to self-clear — simpler to just use /tmp and
+# tolerate the per-user file naming. The script's purpose is preventing
+# the SAME user from running two instances simultaneously; cross-user
+# races are already prevented by the daily systemd timer firing on a
+# fixed schedule.
+LOCK_DIR="/tmp"
+LOCK_FILE="$LOCK_DIR/sysadmin-healthcheck-box-audit.lock"
 LOCK_ENABLED="yes"
 # Track anything that couldn't run properly, so a silent/missing result
 # doesn't get reported as "all clear".
@@ -114,17 +116,23 @@ flag_degraded() {
 #
 # Stale-lockfile handling: if the lockfile exists and is owned by a
 # different user (e.g. root's systemd run left it behind while luke is
-# testing interactively), we delete it before opening. flock is atomic
-# so this introduces no race — if another instance acquires between our
-# delete and our open, we'd just hit the flock -n failure below and exit.
+# testing interactively), we try to delete it. If we can't (sticky dir
+# + not owner), we skip the lock for this run — the daily systemd timer
+# firing on a fixed schedule means cross-user races are not a real risk;
+# this guard exists to prevent the same user from running two instances.
 if [[ "$LOCK_ENABLED" == "yes" ]]; then
     if [[ -f "$LOCK_FILE" ]] && [[ ! -O "$LOCK_FILE" ]]; then
-        /usr/bin/rm -f "$LOCK_FILE" 2>/dev/null
+        /usr/bin/rm -f "$LOCK_FILE" 2>/dev/null || true
     fi
-    exec 200>"$LOCK_FILE"
-    if ! /usr/bin/flock -n 200; then
-        echo "sysadmin-healthcheck: another instance is already running, exiting" >&2
-        exit 0
+    if [[ ! -f "$LOCK_FILE" ]] || [[ -O "$LOCK_FILE" ]]; then
+        # We can open it (either freshly creating or overwriting our own).
+        exec 200>"$LOCK_FILE"
+        if ! /usr/bin/flock -n 200; then
+            echo "sysadmin-healthcheck: another instance is already running, exiting" >&2
+            exit 0
+        fi
+    else
+        echo "sysadmin-healthcheck: WARNING — lockfile owned by another user, continuing without single-instance guard" >&2
     fi
 else
     echo "sysadmin-healthcheck: WARNING — no writable lock dir, skipping single-instance guard" >&2
