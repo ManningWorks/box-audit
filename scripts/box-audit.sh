@@ -607,9 +607,12 @@ report_maintenance() {
         fi
     done
 
-    # Unattended-upgrades itself — peek the last INFO line. Should be
-    # recent AND end with success. If the log is empty or stale, the
-    # service isn't actually applying updates.
+    # Unattended-upgrades itself — two signals, two roles. The log's mtime
+    # is the load-bearing one: if the service ran on schedule, the file was
+    # touched within TIMER_DRIFT_SECS. The phrase check on the last INFO
+    # line only classifies WHAT kind of run it was. Mid-run lines
+    # ("Starting", "Initial whitelist") are steady state, not anomalies —
+    # greping only the last line flagged a run in progress as broken.
     local uu_log=/var/log/unattended-upgrades/unattended-upgrades.log
     if [[ -f "$uu_log" ]]; then
         local uu_last uu_age
@@ -624,10 +627,15 @@ report_maintenance() {
         # stdout leaks into the function's stdout, polluting the captured
         # report with the raw log line. Use a here-string so $uu_last goes
         # straight to grep's stdin without an echo.
-        elif ! grep -qE "All upgrades installed|No packages found that can be upgraded unattended|kept packages can't be calculated in dry-run mode" <<<"$uu_last"; then
+        elif ! grep -qE "All upgrades installed|No packages found that can be upgraded unattended|kept packages can't be calculated in dry-run mode|Initial whitelist \(not strict\)" <<<"$uu_last"; then
             # Strip the timestamp prefix so the snippet fits Telegram's char
             # budget and answers "old artifact?" vs "current anomaly" at a glance.
             out="$out\n⏰ UNATTENDED-UPGRADES: last INFO line unexpected — $(echo "$uu_last" | /usr/bin/sed -E 's/^[^ ]+ +[0-9:,-]+ INFO //' | /usr/bin/cut -c1-100)"
+        elif [[ $uu_age -gt $APT_CACHE_STALE_SECS ]] && grep -qE "Starting unattended upgrades script|Initial whitelist" <<<"$uu_last"; then
+            # Log is fresh and the last line is a mid-run marker: a run is
+            # in progress (or the last one died mid-flight). Freshness
+            # already cleared it above, so this is informational only.
+            :  # no finding — a run in progress is normal at audit time
         fi
     else
         out="$out\n⏰ UNATTENDED-UPGRADES: log file missing"
