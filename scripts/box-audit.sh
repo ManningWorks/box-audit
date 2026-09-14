@@ -87,7 +87,8 @@ Usage: $(/usr/bin/basename "$0") [--json|--text]
   (default)  Human-readable report suitable for Telegram / Discord.
   --json     Machine-readable JSON to stdout, e.g. for webhook delivery.
 
-Exit codes: 0 = all clear, 1 = findings present, 2 = setup error.
+Exit codes: 0 = all clear, 1 = findings present, 2 = bad CLI flag.
+             (--json mode always exits 0; see the status field.)
 EOF
             exit 0
             ;;
