@@ -512,10 +512,20 @@ report_updates() {
     # actually pending. This protects against that class of bug.
     # Wrapped in -n sudo with a 30s budget so a slow mirror doesn't hang cron.
     # Gated on its own probe: sudoers allowing fail2ban-client says nothing
-    # about apt-get.
+    # about apt-get. The failure message names WHY — a timeout (exit 124)
+    # means a slow mirror and the counts are still usable; anything else
+    # means apt itself errored and the counts may be badly stale.
     if sudo_ok /usr/bin/apt-get; then
-        $T 30 /usr/bin/sudo -n /usr/bin/apt-get -qq update 2>/dev/null || \
-            flag_degraded "apt update priming failed (cache may be stale)"
+        local apt_err apt_rc
+        apt_err=$(/usr/bin/timeout --preserve-status 30 /usr/bin/sudo -n /usr/bin/apt-get -qq update 2>&1 >/dev/null)
+        apt_rc=$?
+        if [[ $apt_rc -ne 0 ]]; then
+            if [[ $apt_rc -eq 124 ]]; then
+                flag_degraded "apt update priming timed out after 30s (slow mirror?) — update counts may be stale"
+            else
+                flag_degraded "apt update priming failed (exit $apt_rc): $(echo "$apt_err" | /usr/bin/tail -1 | /usr/bin/cut -c1-120)"
+            fi
+        fi
     else
         flag_degraded "passwordless sudo for apt-get unavailable — skipping apt cache priming (update counts may be stale)"
     fi
