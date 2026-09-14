@@ -87,7 +87,8 @@ Usage: $(/usr/bin/basename "$0") [--json|--text]
   (default)  Human-readable report suitable for Telegram / Discord.
   --json     Machine-readable JSON to stdout, e.g. for webhook delivery.
 
-Exit codes: 0 = all clear, 1 = findings present, 2 = setup error.
+Exit codes: 0 = all clear, 1 = findings present, 2 = bad CLI flag.
+             (--json mode always exits 0; see the status field.)
 EOF
             exit 0
             ;;
@@ -125,27 +126,27 @@ json_push() {
 # where $0 would otherwise be "bash"). Falls back to $0 if BASH_SOURCE
 # is unset (e.g. when sourced).
 #
-# /run/lock/ is the FHS-conventional location for lockfiles and is
-# world-writable with sticky bit. Try it first; fall back to /var/lock
-# (also FHS-conventional); fall back to /tmp if neither is writable.
-# We don't try to create the dir — the systemd unit's ExecStartPre
-# handles that for the scheduled execution.
-# Use /tmp for the lockfile (world-writable, no sticky-bit headaches).
-# /var/lock has the sticky bit set, which prevents a non-owner from
-# removing root-owned lockfiles even when the script wants to self-clear
-# after a crash. /tmp is simpler and the single-instance concern is
-# only about the same user running it twice — cross-user races are
-# already prevented by the daily systemd timer firing on a fixed
-# schedule.
+# /tmp is the lockfile location: world-writable, no sticky-bit headaches.
+# The single-instance concern is only about the same user running the
+# script twice — cross-user races are already prevented by the daily
+# systemd timer firing on a fixed schedule. A foreign-owned lockfile is
+# removed when possible; if the sticky bit blocks that, the guard is
+# skipped with a warning rather than failing the run (see below).
 LOCK_DIR="/tmp"
 LOCK_FILE="$LOCK_DIR/sysadmin-healthcheck-box-audit.lock"
 LOCK_ENABLED="yes"
 # Track anything that couldn't run properly, so a silent/missing result
 # doesn't get reported as "all clear".
+#
+# Degraded findings are collected in a temp FILE, not a shell variable:
+# every report_* function runs inside a command substitution, which is a
+# subshell — appending to a global there mutates a copy that's thrown
+# away when the substitution returns. A file survives subshell boundaries
+# and main() reads it once at assembly time.
+DEGRADED_FILE=""
 DEGRADED=""
-
 flag_degraded() {
-    DEGRADED="$DEGRADED\n❓ DEGRADED: $1"
+    /usr/bin/printf '%s\n' "$1" >> "$DEGRADED_FILE" 2>/dev/null
 }
 
 # --- Single-instance guard -------------------------------------------------
@@ -181,20 +182,44 @@ fi
 # If a required binary is missing, or sudo isn't actually usable
 # non-interactively, the relevant checks below will silently return empty
 # results and look identical to "no issues". Catch that here instead.
+
+# sudo_ok <command-path> — is `sudo -n <this exact command>` usable?
+# Probing one sudo command (e.g. fail2ban-client) does NOT prove others
+# (docker, apt-get, needrestart) are allowed: scoped sudoers lists each
+# command separately. Each check gates on its own command's probe.
+# Results are cached — declare the assoc array once at source time.
+declare -A SUDO_OK_CACHE
+sudo_ok() {
+    local cmd="$1"
+    if [[ -z "${SUDO_OK_CACHE[$cmd]:-}" ]]; then
+        if /usr/bin/sudo -n "$cmd" --version >/dev/null 2>&1 \
+           || /usr/bin/sudo -n "$cmd" status >/dev/null 2>&1 \
+           || /usr/bin/sudo -n "$cmd" --help >/dev/null 2>&1; then
+            SUDO_OK_CACHE[$cmd]=1
+        else
+            SUDO_OK_CACHE[$cmd]=0
+        fi
+    fi
+    [[ "${SUDO_OK_CACHE[$cmd]}" == "1" ]]
+}
+
 check_deps() {
     local bin
-    for bin in df free awk ss systemctl journalctl apt find sudo fail2ban-client docker timeout flock stat; do
+    for bin in df free awk ss systemctl journalctl apt find sudo fail2ban-client docker timeout flock stat python3; do
         if ! command -v "$bin" >/dev/null 2>&1; then
             flag_degraded "'$bin' not found on PATH — related checks skipped"
         fi
     done
 
     if command -v sudo >/dev/null 2>&1; then
-        # Probe one of the actual sudo commands the script will use,
-        # not bare `sudo -n true` (which fails under scoped sudoers).
-        # fail2ban-client is the lightest of the three needed commands.
-        if ! /usr/bin/sudo -n /usr/bin/fail2ban-client status >/dev/null 2>&1; then
-            flag_degraded "passwordless sudo for fail2ban-client/docker not working — related checks skipped"
+        # Probe each sudo command the script actually uses. Under scoped
+        # sudoers these succeed/fail independently, so one shared canary
+        # would mask per-command gaps (e.g. docker allowed, apt-get not).
+        if ! sudo_ok /usr/bin/fail2ban-client; then
+            flag_degraded "passwordless sudo for fail2ban-client not working — fail2ban check skipped"
+        fi
+        if ! sudo_ok /usr/bin/docker; then
+            flag_degraded "passwordless sudo for docker not working — container health check skipped"
         fi
     fi
 
@@ -300,8 +325,18 @@ report_security() {
     local ss_out
     ss_out=$($T /usr/bin/ss -tnp state established 2>/dev/null)
     if [[ -n "$ss_out" ]]; then
+        # IPv4: column 5 holds remote addr:port.
         local remote_ips
         remote_ips=$(echo "$ss_out" | awk 'NR>1 {print $5}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
+        # IPv6: same column, but addresses are hex with colons and often a
+        # %if suffix ([2001:db8::1]:443 or [fe80::1%eth0]:22). Grab the
+        # bracketed address, strip port/brackets/interface. Without this,
+        # a compromised process phoning home over IPv6 is invisible to the
+        # check on any dual-stack box.
+        local remote_ips6
+        remote_ips6=$(echo "$ss_out" | awk 'NR>1 {print $5}' \
+            | grep -oE '^\[[0-9a-fA-F:]+(%[a-z0-9]+)?\]' \
+            | /usr/bin/sed -E 's/^\[//; s/\]$//' | sort -u)
         local suspicious_ips=""
         local ip
         for ip in $remote_ips; do
@@ -310,6 +345,20 @@ report_security() {
                || [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] \
                || [[ "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\. ]] \
                || [[ "$ip" =~ ^127\. ]]; then
+                continue
+            fi
+            suspicious_ips="$suspicious_ips $ip"
+        done
+        for ip in $remote_ips6; do
+            # Lowercase for consistent matching, strip zone id (fe80::1%eth0)
+            ip="${ip%%%*}"
+            ip="${ip,,}"
+            # Skip loopback (::1), link-local fe80::/10, ULA fc00::/7,
+            # and IPv4-mapped ::ffff:x.x.x.x (already handled above).
+            if [[ "$ip" == "::1" ]] \
+               || [[ "$ip" =~ ^fe[89ab] ]] \
+               || [[ "$ip" =~ ^f[cd] ]] \
+               || [[ "$ip" =~ ^::ffff: ]]; then
                 continue
             fi
             suspicious_ips="$suspicious_ips $ip"
@@ -323,14 +372,13 @@ report_security() {
     # SUID binary count — catches a rootkit that dropped a SUID binary to
     # escalate. Standard Ubuntu desktop has ~18-25 SUID files (passwd,
     # mount, su, sudo, etc.). A real jump means somebody added one.
+    # Skip /var/lib/docker: overlay2 layers carry SUID bits from base
+    # images (passwd, util-linux, openssh) that don't add to the host's
+    # attack surface, and their counts mask real findings (37 → 17 here).
+    # `-path '/var/lib/docker' -prune -o` drops the whole tree before the
+    # perm filter runs.
     local suid_count
-    # Skip /var/lib/docker overlay2 layers — they contain SUID bits from base
-# images (passwd, util-linux, openssh, etc.) that the host can't directly
-# execute as SUID, so they don't add to the host's attack surface. They
-# show up as massive counts that mask real findings (37 → 17 on this box).
-# `-path '/var/lib/docker' -prune -o` drops the entire docker tree from
-# the find walk before the perm filter runs.
-suid_count=$($T /usr/bin/find / -xdev -path '/var/lib/docker' -prune -o -perm -4000 -type f -print 2>/dev/null | /usr/bin/wc -l)
+    suid_count=$($T /usr/bin/find / -xdev -path '/var/lib/docker' -prune -o -perm -4000 -type f -print 2>/dev/null | /usr/bin/wc -l)
     suid_count=${suid_count:-0}
     # Baseline 18 measured 2026-09-14 on this box; flag if > 30 (50%+ growth).
     [[ $suid_count -gt 30 ]] && out="$out\n🔓 SUID: $suid_count SUID binaries on disk (baseline ~18-25) — review for unauthorised additions"
@@ -427,7 +475,7 @@ for row in data:
 
     # Docker containers - use Docker's own health filter (containers with no
     # HEALTHCHECK defined are correctly ignored, not false-flagged)
-    if /usr/bin/sudo -n /usr/bin/fail2ban-client status >/dev/null 2>&1; then
+    if sudo_ok /usr/bin/docker; then
         local unhealthy unhealthy_names
         unhealthy_names=$($T /usr/bin/sudo /usr/bin/docker ps --filter health=unhealthy --format '{{.Names}}' 2>/dev/null)
         unhealthy=$(echo "$unhealthy_names" | grep -c . | tr -d ' \n')
@@ -463,11 +511,13 @@ report_updates() {
     # saw an empty queue, our cron reported "0 security" while 28 were
     # actually pending. This protects against that class of bug.
     # Wrapped in -n sudo with a 30s budget so a slow mirror doesn't hang cron.
-    if /usr/bin/sudo -n /usr/bin/fail2ban-client status >/dev/null 2>&1; then
+    # Gated on its own probe: sudoers allowing fail2ban-client says nothing
+    # about apt-get.
+    if sudo_ok /usr/bin/apt-get; then
         $T 30 /usr/bin/sudo -n /usr/bin/apt-get -qq update 2>/dev/null || \
             flag_degraded "apt update priming failed (cache may be stale)"
     else
-        flag_degraded "passwordless sudo unavailable — skipping apt cache priming"
+        flag_degraded "passwordless sudo for apt-get unavailable — skipping apt cache priming (update counts may be stale)"
     fi
 
     # Cache apt output once
@@ -581,7 +631,7 @@ report_maintenance() {
     # action) while services can be restarted individually.
     local needrestart_bin
     needrestart_bin=$(command -v needrestart)
-    if [[ -n "$needrestart_bin" ]] && /usr/bin/sudo -n /usr/bin/fail2ban-client status >/dev/null 2>&1; then
+    if [[ -n "$needrestart_bin" ]] && sudo_ok "$needrestart_bin"; then
         local nr_out nr_rc
         nr_out=$($T /usr/bin/sudo -n "$needrestart_bin" -b -p 2>/dev/null)
         nr_rc=$?
@@ -659,20 +709,36 @@ integrity_snapshot() {
 report_integrity() {
     local out=""
 
+    # Non-root runs can't read /etc/shadow, /etc/gshadow, /etc/sudoers, or
+    # /root/.ssh/authorized_keys. integrity_hash_path returns empty for
+    # those, which drops them from the snapshot — the diff then reports
+    # them as "removed" AND the poisoned snapshot overwrites the baseline,
+    # so the next root run reports them all as "added". Skip the whole
+    # check instead of corrupting it.
+    if [[ $EUID -ne 0 ]]; then
+        flag_degraded "not running as root — file-integrity check skipped (it would poison the baseline with false removals)"
+        echo ""
+        return
+    fi
+
     if [[ ! -d "$INTEGRITY_BASELINE_DIR" ]]; then
         /usr/bin/mkdir -p "$INTEGRITY_BASELINE_DIR" 2>/dev/null || {
             flag_degraded "could not create $INTEGRITY_BASELINE_DIR — integrity check skipped"
             echo ""
             return
         }
-        /usr/bin/chmod 0755 "$INTEGRITY_BASELINE_DIR"
+        /usr/bin/chmod 0700 "$INTEGRITY_BASELINE_DIR"
     fi
 
     local current
     current=$(integrity_snapshot)
 
     if [[ ! -f "$INTEGRITY_BASELINE_FILE" ]]; then
-        # First run — persist and stay silent.
+        # First run — persist and stay silent. The baseline contains hashes
+        # of /etc/shadow and /etc/gshadow, which makes it an offline
+        # password-guessing oracle for anyone who can read it: 0600, not
+        # world-readable.
+        umask 077
         /usr/bin/printf '%s' "$current" > "$INTEGRITY_BASELINE_FILE" 2>/dev/null \
             || flag_degraded "could not write integrity baseline"
         echo ""
@@ -724,7 +790,12 @@ for kind, path in changes:
             n=$((n + 1))
         done <<< "$diff"
         # Persist the new snapshot so the next run's baseline is current.
+        # umask 077 keeps it 0600 (same reasoning as the first-run write);
+        # the chmod also repairs any pre-existing world-readable baseline
+        # from an earlier version of this script.
+        umask 077
         /usr/bin/printf '%s' "$current" > "$INTEGRITY_BASELINE_FILE" 2>/dev/null
+        /usr/bin/chmod 0600 "$INTEGRITY_BASELINE_FILE" 2>/dev/null
         if [[ $n -gt 1 ]]; then
             out="$out\n🔒 INTEGRITY: $n crown-jewel change(s) total (baseline updated)"
         fi
@@ -734,6 +805,11 @@ for kind, path in changes:
 }
 
 main() {
+    # Temp file for degraded findings — see the comment at flag_degraded().
+    # Left empty if mktemp fails; flag_degraded's append then no-ops and
+    # the run proceeds without degraded reporting (same as before).
+    DEGRADED_FILE=$(/usr/bin/mktemp 2>/dev/null) || true
+
     check_deps
 
     local resources security system updates maintenance integrity exit_code=0
@@ -743,6 +819,16 @@ main() {
     updates=$(report_updates)
     maintenance=$(report_maintenance)
     integrity=$(report_integrity)
+
+    # Assemble degraded findings from the temp file (survived subshells)
+    if [[ -n "$DEGRADED_FILE" ]] && [[ -s "$DEGRADED_FILE" ]]; then
+        while IFS= read -r degraded_line; do
+            [[ -z "$degraded_line" ]] && continue
+            DEGRADED="$DEGRADED\n❓ DEGRADED: $degraded_line"
+        done < "$DEGRADED_FILE"
+        /usr/bin/rm -f "$DEGRADED_FILE"
+    fi
+    DEGRADED_FILE=""
 
     local full_report="${resources}${security}${system}${updates}${maintenance}${integrity}${DEGRADED}"
 
@@ -759,8 +845,15 @@ main() {
         local findings_count=0
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
-            # Skip the DEGRADED entries; flag_degraded() handles them separately
-            [[ "$line" == *"❓ DEGRADED:"* ]] && continue
+            # DEGRADED entries get their own severity instead of the
+            # generic emoji classification — they mean "a check could
+            # not run", which is more actionable than info/warn.
+            if [[ "$line" == *"❓ DEGRADED:"* ]]; then
+                local degraded_msg="${line#*❓ DEGRADED: }"
+                json_push "degraded" "degraded.check" "$degraded_msg"
+                findings_count=$((findings_count + 1))
+                continue
+            fi
             # Strip leading emoji + space; everything after is the message
             local msg="${line}"
             local id_prefix="info"
@@ -779,7 +872,11 @@ main() {
         done <<< "$report_for_parsing"
 
         local safe_report_json
-        safe_report_json=$(/usr/bin/printf '%s' "$safe_report" | /usr/bin/python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+        # Convert the \n escapes to real newlines BEFORE json.dumps — the
+        # escaped two-char sequences would otherwise survive into the JSON
+        # string as literal backslash-n garbage for downstream formatters.
+        local report_real_newlines="${safe_report//\\n/$'\n'}"
+        safe_report_json=$(/usr/bin/printf '%s' "$report_real_newlines" | /usr/bin/python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
         local status="ok"
         [[ "$findings_count" -gt 0 ]] && status="findings"
         /usr/bin/printf '{"status":"%s","timestamp":"%s","host":"%s","findings":[%s],"raw_output":%s}\n' \

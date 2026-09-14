@@ -52,22 +52,30 @@ Lynis-style absolute scoring.
 }
 ```
 
-Exit codes: `0` = all clear, `1` = findings present, `2` = setup error.
+Exit codes: `0` = all clear, `1` = findings present, `2` = bad CLI flag.
+In `--json` mode the exit code is always `0`; the JSON body's `status`
+field (`ok` vs `findings`) is the signal instead.
 
 ## Install
 
 ### Manual install
 
 ```bash
-# 1. Install dependencies (Ubuntu/Debian; all are in main repos)
-sudo apt install -y bash coreutils util-linux systemd
+# 1. Install dependencies (Ubuntu/Debian)
+sudo apt install -y needrestart fail2ban python3
+# docker only if you run containers and want the health check:
+# sudo apt install -y docker.io
 
 # 2. Drop the script somewhere on PATH
 sudo install -m 0755 scripts/box-audit.sh /usr/local/bin/box-audit
 
 # 3. Test it
-box-audit
+sudo box-audit
 ```
+
+Run it with sudo at least once (or via the systemd unit, which runs as
+root) so the file-integrity baseline can read all crown-jewel files.
+Non-root runs skip the integrity check rather than poison the baseline.
 
 ### Via an AI agent (recommended)
 
