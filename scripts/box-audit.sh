@@ -424,6 +424,9 @@ for row in data:
     custom_timers=""
     while IFS= read -r timer_name; do
         [[ -z "$timer_name" ]] && continue
+        # box-audit.timer (or any name the script is installed under) is
+        # this very audit — flagging it would self-report on every run.
+        [[ "$timer_name" == *"box-audit"* || "$timer_name" == *"healthcheck"* ]] && continue
         case "$timer_name" in
             anacron.timer|apport-autoreport.timer|apt-daily.timer|\
             apt-daily-upgrade.timer|dpkg-db-backup.timer|\
