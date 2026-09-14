@@ -126,18 +126,12 @@ json_push() {
 # where $0 would otherwise be "bash"). Falls back to $0 if BASH_SOURCE
 # is unset (e.g. when sourced).
 #
-# /run/lock/ is the FHS-conventional location for lockfiles and is
-# world-writable with sticky bit. Try it first; fall back to /var/lock
-# (also FHS-conventional); fall back to /tmp if neither is writable.
-# We don't try to create the dir — the systemd unit's ExecStartPre
-# handles that for the scheduled execution.
-# Use /tmp for the lockfile (world-writable, no sticky-bit headaches).
-# /var/lock has the sticky bit set, which prevents a non-owner from
-# removing root-owned lockfiles even when the script wants to self-clear
-# after a crash. /tmp is simpler and the single-instance concern is
-# only about the same user running it twice — cross-user races are
-# already prevented by the daily systemd timer firing on a fixed
-# schedule.
+# /tmp is the lockfile location: world-writable, no sticky-bit headaches.
+# The single-instance concern is only about the same user running the
+# script twice — cross-user races are already prevented by the daily
+# systemd timer firing on a fixed schedule. A foreign-owned lockfile is
+# removed when possible; if the sticky bit blocks that, the guard is
+# skipped with a warning rather than failing the run (see below).
 LOCK_DIR="/tmp"
 LOCK_FILE="$LOCK_DIR/sysadmin-healthcheck-box-audit.lock"
 LOCK_ENABLED="yes"
@@ -378,14 +372,13 @@ report_security() {
     # SUID binary count — catches a rootkit that dropped a SUID binary to
     # escalate. Standard Ubuntu desktop has ~18-25 SUID files (passwd,
     # mount, su, sudo, etc.). A real jump means somebody added one.
+    # Skip /var/lib/docker: overlay2 layers carry SUID bits from base
+    # images (passwd, util-linux, openssh) that don't add to the host's
+    # attack surface, and their counts mask real findings (37 → 17 here).
+    # `-path '/var/lib/docker' -prune -o` drops the whole tree before the
+    # perm filter runs.
     local suid_count
-    # Skip /var/lib/docker overlay2 layers — they contain SUID bits from base
-# images (passwd, util-linux, openssh, etc.) that the host can't directly
-# execute as SUID, so they don't add to the host's attack surface. They
-# show up as massive counts that mask real findings (37 → 17 on this box).
-# `-path '/var/lib/docker' -prune -o` drops the entire docker tree from
-# the find walk before the perm filter runs.
-suid_count=$($T /usr/bin/find / -xdev -path '/var/lib/docker' -prune -o -perm -4000 -type f -print 2>/dev/null | /usr/bin/wc -l)
+    suid_count=$($T /usr/bin/find / -xdev -path '/var/lib/docker' -prune -o -perm -4000 -type f -print 2>/dev/null | /usr/bin/wc -l)
     suid_count=${suid_count:-0}
     # Baseline 18 measured 2026-09-14 on this box; flag if > 30 (50%+ growth).
     [[ $suid_count -gt 30 ]] && out="$out\n🔓 SUID: $suid_count SUID binaries on disk (baseline ~18-25) — review for unauthorised additions"
