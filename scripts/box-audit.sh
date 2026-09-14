@@ -665,14 +665,18 @@ report_integrity() {
             echo ""
             return
         }
-        /usr/bin/chmod 0755 "$INTEGRITY_BASELINE_DIR"
+        /usr/bin/chmod 0700 "$INTEGRITY_BASELINE_DIR"
     fi
 
     local current
     current=$(integrity_snapshot)
 
     if [[ ! -f "$INTEGRITY_BASELINE_FILE" ]]; then
-        # First run — persist and stay silent.
+        # First run — persist and stay silent. The baseline contains hashes
+        # of /etc/shadow and /etc/gshadow, which makes it an offline
+        # password-guessing oracle for anyone who can read it: 0600, not
+        # world-readable.
+        umask 077
         /usr/bin/printf '%s' "$current" > "$INTEGRITY_BASELINE_FILE" 2>/dev/null \
             || flag_degraded "could not write integrity baseline"
         echo ""
@@ -724,7 +728,12 @@ for kind, path in changes:
             n=$((n + 1))
         done <<< "$diff"
         # Persist the new snapshot so the next run's baseline is current.
+        # umask 077 keeps it 0600 (same reasoning as the first-run write);
+        # the chmod also repairs any pre-existing world-readable baseline
+        # from an earlier version of this script.
+        umask 077
         /usr/bin/printf '%s' "$current" > "$INTEGRITY_BASELINE_FILE" 2>/dev/null
+        /usr/bin/chmod 0600 "$INTEGRITY_BASELINE_FILE" 2>/dev/null
         if [[ $n -gt 1 ]]; then
             out="$out\n🔒 INTEGRITY: $n crown-jewel change(s) total (baseline updated)"
         fi
