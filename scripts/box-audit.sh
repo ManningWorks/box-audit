@@ -560,7 +560,11 @@ report_maintenance() {
             out="$out\n⏰ UNATTENDED-UPGRADES: no INFO line found in log"
         elif [[ $uu_age -gt $TIMER_DRIFT_SECS ]]; then
             out="$out\n⏰ UNATTENDED-UPGRADES: log not updated in ${uu_age}s — service may be broken"
-        elif ! echo "$uu_last" | /usr/bin/grep -qE "All upgrades installed|No packages found that can be upgraded unattended|kept packages can't be calculated in dry-run mode"; then
+        # NOTE: do NOT use 'echo "$uu_last" | grep -qE ...' here — the echo's
+        # stdout leaks into the function's stdout, polluting the captured
+        # report with the raw log line. Use a here-string so $uu_last goes
+        # straight to grep's stdin without an echo.
+        elif ! grep -qE "All upgrades installed|No packages found that can be upgraded unattended|kept packages can't be calculated in dry-run mode" <<<"$uu_last"; then
             # Strip the timestamp prefix so the snippet fits Telegram's char
             # budget and answers "old artifact?" vs "current anomaly" at a glance.
             out="$out\n⏰ UNATTENDED-UPGRADES: last INFO line unexpected — $(echo "$uu_last" | /usr/bin/sed -E 's/^[^ ]+ +[0-9:,-]+ INFO //' | /usr/bin/cut -c1-100)"
