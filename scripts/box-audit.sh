@@ -324,7 +324,13 @@ report_security() {
     # escalate. Standard Ubuntu desktop has ~18-25 SUID files (passwd,
     # mount, su, sudo, etc.). A real jump means somebody added one.
     local suid_count
-    suid_count=$($T /usr/bin/find / -xdev -perm -4000 -type f 2>/dev/null | /usr/bin/wc -l)
+    # Skip /var/lib/docker overlay2 layers — they contain SUID bits from base
+# images (passwd, util-linux, openssh, etc.) that the host can't directly
+# execute as SUID, so they don't add to the host's attack surface. They
+# show up as massive counts that mask real findings (37 → 17 on this box).
+# `-path '/var/lib/docker' -prune -o` drops the entire docker tree from
+# the find walk before the perm filter runs.
+suid_count=$($T /usr/bin/find / -xdev -path '/var/lib/docker' -prune -o -perm -4000 -type f -print 2>/dev/null | /usr/bin/wc -l)
     suid_count=${suid_count:-0}
     # Baseline 18 measured 2026-09-14 on this box; flag if > 30 (50%+ growth).
     [[ $suid_count -gt 30 ]] && out="$out\n🔓 SUID: $suid_count SUID binaries on disk (baseline ~18-25) — review for unauthorised additions"
