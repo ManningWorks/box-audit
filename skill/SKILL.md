@@ -1,74 +1,64 @@
 ---
 name: box-audit
-version: 0.1.0
-description: Install the box-audit daily system health + security audit. Use when the user pastes a github URL pointing to ManningWorks/box-audit, names "box-audit", or asks for a daily Telegram/Discord audit of a Linux box. Installs the script + a daily systemd unit + a verify-with-dry-run gate before declaring done.
-trigger: User wants daily system audit, security + health Telegram summary, or "install box-audit"
+version: 0.2.0
+description: Install or repair the box-audit daily security + health audit (script + systemd timer) on a Linux box. Use when the user names "box-audit", pastes a github.com/ManningWorks/box-audit URL, or asks for a daily Telegram/Discord system audit of their machine.
 ---
 
 # box-audit installer
 
-Install the box-audit daily-delta security + health check on this Linux box.
-Pair the script with a daily systemd timer and verify with a dry-run before
-declaring done.
+Install the box-audit daily-delta audit: script on PATH, systemd timer for
+the daily run, output file the user (or a bot) reads. ~10 minutes end to end.
 
-## When this skill applies
+The verify gate (step 4) is the skill. A timer that fails silently every
+morning hands the user false peace of mind. That's the exact opposite of
+what an audit is for. No gate pass, no "done".
 
-- User pastes `github.com/ManningWorks/box-audit` or any URL under it
-- User says "install box-audit", "set up box-audit", "daily system audit"
-- User asks "give me a daily Telegram summary of my box's security"
-- User wants to replace an ad-hoc daily check script with this
+Upstream source of truth: https://github.com/ManningWorks/box-audit
+This skill describes the install; the script's own behaviour is documented
+in its `--help` and the repo README. Where they disagree with this file,
+trust the script and file an issue.
 
-Skip if not Linux (the script depends on systemd, apt, journalctl).
-
-## Steps
-
-### 1. Fetch the script from upstream
+## 1. Fetch and sanity-check the script
 
 ```bash
-mkdir -p /tmp/box-audit-install
 curl -fsSL https://raw.githubusercontent.com/ManningWorks/box-audit/master/scripts/box-audit.sh \
     -o /tmp/box-audit-install/box-audit.sh
+bash -n /tmp/box-audit-install/box-audit.sh \
+  && grep -q 'report_security' /tmp/box-audit-install/box-audit.sh \
+  && grep -q -- '--json' /tmp/box-audit-install/box-audit.sh
 ```
 
-Verify the script:
-- File is non-empty (>5 KB)
-- Starts with `#!/bin/bash`
-- Contains `--json` flag handling
-- Contains the function `report_security` (sanity check it didn't get truncated)
+`bash -n` parses the whole file, so a truncated or corrupted download fails
+here rather than at 9am on the box.
 
-If any check fails, stop and ask the user — do not install a malformed script.
+**Done when:** the compound command exits 0. On failure, stop and report the
+fetch as bad; install nothing.
 
-### 2. Install the script
+## 2. Install the script and check dependencies
 
 ```bash
 sudo install -m 0755 /tmp/box-audit-install/box-audit.sh /usr/local/bin/box-audit
-which box-audit && box-audit --help
+box-audit --help        # usage text, exit 0
+sudo box-audit          # first run, as root
 ```
 
-### 3. Verify dependencies
+The first run must be root so the file-integrity baseline reads all
+crown-jewel files; a non-root first run leaves the integrity check degraded.
+Collect any `❓ DEGRADED:` lines from the output. Each names the missing
+binary and the check it would enable (`needrestart`, `fail2ban-client`,
+`docker`). List them for the user and install the ones they want before
+moving on; the checks are the product.
 
-The script's `check_deps()` function lists required binaries. Most are in
-`coreutils`, `util-linux`, `systemd`. The optional ones:
+**Done when:** `box-audit --help` exits 0 and the first run prints a report
+(ok or findings; findings are fine, they're the tool working).
 
-| Binary | Required by check | Install |
-|---|---|---|
-| `needrestart` | libc/kernel drift detection | `sudo apt install -y needrestart` |
-| `fail2ban-client` | fail2ban banned-IP status | `sudo apt install -y fail2ban` (if not already) |
-| `docker` | Docker container health check | only if user runs docker |
+## 3. Install the systemd units
 
-Run `box-audit` once and check the output for any `❓ DEGRADED: '<bin>' not found` lines. Tell the user what's missing and ask whether to install.
+Create `/var/log/box-audit/` first, then write both units:
 
-### 4. Install the systemd units
-
-Write `/etc/systemd/system/box-audit.service` and `box-audit.timer`. The
-service runs `box-audit --json` and either pipes the output to the user's
-delivery system or writes to a file the user can pick up later.
-
-Default delivery is **to a file** at `/var/log/box-audit/latest.json`. The
-user can swap in a webhook / Telegram bot later without changing the script.
+`/etc/systemd/system/box-audit.service`:
 
 ```ini
-# /etc/systemd/system/box-audit.service
 [Unit]
 Description=box-audit daily system health + security check
 Wants=network-online.target
@@ -77,18 +67,17 @@ After=network-online.target
 [Service]
 Type=oneshot
 User=root
-# systemd parses whitespace in ExecStart as argv boundaries — DO NOT put
-# a `>` redirection inside `ExecStart=/bin/bash -c '...'` because systemd
-# will pass the redirect target to bash as an argv element instead of
-# parsing it as shell syntax. Use StandardOutput=truncate:... instead, which
-# bypasses the shell and captures stdout directly.
+# truncate:, not file: — file: never truncates, so a shorter JSON document
+# following a longer one leaves stale bytes glued to the end and the file
+# stops parsing. truncate: cuts on service start.
 StandardOutput=truncate:/var/log/box-audit/latest.json
 StandardError=journal
 ExecStart=/usr/local/bin/box-audit --json
 ```
 
+`/etc/systemd/system/box-audit.timer`:
+
 ```ini
-# /etc/systemd/system/box-audit.timer
 [Unit]
 Description=Run box-audit daily
 
@@ -105,67 +94,66 @@ WantedBy=timers.target
 sudo mkdir -p /var/log/box-audit
 sudo systemctl daemon-reload
 sudo systemctl enable --now box-audit.timer
-sudo systemctl status box-audit.timer --no-pager
 ```
 
-### 5. Verify with a dry-run (GATE — do not declare done unless this passes)
+**Done when:** `systemctl is-active box-audit.timer` prints `active` and
+`systemctl list-timers box-audit.timer` shows a next-run time.
 
-Run the service once manually and inspect the output:
+## 4. Verify gate
 
 ```bash
 sudo systemctl start box-audit.service
-sudo systemctl status box-audit.service --no-pager
-sudo journalctl -u box-audit.service --since "5 minutes ago" --no-pager
-test -s /var/log/box-audit/latest.json && echo "JSON output file written"
+systemctl show box-audit.service -p Result -p ExecMainStatus
+python3 -c "import json; d=json.load(open('/var/log/box-audit/latest.json')); print(d['status'], len(d['findings']), 'findings')"
 ```
 
-Expected:
-- Service status: `active (exited)` with exit code 0
-- `/var/log/box-audit/latest.json` exists, is non-empty, parses as valid JSON:
-  ```bash
-  python3 -c "import json; d=json.load(open('/var/log/box-audit/latest.json')); print(f'{len(d[\"findings\"])} findings, status={d[\"status\"]}')"
-  ```
+**Done when all three hold:**
+- `Result=success`, `ExecMainStatus=0`
+- `latest.json` parses and prints its status + finding count
+- the timer from step 3 still shows `active` with a next-run time
 
-If the service fails or the JSON is malformed, debug before declaring done.
-Common failures:
-- `sudo: a password is required` — script needs `NOPASSWD` in sudoers, or run service as a user with NOPASSWD already configured
-- `needrestart: command not found` — install it, or accept the DEGRADED line
-- Exit code 2 from script — unknown CLI flag passed; rerun manually to see
+If the gate fails, debug before declaring done. The usual suspects, in
+order of likelihood:
+- `sudo: a password is required` in the journal: the script shells out to
+  `sudo -n` for `fail2ban-client` and `docker`. Either run the service as
+  root (as above) or grant NOPASSWD for exactly those two commands.
+- directory missing. `/var/log/box-audit/` doesn't exist when the service
+  first runs, and the run fails on output.
+- exit 2 from the script itself. A bad CLI flag reached `ExecStart`; run
+  the same command by hand to see the error.
 
-### 6. (Optional) Wire up delivery
+## 5. Report
 
-If the user has a Telegram / Discord bot already configured for system
-notifications, replace the `ExecStart` in the service file with a webhook
-POST:
+Tell the user, with real values from the gate run:
+- script path (`/usr/local/bin/box-audit`) and version from `--help`
+- timer active, with the actual next-run time
+- where output lands (`/var/log/box-audit/latest.json`) and today's
+  finding count
+- any DEGRADED lines left unfixed, as explicit follow-ups
+- one line on pairing with monthly Lynis for absolute (non-delta) scoring
+
+## Webhook delivery (optional branch)
+
+If the user already has a Telegram/Discord bot for system notifications,
+replace the service's stdout capture with a POST:
 
 ```ini
 ExecStart=/bin/bash -c '/usr/local/bin/box-audit --json | curl -fsS -X POST -H "Content-Type: application/json" -d @- https://your-webhook.example.com/audit'
 ```
 
-The downstream formatter turns the JSON findings into a Telegram message
-using the `severity`, `id`, and `message` fields.
-
-### 7. Report
-
-Tell the user:
-- Script installed at `/usr/local/bin/box-audit`
-- Daily systemd timer `box-audit.timer` is active
-- Latest output is at `/var/log/box-audit/latest.json` (or their webhook)
-- Show today's finding count: `python3 -c "import json; print(len(json.load(open('/var/log/box-audit/latest.json'))['findings']), 'findings')"`
-- Note any DEGRADED lines that need follow-up
-- Suggest pairing with monthly Lynis for absolute scoring (not part of this skill)
+The JSON's `severity`, `id`, and `message` fields per finding are the
+formatter contract. Everything else in the skill is unchanged; the gate
+still runs, checking the webhook received the payload instead of the file.
 
 ## Pitfalls
 
-- **Do not install without the verify gate.** A systemd unit that fails
-  silently every day is worse than not having one — it gives false peace
-  of mind. Step 5 is mandatory.
-- **Do not assume NOPASSWD sudo.** Many personal boxes don't have it. Either
-  configure sudoers first (audit-only rules: `/usr/bin/fail2ban-client`,
-  `/usr/bin/docker`) or document that the user needs to do this.
-- **Do not write the timer with `OnCalendar=hourly`**. Daily is right for
-  this audit; hourly generates noise the user will tune out.
-- **Do not modify the script before installing.** The upstream version has
-  been tested. If you need a local change, fork or wrap, don't patch in place.
-- **`/var/log/box-audit/` needs to exist before the service runs.** Create
-  it in step 4 or the first run will fail with a permission/IO error.
+- Run the verify gate before declaring done. A unit that fails silently
+  every day is worse than no unit.
+- Check sudo policy before the first service run: the script probes
+  `sudo -n` per command (`fail2ban-client`, `docker`) and degrades the
+  check when the probe fails, which is easy to miss in JSON output.
+- Keep the timer daily. Hourly re-runs generate noise the user learns to
+  ignore, which defeats a delta audit.
+- Install the upstream script as-is; wrap or fork for local changes so the
+  next update doesn't silently revert them.
+- Create `/var/log/box-audit/` before the first service run, not after.
