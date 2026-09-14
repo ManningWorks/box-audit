@@ -759,8 +759,15 @@ main() {
         local findings_count=0
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
-            # Skip the DEGRADED entries; flag_degraded() handles them separately
-            [[ "$line" == *"❓ DEGRADED:"* ]] && continue
+            # DEGRADED entries get their own severity instead of the
+            # generic emoji classification — they mean "a check could
+            # not run", which is more actionable than info/warn.
+            if [[ "$line" == *"❓ DEGRADED:"* ]]; then
+                local degraded_msg="${line#*❓ DEGRADED: }"
+                json_push "degraded" "degraded.check" "$degraded_msg"
+                findings_count=$((findings_count + 1))
+                continue
+            fi
             # Strip leading emoji + space; everything after is the message
             local msg="${line}"
             local id_prefix="info"
@@ -779,7 +786,11 @@ main() {
         done <<< "$report_for_parsing"
 
         local safe_report_json
-        safe_report_json=$(/usr/bin/printf '%s' "$safe_report" | /usr/bin/python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+        # Convert the \n escapes to real newlines BEFORE json.dumps — the
+        # escaped two-char sequences would otherwise survive into the JSON
+        # string as literal backslash-n garbage for downstream formatters.
+        local report_real_newlines="${safe_report//\\n/$'\n'}"
+        safe_report_json=$(/usr/bin/printf '%s' "$report_real_newlines" | /usr/bin/python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
         local status="ok"
         [[ "$findings_count" -gt 0 ]] && status="findings"
         /usr/bin/printf '{"status":"%s","timestamp":"%s","host":"%s","findings":[%s],"raw_output":%s}\n' \
