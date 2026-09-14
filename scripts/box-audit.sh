@@ -87,16 +87,21 @@ json_push() {
 # where $0 would otherwise be "bash"). Falls back to $0 if BASH_SOURCE
 # is unset (e.g. when sourced).
 #
-# Use /var/lock/box-audit/ instead of /tmp/ so the file is owned by root
-# when systemd runs the script as root — a /tmp lockfile owned by an
-# earlier luke-user run blocks root invocations. Falls back to /tmp if
-# /var/lock isn't writable.
-LOCK_DIR="/var/lock/box-audit"
-if (/usr/bin/mkdir -p "$LOCK_DIR" && [[ -w "$LOCK_DIR" ]]) 2>/dev/null; then
-    LOCK_FILE="$LOCK_DIR/healthcheck.lock"
-else
-    LOCK_FILE="/tmp/sysadmin-healthcheck-box-audit.lock"
-fi
+# /run/lock/ is the FHS-conventional location for lockfiles and is
+# world-writable with sticky bit. Try it first; fall back to /var/lock
+# (also FHS-conventional); fall back to /tmp if neither is writable.
+# We don't try to create the dir — the systemd unit's ExecStartPre
+# handles that for the scheduled execution.
+LOCK_FILE=""
+for lock_dir in /run/lock /var/lock /tmp; do
+    if [[ -d "$lock_dir" && -w "$lock_dir" ]]; then
+        LOCK_FILE="$lock_dir/sysadmin-healthcheck-box-audit.lock"
+        break
+    fi
+done
+# If nothing is writable, skip the lock entirely (single-user case).
+LOCK_ENABLED="no"
+[[ -n "$LOCK_FILE" ]] && LOCK_ENABLED="yes"
 # Track anything that couldn't run properly, so a silent/missing result
 # doesn't get reported as "all clear".
 DEGRADED=""
@@ -107,11 +112,15 @@ flag_degraded() {
 
 # --- Single-instance guard -------------------------------------------------
 # Prevents an overlapping run (e.g. a slow journalctl on a big journal)
-# from stacking up under cron.
-exec 200>"$LOCK_FILE"
-if ! /usr/bin/flock -n 200; then
-    echo "sysadmin-healthcheck: another instance is already running, exiting" >&2
-    exit 0
+# from stacking up under cron. Skipped if no writable lock dir was found.
+if [[ "$LOCK_ENABLED" == "yes" ]]; then
+    exec 200>"$LOCK_FILE"
+    if ! /usr/bin/flock -n 200; then
+        echo "sysadmin-healthcheck: another instance is already running, exiting" >&2
+        exit 0
+    fi
+else
+    echo "sysadmin-healthcheck: WARNING — no writable lock dir, skipping single-instance guard" >&2
 fi
 
 # --- Dependency / privilege verification ------------------------------------
