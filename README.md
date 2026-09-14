@@ -95,8 +95,8 @@ User=root
 # DO NOT use `ExecStart=/bin/bash -c '... > /path'` — systemd parses
 # whitespace as argv boundaries and will pass the redirect target to
 # bash as a positional argument instead of shell syntax. Use
-# StandardOutput=file:... to bypass the shell entirely.
-StandardOutput=file:/var/log/box-audit/latest.json
+# StandardOutput=truncate:... to bypass the shell entirely.
+StandardOutput=truncate:/var/log/box-audit/latest.json
 StandardError=journal
 ExecStart=/usr/local/bin/box-audit --json
 # Sudo is invoked internally by the script for fail2ban/docker checks;

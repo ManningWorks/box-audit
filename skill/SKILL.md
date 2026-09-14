@@ -80,9 +80,9 @@ User=root
 # systemd parses whitespace in ExecStart as argv boundaries — DO NOT put
 # a `>` redirection inside `ExecStart=/bin/bash -c '...'` because systemd
 # will pass the redirect target to bash as an argv element instead of
-# parsing it as shell syntax. Use StandardOutput=file:... instead, which
+# parsing it as shell syntax. Use StandardOutput=truncate:... instead, which
 # bypasses the shell and captures stdout directly.
-StandardOutput=file:/var/log/box-audit/latest.json
+StandardOutput=truncate:/var/log/box-audit/latest.json
 StandardError=journal
 ExecStart=/usr/local/bin/box-audit --json
 ```
