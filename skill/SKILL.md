@@ -76,12 +76,15 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-# Pre-create the lock directory with permissive perms so the script's
-# flock doesn't fail when run as root after a luke-user invocation left
-# a /tmp lockfile owned by luke.
-ExecStartPre=/bin/mkdir -p /var/lock/box-audit
-ExecStart=/bin/bash -c '/usr/local/bin/box-audit --json > /var/log/box-audit/latest.json'
 User=root
+# systemd parses whitespace in ExecStart as argv boundaries — DO NOT put
+# a `>` redirection inside `ExecStart=/bin/bash -c '...'` because systemd
+# will pass the redirect target to bash as an argv element instead of
+# parsing it as shell syntax. Use StandardOutput=file:... instead, which
+# bypasses the shell and captures stdout directly.
+StandardOutput=file:/var/log/box-audit/latest.json
+StandardError=journal
+ExecStart=/usr/local/bin/box-audit --json
 ```
 
 ```ini
