@@ -142,10 +142,16 @@ LOCK_FILE="$LOCK_DIR/sysadmin-healthcheck-box-audit.lock"
 LOCK_ENABLED="yes"
 # Track anything that couldn't run properly, so a silent/missing result
 # doesn't get reported as "all clear".
+#
+# Degraded findings are collected in a temp FILE, not a shell variable:
+# every report_* function runs inside a command substitution, which is a
+# subshell — appending to a global there mutates a copy that's thrown
+# away when the substitution returns. A file survives subshell boundaries
+# and main() reads it once at assembly time.
+DEGRADED_FILE=""
 DEGRADED=""
-
 flag_degraded() {
-    DEGRADED="$DEGRADED\n❓ DEGRADED: $1"
+    /usr/bin/printf '%s\n' "$1" >> "$DEGRADED_FILE" 2>/dev/null
 }
 
 # --- Single-instance guard -------------------------------------------------
@@ -659,6 +665,18 @@ integrity_snapshot() {
 report_integrity() {
     local out=""
 
+    # Non-root runs can't read /etc/shadow, /etc/gshadow, /etc/sudoers, or
+    # /root/.ssh/authorized_keys. integrity_hash_path returns empty for
+    # those, which drops them from the snapshot — the diff then reports
+    # them as "removed" AND the poisoned snapshot overwrites the baseline,
+    # so the next root run reports them all as "added". Skip the whole
+    # check instead of corrupting it.
+    if [[ $EUID -ne 0 ]]; then
+        flag_degraded "not running as root — file-integrity check skipped (it would poison the baseline with false removals)"
+        echo ""
+        return
+    fi
+
     if [[ ! -d "$INTEGRITY_BASELINE_DIR" ]]; then
         /usr/bin/mkdir -p "$INTEGRITY_BASELINE_DIR" 2>/dev/null || {
             flag_degraded "could not create $INTEGRITY_BASELINE_DIR — integrity check skipped"
@@ -743,6 +761,11 @@ for kind, path in changes:
 }
 
 main() {
+    # Temp file for degraded findings — see the comment at flag_degraded().
+    # Left empty if mktemp fails; flag_degraded's append then no-ops and
+    # the run proceeds without degraded reporting (same as before).
+    DEGRADED_FILE=$(/usr/bin/mktemp 2>/dev/null) || true
+
     check_deps
 
     local resources security system updates maintenance integrity exit_code=0
@@ -752,6 +775,16 @@ main() {
     updates=$(report_updates)
     maintenance=$(report_maintenance)
     integrity=$(report_integrity)
+
+    # Assemble degraded findings from the temp file (survived subshells)
+    if [[ -n "$DEGRADED_FILE" ]] && [[ -s "$DEGRADED_FILE" ]]; then
+        while IFS= read -r degraded_line; do
+            [[ -z "$degraded_line" ]] && continue
+            DEGRADED="$DEGRADED\n❓ DEGRADED: $degraded_line"
+        done < "$DEGRADED_FILE"
+        /usr/bin/rm -f "$DEGRADED_FILE"
+    fi
+    DEGRADED_FILE=""
 
     local full_report="${resources}${security}${system}${updates}${maintenance}${integrity}${DEGRADED}"
 
