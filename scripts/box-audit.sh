@@ -330,8 +330,18 @@ report_security() {
     local ss_out
     ss_out=$($T /usr/bin/ss -tnp state established 2>/dev/null)
     if [[ -n "$ss_out" ]]; then
+        # IPv4: column 5 holds remote addr:port.
         local remote_ips
         remote_ips=$(echo "$ss_out" | awk 'NR>1 {print $5}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
+        # IPv6: same column, but addresses are hex with colons and often a
+        # %if suffix ([2001:db8::1]:443 or [fe80::1%eth0]:22). Grab the
+        # bracketed address, strip port/brackets/interface. Without this,
+        # a compromised process phoning home over IPv6 is invisible to the
+        # check on any dual-stack box.
+        local remote_ips6
+        remote_ips6=$(echo "$ss_out" | awk 'NR>1 {print $5}' \
+            | grep -oE '^\[[0-9a-fA-F:]+(%[a-z0-9]+)?\]' \
+            | /usr/bin/sed -E 's/^\[//; s/\]$//' | sort -u)
         local suspicious_ips=""
         local ip
         for ip in $remote_ips; do
@@ -340,6 +350,20 @@ report_security() {
                || [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] \
                || [[ "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\. ]] \
                || [[ "$ip" =~ ^127\. ]]; then
+                continue
+            fi
+            suspicious_ips="$suspicious_ips $ip"
+        done
+        for ip in $remote_ips6; do
+            # Lowercase for consistent matching, strip zone id (fe80::1%eth0)
+            ip="${ip%%%*}"
+            ip="${ip,,}"
+            # Skip loopback (::1), link-local fe80::/10, ULA fc00::/7,
+            # and IPv4-mapped ::ffff:x.x.x.x (already handled above).
+            if [[ "$ip" == "::1" ]] \
+               || [[ "$ip" =~ ^fe[89ab] ]] \
+               || [[ "$ip" =~ ^f[cd] ]] \
+               || [[ "$ip" =~ ^::ffff: ]]; then
                 continue
             fi
             suspicious_ips="$suspicious_ips $ip"
