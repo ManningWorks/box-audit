@@ -187,20 +187,44 @@ fi
 # If a required binary is missing, or sudo isn't actually usable
 # non-interactively, the relevant checks below will silently return empty
 # results and look identical to "no issues". Catch that here instead.
+
+# sudo_ok <command-path> — is `sudo -n <this exact command>` usable?
+# Probing one sudo command (e.g. fail2ban-client) does NOT prove others
+# (docker, apt-get, needrestart) are allowed: scoped sudoers lists each
+# command separately. Each check gates on its own command's probe.
+# Results are cached — declare the assoc array once at source time.
+declare -A SUDO_OK_CACHE
+sudo_ok() {
+    local cmd="$1"
+    if [[ -z "${SUDO_OK_CACHE[$cmd]:-}" ]]; then
+        if /usr/bin/sudo -n "$cmd" --version >/dev/null 2>&1 \
+           || /usr/bin/sudo -n "$cmd" status >/dev/null 2>&1 \
+           || /usr/bin/sudo -n "$cmd" --help >/dev/null 2>&1; then
+            SUDO_OK_CACHE[$cmd]=1
+        else
+            SUDO_OK_CACHE[$cmd]=0
+        fi
+    fi
+    [[ "${SUDO_OK_CACHE[$cmd]}" == "1" ]]
+}
+
 check_deps() {
     local bin
-    for bin in df free awk ss systemctl journalctl apt find sudo fail2ban-client docker timeout flock stat; do
+    for bin in df free awk ss systemctl journalctl apt find sudo fail2ban-client docker timeout flock stat python3; do
         if ! command -v "$bin" >/dev/null 2>&1; then
             flag_degraded "'$bin' not found on PATH — related checks skipped"
         fi
     done
 
     if command -v sudo >/dev/null 2>&1; then
-        # Probe one of the actual sudo commands the script will use,
-        # not bare `sudo -n true` (which fails under scoped sudoers).
-        # fail2ban-client is the lightest of the three needed commands.
-        if ! /usr/bin/sudo -n /usr/bin/fail2ban-client status >/dev/null 2>&1; then
-            flag_degraded "passwordless sudo for fail2ban-client/docker not working — related checks skipped"
+        # Probe each sudo command the script actually uses. Under scoped
+        # sudoers these succeed/fail independently, so one shared canary
+        # would mask per-command gaps (e.g. docker allowed, apt-get not).
+        if ! sudo_ok /usr/bin/fail2ban-client; then
+            flag_degraded "passwordless sudo for fail2ban-client not working — fail2ban check skipped"
+        fi
+        if ! sudo_ok /usr/bin/docker; then
+            flag_degraded "passwordless sudo for docker not working — container health check skipped"
         fi
     fi
 
@@ -433,7 +457,7 @@ for row in data:
 
     # Docker containers - use Docker's own health filter (containers with no
     # HEALTHCHECK defined are correctly ignored, not false-flagged)
-    if /usr/bin/sudo -n /usr/bin/fail2ban-client status >/dev/null 2>&1; then
+    if sudo_ok /usr/bin/docker; then
         local unhealthy unhealthy_names
         unhealthy_names=$($T /usr/bin/sudo /usr/bin/docker ps --filter health=unhealthy --format '{{.Names}}' 2>/dev/null)
         unhealthy=$(echo "$unhealthy_names" | grep -c . | tr -d ' \n')
@@ -469,11 +493,13 @@ report_updates() {
     # saw an empty queue, our cron reported "0 security" while 28 were
     # actually pending. This protects against that class of bug.
     # Wrapped in -n sudo with a 30s budget so a slow mirror doesn't hang cron.
-    if /usr/bin/sudo -n /usr/bin/fail2ban-client status >/dev/null 2>&1; then
+    # Gated on its own probe: sudoers allowing fail2ban-client says nothing
+    # about apt-get.
+    if sudo_ok /usr/bin/apt-get; then
         $T 30 /usr/bin/sudo -n /usr/bin/apt-get -qq update 2>/dev/null || \
             flag_degraded "apt update priming failed (cache may be stale)"
     else
-        flag_degraded "passwordless sudo unavailable — skipping apt cache priming"
+        flag_degraded "passwordless sudo for apt-get unavailable — skipping apt cache priming (update counts may be stale)"
     fi
 
     # Cache apt output once
@@ -587,7 +613,7 @@ report_maintenance() {
     # action) while services can be restarted individually.
     local needrestart_bin
     needrestart_bin=$(command -v needrestart)
-    if [[ -n "$needrestart_bin" ]] && /usr/bin/sudo -n /usr/bin/fail2ban-client status >/dev/null 2>&1; then
+    if [[ -n "$needrestart_bin" ]] && sudo_ok "$needrestart_bin"; then
         local nr_out nr_rc
         nr_out=$($T /usr/bin/sudo -n "$needrestart_bin" -b -p 2>/dev/null)
         nr_rc=$?
