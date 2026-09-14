@@ -43,7 +43,7 @@ Lynis-style absolute scoring.
 {
   "status": "findings",
   "timestamp": "2026-09-14T14:29:33Z",
-  "host": "luke-NucBoxG3-Plus",
+  "host": "your-hostname",
   "findings": [
     {"severity": "warn", "id": "security:_2_security", "message": "SECURITY: 2 security update(s) pending"},
     {"severity": "warn", "id": "kernel-restart:_kernel:_7.0.0-31-generic", "message": "KERNEL-RESTART: ..."}
@@ -62,10 +62,10 @@ Exit codes: `0` = all clear, `1` = findings present, `2` = setup error.
 # 1. Install dependencies (Ubuntu/Debian; all are in main repos)
 sudo apt install -y bash coreutils util-linux systemd
 
-# 3. Drop the script somewhere on PATH
+# 2. Drop the script somewhere on PATH
 sudo install -m 0755 scripts/box-audit.sh /usr/local/bin/box-audit
 
-# 4. Test it
+# 3. Test it
 box-audit
 ```
 
@@ -75,7 +75,7 @@ If you use an AI agent that supports the [Skills](https://agentskills.io) format
 (Hermes, opencode, Claude Code, etc.), point it at the `skill/SKILL.md` file:
 
 > "Install the box-audit skill from
-> https://github.com/lukemanning/box-audit/tree/main/skill"
+> https://github.com/ManningWorks/box-audit/tree/master/skill"
 
 The agent will walk through: copy the script, set up a daily systemd timer,
 verify with a dry-run, and report back.
@@ -137,7 +137,6 @@ sudo systemctl enable --now box-audit.timer
 - **Not a security tool.** It is an observer. It does not block, patch,
   quarantine, or remediate. It surfaces things; you decide.
 - **Not comprehensive.** It checks ~25 things. Lynis checks hundreds.
-  See `examples/comparison-with-lynis.md` for the difference.
 - **Not CIS-compliant.** No compliance framework. If you need CIS / PCI /
   HIPAA evidence, run Lynis or OpenSCAP.
 

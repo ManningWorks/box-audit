@@ -1,3 +1,0 @@
-/usr/local/bin/box-audit: line 111: /tmp/sysadmin-healthcheck-box-audit.lock: Permission denied
-flock: 200: Bad file descriptor
-sysadmin-healthcheck: another instance is already running, exiting

@@ -1,7 +1,7 @@
 ---
 name: box-audit
 version: 0.1.0
-description: Install the box-audit daily system health + security audit. Use when the user pastes a github URL pointing to lukemanning/box-audit, names "box-audit", or asks for a daily Telegram/Discord audit of a Linux box. Installs the script + a daily systemd unit + a verify-with-dry-run gate before declaring done.
+description: Install the box-audit daily system health + security audit. Use when the user pastes a github URL pointing to ManningWorks/box-audit, names "box-audit", or asks for a daily Telegram/Discord audit of a Linux box. Installs the script + a daily systemd unit + a verify-with-dry-run gate before declaring done.
 trigger: User wants daily system audit, security + health Telegram summary, or "install box-audit"
 ---
 
@@ -13,7 +13,7 @@ declaring done.
 
 ## When this skill applies
 
-- User pastes `github.com/lukemanning/box-audit` or any URL under it
+- User pastes `github.com/ManningWorks/box-audit` or any URL under it
 - User says "install box-audit", "set up box-audit", "daily system audit"
 - User asks "give me a daily Telegram summary of my box's security"
 - User wants to replace an ad-hoc daily check script with this
@@ -26,7 +26,7 @@ Skip if not Linux (the script depends on systemd, apt, journalctl).
 
 ```bash
 mkdir -p /tmp/box-audit-install
-curl -fsSL https://raw.githubusercontent.com/lukemanning/box-audit/main/scripts/box-audit.sh \
+curl -fsSL https://raw.githubusercontent.com/ManningWorks/box-audit/master/scripts/box-audit.sh \
     -o /tmp/box-audit-install/box-audit.sh
 ```
 

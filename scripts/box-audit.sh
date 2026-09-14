@@ -1,9 +1,11 @@
 #!/bin/bash
-# Luke Manning - System Health Check (NucBox / Hermes agent box)
-# Uses /usr/bin/sudo -n for fail2ban-client and docker (passwordless).
-# Note: /etc/sudoers.d/luke currently grants NOPASSWD: ALL — consider
-# tightening to just /usr/bin/fail2ban-client, /usr/bin/docker, /usr/bin/apt
-# (the last is needed only if you ever want this script to run apt itself).
+# System health + security audit for personal Linux boxes.
+# Runs as root (typically via the box-audit.service systemd unit).
+# Uses /usr/bin/sudo -n for fail2ban-client and docker. Configure sudoers
+# to grant NOPASSWD on those commands (e.g.
+#   /etc/sudoers.d/box-audit:
+#     ALL ALL=(root) NOPASSWD: /usr/bin/fail2ban-client, /usr/bin/docker
+# ); the README's "Compatibility" section calls this out.
 
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -93,12 +95,12 @@ json_push() {
 # We don't try to create the dir — the systemd unit's ExecStartPre
 # handles that for the scheduled execution.
 # Use /tmp for the lockfile (world-writable, no sticky-bit headaches).
-# Sticky-bit on /var/lock prevents luke from removing root-owned lockfiles
-# even when the script wants to self-clear — simpler to just use /tmp and
-# tolerate the per-user file naming. The script's purpose is preventing
-# the SAME user from running two instances simultaneously; cross-user
-# races are already prevented by the daily systemd timer firing on a
-# fixed schedule.
+# /var/lock has the sticky bit set, which prevents a non-owner from
+# removing root-owned lockfiles even when the script wants to self-clear
+# after a crash. /tmp is simpler and the single-instance concern is
+# only about the same user running it twice — cross-user races are
+# already prevented by the daily systemd timer firing on a fixed
+# schedule.
 LOCK_DIR="/tmp"
 LOCK_FILE="$LOCK_DIR/sysadmin-healthcheck-box-audit.lock"
 LOCK_ENABLED="yes"
@@ -115,11 +117,12 @@ flag_degraded() {
 # from stacking up under cron. Skipped if no writable lock dir was found.
 #
 # Stale-lockfile handling: if the lockfile exists and is owned by a
-# different user (e.g. root's systemd run left it behind while luke is
-# testing interactively), we try to delete it. If we can't (sticky dir
-# + not owner), we skip the lock for this run — the daily systemd timer
-# firing on a fixed schedule means cross-user races are not a real risk;
-# this guard exists to prevent the same user from running two instances.
+# different user (e.g. root's systemd run left it behind while an
+# interactive user is testing), we try to delete it. If we can't
+# (sticky dir + not owner), we skip the lock for this run — the daily
+# systemd timer firing on a fixed schedule means cross-user races are
+# not a real risk; this guard exists to prevent the same user from
+# running two instances.
 if [[ "$LOCK_ENABLED" == "yes" ]]; then
     if [[ -f "$LOCK_FILE" ]] && [[ ! -O "$LOCK_FILE" ]]; then
         /usr/bin/rm -f "$LOCK_FILE" 2>/dev/null || true
