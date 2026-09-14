@@ -83,9 +83,20 @@ json_push() {
     fi
 }
 
-# Bind the lock to the script path, not the user, so concurrent runs as
-# different users (luke vs. root) can't stomp each other.
-LOCK_FILE="/tmp/sysadmin-healthcheck-$(/usr/bin/basename "$0" .sh).lock"
+# Bind the lock to the script name (stable across bash -c invocations
+# where $0 would otherwise be "bash"). Falls back to $0 if BASH_SOURCE
+# is unset (e.g. when sourced).
+#
+# Use /var/lock/box-audit/ instead of /tmp/ so the file is owned by root
+# when systemd runs the script as root — a /tmp lockfile owned by an
+# earlier luke-user run blocks root invocations. Falls back to /tmp if
+# /var/lock isn't writable.
+LOCK_DIR="/var/lock/box-audit"
+if (/usr/bin/mkdir -p "$LOCK_DIR" && [[ -w "$LOCK_DIR" ]]) 2>/dev/null; then
+    LOCK_FILE="$LOCK_DIR/healthcheck.lock"
+else
+    LOCK_FILE="/tmp/sysadmin-healthcheck-box-audit.lock"
+fi
 # Track anything that couldn't run properly, so a silent/missing result
 # doesn't get reported as "all clear".
 DEGRADED=""
@@ -546,6 +557,7 @@ main() {
         # report_* functions emit echo $out which preserves \n as escapes
         # (no actual newlines). Convert them so we can iterate per finding.
         local report_for_parsing="${safe_report//\\n/$'\n'}"
+        local findings_count=0
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
             # Skip the DEGRADED entries; flag_degraded() handles them separately
@@ -564,19 +576,25 @@ main() {
             local id
             id=$(echo "$msg" | /usr/bin/awk '{for(i=1;i<=3 && i<=NF;i++) printf "%s_", tolower($i); print ""}' | /usr/bin/sed 's/_$//' | /usr/bin/tr -d ',' | /usr/bin/cut -c1-50)
             json_push "$id_prefix" "$id" "$msg"
+            findings_count=$((findings_count + 1))
         done <<< "$report_for_parsing"
 
         local safe_report_json
         safe_report_json=$(/usr/bin/printf '%s' "$safe_report" | /usr/bin/python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
         local status="ok"
-        [[ -n "$safe_report" ]] && status="findings"
+        [[ "$findings_count" -gt 0 ]] && status="findings"
         /usr/bin/printf '{"status":"%s","timestamp":"%s","host":"%s","findings":[%s],"raw_output":%s}\n' \
             "$status" \
             "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" \
             "$(/usr/bin/hostname)" \
             "$JSON_FINDINGS" \
             "$safe_report_json"
-        [[ -z "$safe_report" ]] && exit_code=0 || exit_code=1
+        # Always exit 0 in JSON mode — the JSON itself encodes "status:ok"
+        # vs "status:findings", so callers can branch on that instead of
+        # the exit code. This matters because pipefail in shells / systemd
+        # units would otherwise treat exit-1 (findings) as a failure even
+        # though the JSON was produced correctly.
+        exit_code=0
     else
         if [[ -z "$full_report" ]]; then
             printf '\n=== SYSTEM HEALTH - %s ===\n' "$(date '+%Y-%m-%d %H:%M')"

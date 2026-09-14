@@ -91,9 +91,12 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+# Pre-create the lock directory (script uses /var/lock/box-audit/).
+ExecStartPre=/bin/mkdir -p /var/lock/box-audit
+# Default: write JSON to a file. Replace with a webhook POST if you want
+# the report delivered to Telegram / Discord / Pushover directly:
+# ExecStart=/bin/bash -c '/usr/local/bin/box-audit --json | curl -fsS -X POST -H "Content-Type: application/json" -d @- https://your-webhook.example.com/audit'
 ExecStart=/usr/local/bin/box-audit --json
-# Or pipe to your delivery system:
-# ExecStart=/bin/bash -c '/usr/local/bin/box-audit --json | curl -s -X POST -d @- https://your-webhook.example.com/audit'
 User=root
 # Sudo is invoked internally by the script for fail2ban/docker checks;
 # run as root or grant NOPASSWD to /usr/bin/fail2ban-client, /usr/bin/docker.

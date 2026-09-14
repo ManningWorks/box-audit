@@ -76,7 +76,11 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c '/usr/local/bin/box-audit --json | tee /var/log/box-audit/latest.json | /usr/bin/python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get(\"raw_output\",\"\"))"'
+# Pre-create the lock directory with permissive perms so the script's
+# flock doesn't fail when run as root after a luke-user invocation left
+# a /tmp lockfile owned by luke.
+ExecStartPre=/bin/mkdir -p /var/lock/box-audit
+ExecStart=/bin/bash -c '/usr/local/bin/box-audit --json > /var/log/box-audit/latest.json'
 User=root
 ```
 
