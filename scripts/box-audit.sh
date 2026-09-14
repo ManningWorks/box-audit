@@ -92,16 +92,14 @@ json_push() {
 # (also FHS-conventional); fall back to /tmp if neither is writable.
 # We don't try to create the dir — the systemd unit's ExecStartPre
 # handles that for the scheduled execution.
-LOCK_FILE=""
-for lock_dir in /run/lock /var/lock /tmp; do
-    if [[ -d "$lock_dir" && -w "$lock_dir" ]]; then
-        LOCK_FILE="$lock_dir/sysadmin-healthcheck-box-audit.lock"
-        break
-    fi
-done
-# If nothing is writable, skip the lock entirely (single-user case).
-LOCK_ENABLED="no"
-[[ -n "$LOCK_FILE" ]] && LOCK_ENABLED="yes"
+# Pre-create the lock directory with root permissions so the systemd user
+# (root) can always create the lockfile. Use /var/lock (always writable
+# on Linux) and explicitly create our own subdir to avoid permission
+# collisions with other packages (CUPS, sanlock, etc.) that share /var.
+LOCK_DIR="/var/lock/box-audit"
+/usr/bin/mkdir -p "$LOCK_DIR" 2>/dev/null
+LOCK_FILE="$LOCK_DIR/healthcheck.lock"
+LOCK_ENABLED="yes"
 # Track anything that couldn't run properly, so a silent/missing result
 # doesn't get reported as "all clear".
 DEGRADED=""
@@ -136,8 +134,11 @@ check_deps() {
     done
 
     if command -v sudo >/dev/null 2>&1; then
-        if ! /usr/bin/sudo -n true 2>/dev/null; then
-            flag_degraded "passwordless sudo not working — fail2ban/docker checks skipped"
+        # Probe one of the actual sudo commands the script will use,
+        # not bare `sudo -n true` (which fails under scoped sudoers).
+        # fail2ban-client is the lightest of the three needed commands.
+        if ! /usr/bin/sudo -n /usr/bin/fail2ban-client status >/dev/null 2>&1; then
+            flag_degraded "passwordless sudo for fail2ban-client/docker not working — related checks skipped"
         fi
     fi
 
@@ -181,7 +182,7 @@ report_security() {
     local out=""
 
     # fail2ban banned IPs
-    if /usr/bin/sudo -n true 2>/dev/null; then
+    if /usr/bin/sudo -n /usr/bin/fail2ban-client status >/dev/null 2>&1; then
         local currently_banned
         currently_banned=$($T /usr/bin/sudo /usr/bin/fail2ban-client status sshd 2>/dev/null | awk '/Currently banned/ {print $4}' | tr -d ' ')
         local f2b_status=${PIPESTATUS[0]}
@@ -364,7 +365,7 @@ for row in data:
 
     # Docker containers - use Docker's own health filter (containers with no
     # HEALTHCHECK defined are correctly ignored, not false-flagged)
-    if /usr/bin/sudo -n true 2>/dev/null; then
+    if /usr/bin/sudo -n /usr/bin/fail2ban-client status >/dev/null 2>&1; then
         local unhealthy unhealthy_names
         unhealthy_names=$($T /usr/bin/sudo /usr/bin/docker ps --filter health=unhealthy --format '{{.Names}}' 2>/dev/null)
         unhealthy=$(echo "$unhealthy_names" | grep -c . | tr -d ' \n')
@@ -400,7 +401,7 @@ report_updates() {
     # saw an empty queue, our cron reported "0 security" while 28 were
     # actually pending. This protects against that class of bug.
     # Wrapped in -n sudo with a 30s budget so a slow mirror doesn't hang cron.
-    if /usr/bin/sudo -n true 2>/dev/null; then
+    if /usr/bin/sudo -n /usr/bin/fail2ban-client status >/dev/null 2>&1; then
         $T 30 /usr/bin/sudo -n /usr/bin/apt-get -qq update 2>/dev/null || \
             flag_degraded "apt update priming failed (cache may be stale)"
     else
@@ -514,7 +515,7 @@ report_maintenance() {
     # action) while services can be restarted individually.
     local needrestart_bin
     needrestart_bin=$(command -v needrestart)
-    if [[ -n "$needrestart_bin" ]] && /usr/bin/sudo -n true 2>/dev/null; then
+    if [[ -n "$needrestart_bin" ]] && /usr/bin/sudo -n /usr/bin/fail2ban-client status >/dev/null 2>&1; then
         local nr_out nr_rc
         nr_out=$($T /usr/bin/sudo -n "$needrestart_bin" -b -p 2>/dev/null)
         nr_rc=$?
