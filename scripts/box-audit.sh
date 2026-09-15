@@ -942,7 +942,8 @@ report_maintenance() {
 }
 
 # --- History dir + delta mode ---------------------------------------------
-# Each daily run writes /var/log/box-audit/history/YYYY-MM-DD.json. The
+# Each daily run writes /var/log/box-audit/history/YYYY-MM-DD.json
+# (bounded to 30 days by history_write's retention prune; see below). The
 # next day's run reads yesterday's file and computes deltas (today > 2x
 # yesterday AND > 5 absolute is the typical heuristic; thresholds are
 # inlined in each report_* function). Day-1 has no yesterday file —
@@ -1061,6 +1062,30 @@ for k in sorted(removed):
     print(f'- GONE   [{base[k].get(chr(34)+\"severity\"+chr(34),\"?\")[:4]:<4}] {base[k].get(\"message\",\"\")}')
 print(f'  baseline=$(date -u -d "$n days ago" +%Y-%m-%d).json today=$(date -u +%Y-%m-%d).json  (+{len(added)} -{len(removed)})')
 "
+}
+
+# Write today's snapshot + enforce retention. The single mechanism for
+# bounding /var/log/box-audit/: latest.json and .latest-counts.json are
+# overwritten in place every run (no growth), so the only unbounded
+# stream is history/YYYY-MM-DD.json — pruned here, right after the
+# write, instead of logrotate. Logrotate would rename/compress the
+# date-named files and break --diff, which looks them up by exact
+# filename. Retention window: 30 days of history, which covers any
+# --diff [N] a human will realistically ask for.
+#
+# Args: $1 = full JSON document (as printed by --json)
+# Best-effort like every history operation: failures are silent.
+HISTORY_RETENTION_DAYS=30
+history_write() {
+    local json_text="$1"
+    /usr/bin/mkdir -p "$HISTORY_DIR" 2>/dev/null || return 0
+    [[ -d "$HISTORY_DIR" ]] || return 0
+    /usr/bin/printf '%s\n' "$json_text" \
+        > "$HISTORY_DIR/$(/usr/bin/date -u +%Y-%m-%d).json" 2>/dev/null || return 0
+    # Retention: delete snapshots older than the window. -mtime +30 =
+    # strictly older than 30 days, so 31 calendar files remain.
+    /usr/bin/find "$HISTORY_DIR" -maxdepth 1 -type f -name '????-??-??.json' \
+        -mtime +$HISTORY_RETENTION_DAYS -delete 2>/dev/null || true
 }
 
 # --- File-integrity baseline -----------------------------------------------

@@ -37,6 +37,13 @@ whether to upgrade.
 - **`box-audit --diff [N]`** (default 1). Read-only diff: shows the
   findings added today that weren't in the snapshot N days ago
   (and vice versa). Useful for "what changed since Tuesday?"
+- **History retention** (30 days). Each `--json` run deletes
+  `history/` snapshots older than 30 days right after writing today's.
+  This is the box-audit equivalent of a logrotate policy — it lives in
+  the script because logrotate's rename-and-compress would break
+  `--diff`, which looks snapshots up by exact filename. `latest.json`
+  and the counts sidecar are overwritten in place every run and need
+  no rotation.
 - **Stable `check_id` field** in JSON output. Previously the JSON `id`
   field was a heuristic word-trigram derived from the message text,
   so any reword silently renamed the id. Now each finding maps to a

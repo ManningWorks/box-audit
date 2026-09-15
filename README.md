@@ -204,6 +204,18 @@ the run's output, the notifier doesn't read stdin, and the unit's
 When the notifier is wired in, the verify gate still checks the file,
 plus the webhook POST now participates in the unit's success/failure.
 
+### Log retention
+
+`latest.json` is overwritten in place on every run — it never grows.
+The daily snapshots in `/var/log/box-audit/history/` are bounded by the
+script itself: each run deletes snapshots older than 30 days after
+writing today's. There is deliberately no logrotate config — rotating
+(rename + compress) the date-named snapshots would break `--diff`,
+which looks them up by exact filename. If you want a longer history,
+raise `HISTORY_RETENTION_DAYS` in the script; if you want the space
+back sooner, delete old files from `history/` — the tool re-seeds
+gracefully.
+
 ### Hermes recipe
 
 What the author actually runs: a Hermes cron job once a day whose entire
