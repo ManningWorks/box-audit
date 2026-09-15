@@ -1,0 +1,5 @@
+# Edit this file to introduce tasks to be run by cron.
+# 
+# m h  dom mon dow   command
+0 3 * * * /usr/local/bin/backup.sh
+*/15 * * * * /home/luke/bin/sync-notes
