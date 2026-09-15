@@ -28,7 +28,7 @@ regardless of EUID.
 
 | Flag | Argument | What it does |
 |---|---|---|
-| `--init` | none | Snapshots the box's current state into all three config files: currently-listening ports → `ports-allowlist.txt`; active `*.timer` units → `timers-baseline.txt`; outbound threshold reset to 25. Idempotent — safe to re-run. |
+| `--init` | none | Snapshots the box's current state into all five config files: currently-listening ports → `ports-allowlist.txt`; active `*.timer` units → `timers-baseline.txt`; current `/etc/cron.d/` entries (plus the four standard names) → `cron-d-allowlist.txt`; outbound threshold reset to 25 → `outbound-threshold.conf`; SUID threshold seeded at 30 → `suid-threshold.conf`. Idempotent — safe to re-run. |
 | `--accept-port` | integer 1–65535 | Appends the port to `ports-allowlist.txt`. Refuses duplicates. Use after the audit flags a port you want to keep. |
 | `--accept-timer` | name (e.g. `lynis`) | Appends `<name>.timer` to `timers-baseline.txt`. Accepts both `name` and `name.timer`. |
 | `--outbound-threshold` | positive integer | Writes the new threshold to `outbound-threshold.conf`. The OUTBOUND finding fires only when today's count exceeds this; daily-delta awareness (PR 3) further narrows that to 2× yesterday, when yesterday exists. |
@@ -40,10 +40,11 @@ regardless of EUID.
 ├── ports-allowlist.txt       one port per line; # comments OK
 ├── timers-baseline.txt       one <name>.timer per line; # comments OK
 ├── outbound-threshold.conf   single non-negative integer
+├── cron-d-allowlist.txt      one /etc/cron.d/ name per line; # comments OK
+├── suid-threshold.conf       single positive integer (SUID finding threshold)
 ├── integrity-baseline.json   sha256s of /etc/passwd, sudoers, etc.
 │                             (created by the audit's first run as root;
 │                             not touched by install.sh)
-└── README.md                 (planned for PR 4 — agent-facing notes)
 ```
 
 When a file is missing, the audit uses a small built-in fallback (so the

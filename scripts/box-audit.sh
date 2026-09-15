@@ -105,7 +105,8 @@ Usage: $(/usr/bin/basename "$0") [OPTIONS]
   Manage per-box config under /var/lib/box-audit/ (run as root):
   --init                       Snapshot the current box into the config files
                                (ports listening now, timers active now,
-                               outbound threshold = 25).
+                               cron.d allowlist, outbound threshold = 25,
+                               SUID threshold = 30).
   --accept-port N              Append port N to ports-allowlist.txt.
   --accept-timer NAME          Append timer NAME to timers-baseline.txt.
   --outbound-threshold N       Write outbound-threshold.conf (single integer).
@@ -172,6 +173,8 @@ EOF
         PORTS_FILE="$CONFIG_DIR/ports-allowlist.txt"
         TIMERS_FILE="$CONFIG_DIR/timers-baseline.txt"
         OUTBOUND_FILE="$CONFIG_DIR/outbound-threshold.conf"
+        CRON_D_ALLOWLIST_FILE="$CONFIG_DIR/cron-d-allowlist.txt"
+        SUID_THRESHOLD_FILE="$CONFIG_DIR/suid-threshold.conf"
         CONFIG_NOTICE_PRINTED=0
         note_default_used() {
             [[ $CONFIG_NOTICE_PRINTED -eq 0 ]] || return 0
@@ -209,6 +212,29 @@ EOF
             fi
             note_default_used
             echo "25"
+        }
+        get_cron_d_allowlist() {
+            if [[ -r "$CRON_D_ALLOWLIST_FILE" ]]; then
+                # One name per non-comment, non-blank line. Trim whitespace.
+                /usr/bin/grep -vE '^[[:space:]]*(#|$)' "$CRON_D_ALLOWLIST_FILE" 2>/dev/null \
+                    | /usr/bin/sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+                    | /usr/bin/tr '\n' ' ' \
+                    | /usr/bin/sed -E 's/[[:space:]]+$//'
+            else
+                note_default_used
+                echo "anacron e2scrub_all sysstat 0hourly"
+            fi
+        }
+        get_suid_threshold() {
+            if [[ -r "$SUID_THRESHOLD_FILE" ]]; then
+                local v
+                v=$(/usr/bin/grep -vE '^[[:space:]]*(#|$)' "$SUID_THRESHOLD_FILE" 2>/dev/null | /usr/bin/head -1 | /usr/bin/tr -d ' \r\n')
+                if [[ "$v" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "$v"; return 0
+                fi
+            fi
+            note_default_used
+            echo "30"
         }
         main_manage() {
             # Validate the argument FIRST so a bad value is reported regardless of
@@ -250,7 +276,16 @@ EOF
             if u.endswith(".timer"):
                 print(u)' > "$TIMERS_FILE"
                     /usr/bin/printf '25\n' > "$OUTBOUND_FILE"
-                    echo "box-audit: seeded $PORTS_FILE, $TIMERS_FILE, $OUTBOUND_FILE"
+                    # cron.d allowlist: learn the box's actual current
+                    # /etc/cron.d/ contents, but make sure the four standard
+                    # names are present too.
+                    {
+                        /usr/bin/ls /etc/cron.d/ 2>/dev/null | /usr/bin/sort -u
+                        /usr/bin/printf 'anacron\ne2scrub_all\nsysstat\n0hourly\n'
+                    } | /usr/bin/sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+                        | /usr/bin/awk 'NF && !seen[$0]++' > "$CRON_D_ALLOWLIST_FILE"
+                    /usr/bin/printf '30\n' > "$SUID_THRESHOLD_FILE"
+                    echo "box-audit: seeded $PORTS_FILE, $TIMERS_FILE, $OUTBOUND_FILE, $CRON_D_ALLOWLIST_FILE, $SUID_THRESHOLD_FILE"
                     ;;
                 accept-port)
                     [[ -f "$PORTS_FILE" ]] || /usr/bin/install -D -m 0644 /dev/null "$PORTS_FILE"
@@ -702,8 +737,9 @@ report_security() {
     local suid_count
     suid_count=$($T /usr/bin/find / -xdev -path '/var/lib/docker' -prune -o -perm -4000 -type f -print 2>/dev/null | /usr/bin/wc -l)
     suid_count=${suid_count:-0}
-    # Baseline 18 measured 2026-09-14 on this box; flag if > 30 (50%+ growth).
-    [[ $suid_count -gt 30 ]] && out="$out\n🔓 SUID: $suid_count SUID binaries on disk (baseline ~18-25) — review for unauthorised additions"
+    # Baseline 18 measured 2026-09-14 on this box; flag if above the
+    # per-box threshold (default 30, i.e. 50%+ growth).
+    [[ $suid_count -gt $(get_suid_threshold) ]] && out="$out\\n🔓 SUID: $suid_count SUID binaries on disk (baseline ~18-25) — review for unauthorised additions"
     # Delta: new SUID binaries are a classic rootkit persistence move. On
     # day 1 (no yesterday snapshot) the absolute check above is the only
     # signal; thereafter a +2 jump is more meaningful than +5 of 18.
@@ -800,18 +836,22 @@ report_system() {
     user_cron_raw=$($T /usr/bin/crontab -l 2>/dev/null | /usr/bin/grep -vE '^no crontab for ')
     user_cron_entries=$(echo "$user_cron_raw" | /usr/bin/grep -cvE '^[[:space:]]*(#|$)')
     user_cron_entries=${user_cron_entries:-0}
-    [[ $user_cron_entries -gt 0 ]] && out="$out\\n📅 USER-CRON: $user_cron_entries entry/entries in $cron_user's crontab (Hermes schedules via its own cron — investigate)"
+    [[ $user_cron_entries -gt 0 ]] && out="$out\\n📅 USER-CRON: $user_cron_entries entry/entries in $cron_user's crontab (unexpected user crontab — verify you created it)"
 
-    # /etc/cron.d/ — flag unknown drop-ins beyond the standard 3.
+    # /etc/cron.d/ — flag unknown drop-ins beyond the per-box allowlist
+    # (default: the standard Ubuntu entries).
     local cron_d_files
     cron_d_files=$($T /usr/bin/ls /etc/cron.d/ 2>/dev/null | /usr/bin/sort -u)
+    local cron_d_allowlist
+    cron_d_allowlist="$(get_cron_d_allowlist)"
     local unexpected_cron=""
     local f
     for f in $cron_d_files; do
-        case "$f" in
-            anacron|e2scrub_all|sysstat|0hourly) ;;  # standard
-            *) unexpected_cron="$unexpected_cron $f" ;;
-        esac
+        local known_cron=0
+        for cf in $cron_d_allowlist; do
+            [[ "$f" == "$cf" ]] && known_cron=1 && break
+        done
+        [[ $known_cron -eq 1 ]] || unexpected_cron="$unexpected_cron $f"
     done
     local ucron_count
     ucron_count=$(echo "$unexpected_cron" | /usr/bin/wc -w)
