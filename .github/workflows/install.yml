@@ -6,17 +6,52 @@ on:
   pull_request:
 
 jobs:
+  install-positive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Positive variant — installs cleanly, verify gate passes.
+      - name: Install + verify in privileged container
+        run: bash test/install.sh box-audit-install:positive
+
+  install-negative:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Sentinel mutation: break ExecStart so the verify gate dies. The
+      # driver (test/install.sh) propagates install.sh's non-zero exit.
+      # We then INVERT that failure into a pass: if the gate caught the
+      # bug, this job succeeds (exit 0). If install.sh somehow returned
+      # zero, the gate has lost its teeth — fail loudly so the regression
+      # gets noticed instead of silently passing.
+      - name: Install + verify with sentinel mutation
+        run: |
+          set +e
+          bash test/install.sh box-audit-install:negative \
+            's|^ExecStart=/usr/local/bin/box-audit |ExecStart=/usr/local/bin/box-audit-nonexistent |'
+          RC=$?
+          set -e
+          if [[ $RC -ne 0 ]]; then
+            echo "gate caught the regression (driver exit $RC) — install-negative passes"
+            exit 0
+          fi
+          echo "FAIL: install.sh exited 0 even with a broken ExecStart — verify gate has no teeth" >&2
+          exit 1
+
   install-regression-fix1:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # Regression assertion for the seed-config fix (fix/seed-config-and-notice-reset).
-      # On a fresh install, the "no /var/lib/box-audit config, using built-in
-      # defaults" notice must appear zero times. Before the fix it printed
-      # twice — once for cron-d-allowlist.txt, once for suid-threshold.conf —
-      # because install.sh failed to seed them. install.sh now seeds both, so
-      # the helpers see a present file and never fall into the defaults branch.
+      # Regression assertion for the seed-config fix (PR #11). On a fresh
+      # install, the "no /var/lib/box-audit config, using built-in defaults"
+      # notice must appear zero times. Before the fix it printed twice —
+      # once for cron-d-allowlist.txt, once for suid-threshold.conf —
+      # because install.sh failed to seed them. install.sh now seeds both,
+      # so the helpers see a present file and never fall into the defaults
+      # branch.
       #
       # The assertion is:
       #   1. install.sh runs to completion on a fresh container (seeds the dir).

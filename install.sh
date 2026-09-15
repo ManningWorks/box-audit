@@ -7,10 +7,22 @@
 # before writing). An existing box-audit.timer keeps its OnCalendar if the user
 # customized it (warned, not silently overwritten).
 #
-# No flags, no config file, no uninstaller. Needs bash + systemd + apt
-# (Ubuntu/Debian). See README.md for the manual fallback.
+# One flag, --ci: for CI runs. Every install step is identical; the only
+# difference is that the final status line is also teed to
+# /var/log/box-audit/install.log. No config file, no uninstaller. Needs
+# bash + systemd + apt (Ubuntu/Debian). See README.md for the manual
+# fallback.
 
 set -euo pipefail
+
+# --ci marks a CI run: identical install steps, final status teed to the
+# install log. Parsed before anything else so it works under `set -u`.
+CI_MODE=0
+for arg in "$@"; do
+    case "$arg" in
+        --ci) CI_MODE=1 ;;
+    esac
+done
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 
@@ -248,4 +260,8 @@ NEXT_RUN="$(systemctl show box-audit.timer -p NextElapseUSecRealtime --value)"
 say "  service:   Result=success ExecMainStatus=0"
 say "  snapshot:  $LOG_DIR/latest.json — status=$FINDING_STATUS, $FINDING_COUNT finding(s)"
 say "  timer:     active, next run $NEXT_RUN"
-say "box-audit v$VERSION $([[ -f $SCRIPT_DST ]] && echo ready — report at $LOG_DIR/latest.json)"
+if [[ $CI_MODE -eq 1 ]]; then
+    say "box-audit v$VERSION $([[ -f $SCRIPT_DST ]] && echo ready — report at $LOG_DIR/latest.json)" | tee -a /var/log/box-audit/install.log
+else
+    say "box-audit v$VERSION $([[ -f $SCRIPT_DST ]] && echo ready — report at $LOG_DIR/latest.json)"
+fi

@@ -264,6 +264,16 @@ also the contract the cron should follow.
 - **Won't work on**: macOS, Windows, Alpine (uses systemd, apt, journalctl,
   fail2ban-client — Ubuntu/Debian idioms)
 
+## CI
+
+Every push and PR runs two GitHub Actions workflows: `ci.yml` runs
+`test/smoke.sh` (shellcheck plus the degraded-path suite) on a bare
+non-root runner. The `install-ci` workflow additionally runs
+`install.sh --ci` inside a privileged
+systemd container (`jrei/systemd-ubuntu:24.04`) on every push and PR, plus a
+negative variant that mutates `ExecStart=` to confirm the verify gate fails
+loudly. Dependabot bumps the base image weekly.
+
 ## What it does NOT do
 
 - **Not a security tool.** It is an observer. It does not block, patch,
