@@ -95,8 +95,10 @@ grep -q -- '--json' "$SCRIPT_SRC" || die "sanity check failed: '--json' missing 
 
 if [[ -f "$SCRIPT_DST" ]]; then
     MODE="Upgrading box-audit v$VERSION"
+    IS_FRESH_INSTALL=0
 else
     MODE="Installing box-audit v$VERSION"
+    IS_FRESH_INSTALL=1
 fi
 say "$MODE"
 
@@ -115,6 +117,54 @@ fi
 #     toward the daemon-reload trigger below.
 mkdir -p "$VERSION_MARKER_DIR"
 install_file "$VERSION_MARKER" 0644 "$VERSION" || true
+
+# 1c. Per-box config dir — only on fresh install. On upgrades the user
+#     may have customized allowlists, and we don't touch those. The script
+#     already creates /var/lib/box-audit/ when it needs an integrity
+#     baseline; install.sh pre-creates it here so the helper-config files
+#     land in one place either way.
+if [[ $IS_FRESH_INSTALL -eq 1 ]]; then
+    mkdir -p /var/lib/box-audit
+    chmod 0755 /var/lib/box-audit
+    # Seed the allowlists only if they're missing. We don't introspect the
+    # running box to learn its ports/timers — the defaults below are a
+    # common Ubuntu desktop baseline, and `box-audit --init` (run later)
+    # replaces these with the box's actual state. The point is to start
+    # with values that produce zero false positives on a fresh install.
+    if [[ ! -f /var/lib/box-audit/ports-allowlist.txt ]]; then
+        printf '%s\n' \
+            '# Ports that box-audit will NOT flag as "unexpected open".' \
+            '# One port per line. Edit with: sudo box-audit --accept-port <N>' \
+            '# Or replace the whole file with: sudo box-audit --init' \
+            '22' '53' '80' '443' '631' \
+            > /var/lib/box-audit/ports-allowlist.txt
+    fi
+    if [[ ! -f /var/lib/box-audit/timers-baseline.txt ]]; then
+        printf '%s\n' \
+            '# Systemd timers that box-audit considers standard on Ubuntu.' \
+            '# Add others with: sudo box-audit --accept-timer <name>' \
+            '# Or rebuild from current system state: sudo box-audit --init' \
+            'anacron.timer' 'apport-autoreport.timer' 'apt-daily.timer' \
+            'apt-daily-upgrade.timer' 'dpkg-db-backup.timer' \
+            'e2scrub_all.timer' 'fstrim.timer' 'fwupd-refresh.timer' \
+            'logrotate.timer' 'man-db.timer' 'motd-news.timer' \
+            'snapd.snap-repair.timer' 'sysstat-collect.timer' \
+            'sysstat-summary.timer' 'systemd-tmpfiles-clean.timer' \
+            'ua-timer.timer' 'update-notifier-download.timer' \
+            'update-notifier-motd.timer' \
+            > /var/lib/box-audit/timers-baseline.txt
+    fi
+    if [[ ! -f /var/lib/box-audit/outbound-threshold.conf ]]; then
+        printf '%s\n' \
+            '# Threshold (single integer) for the OUTBOUND non-LAN IPs check.' \
+            '# Set with: sudo box-audit --outbound-threshold <N>' \
+            '25' \
+            > /var/lib/box-audit/outbound-threshold.conf
+    fi
+    chmod 0644 /var/lib/box-audit/ports-allowlist.txt \
+              /var/lib/box-audit/timers-baseline.txt \
+              /var/lib/box-audit/outbound-threshold.conf
+fi
 
 say "  running first audit as root (builds the integrity baseline)…"
 "$SCRIPT_DST" > /dev/null || true   # exit 1 = findings, which is fine

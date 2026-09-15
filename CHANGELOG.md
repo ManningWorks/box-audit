@@ -7,6 +7,33 @@ whether to upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- Per-box config for ports, timers, and outbound threshold. The hardcoded
+  `known_ports` list, custom-timer allowlist, and outbound threshold of 25
+  all moved from the script to `/var/lib/box-audit/`. Each gets a small
+  built-in fallback when the file is missing (with a one-time stderr note
+  pointing at `--init`). The NucBox-specific ports (`5006`, `5173`,
+  `8384`, `3000`/`3001`, `8787`, `22000`, `34042`, `61271`) are gone from
+  the script — no longer bleed into other boxes via the README example.
+- `box-audit --init` snapshots the live box (currently-listening ports +
+  active `.timer` units) into the three config files. Idempotent.
+- `box-audit --accept-port N` appends a port to `ports-allowlist.txt`.
+- `box-audit --accept-timer NAME` appends a timer to
+  `timers-baseline.txt`. Accepts both `name` and `name.timer`.
+- `box-audit --outbound-threshold N` writes the threshold integer.
+- `install.sh` seeds the three config files on FRESH install only (an
+  upgrade leaves user-edited allowlists alone).
+- `skills/box-audit/references/cli.md` — full CLI reference, with the
+  manage flags table.
+- Skill `§ 5. CLI summary` — quick table pointing at `references/cli.md`.
+
+### Changed
+
+- Arg validation in manage flags runs BEFORE the root check, so a non-root
+  user invoking `--accept-port foo` sees "invalid integer" instead of
+  "needs root." Permission gate is no longer a syntax gate.
+
 ## [0.4.0] - 2026-09-15
 
 ### Added

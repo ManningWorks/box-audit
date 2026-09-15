@@ -22,6 +22,9 @@ Not installed yet, or upgrading? That's one command — `sudo ./install.sh`
 from a repo checkout. Prerequisites, the verify gate, and pitfalls are in
 `references/install.md`. Everything below assumes the daily timer exists.
 
+CLI flags are summarized in § 5 below and detailed in
+`references/cli.md` (manage flags live there).
+
 ## 1. Run or read
 
 Fresh check, right now:
@@ -137,5 +140,18 @@ Default is pull: findings land in `/var/log/box-audit/latest.json` and the
 user (or you) reads them when asked — a daily audit that pings "all
 clear!" trains the user to ignore it; silence means nothing changed.
 Optional push (webhook) and a Hermes cron recipe are in the README's
-"Getting the report off the box" section; format pushed messages using the
-severity table in section 2.
+"Getting the report off the box" section; format pushed messages using
+the severity table in section 2.
+
+## 5. CLI summary
+
+Full reference in `references/cli.md`. Quick:
+
+| Flag | Purpose |
+|---|---|
+| `--json` | Machine-readable JSON to stdout. Always exits 0. |
+| `--version` | Print box-audit version. |
+| `--init` | (root) Snapshot the box into the per-box allowlists. |
+| `--accept-port N` | (root) Append port N to `ports-allowlist.txt`. |
+| `--accept-timer NAME` | (root) Append NAME.timer to `timers-baseline.txt`. |
+| `--outbound-threshold N` | (root) Write the OUTBOUND threshold. |
