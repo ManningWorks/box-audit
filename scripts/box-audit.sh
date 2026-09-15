@@ -127,8 +127,14 @@ EOF
                     [[ $# -ge 2 ]] || { echo "box-audit: --accept-timer requires a name" >&2; exit 2; }
                     MANAGE_MODE="accept-timer"; MANAGE_ARG="$2"; shift 2 ;;
                 --outbound-threshold)
-                    [[ $# -ge 2 ]] || { echo "box-audit: --outbound-threshold requires an integer" >&2; exit 2; }
-                    MANAGE_MODE="outbound-threshold"; MANAGE_ARG="$2"; shift 2 ;;
+                            [[ $# -ge 2 ]] || { echo "box-audit: --outbound-threshold requires an integer" >&2; exit 2; }
+                            MANAGE_MODE="outbound-threshold"; MANAGE_ARG="$2"; shift 2 ;;
+                        --tail)
+                            [[ $# -ge 2 ]] || TAIL_MODE="7"
+                            TAIL_MODE="$2"; shift 2 ;;
+                        --diff)
+                            [[ $# -ge 2 ]] || { echo "box-audit: --diff requires N (days back, default 1)" >&2; exit 2; }
+                            DIFF_MODE="$2"; shift 2 ;;
                 *) /usr/bin/echo "Unknown arg: $1 (try --help)" >&2; exit 2 ;;
             esac
         done
@@ -250,6 +256,15 @@ EOF
         }
         if [[ -n "${MANAGE_MODE:-}" ]]; then
             main_manage
+        fi
+        # --tail / --diff are read-only history queries; same dispatch path.
+        if [[ -n "${TAIL_MODE:-}" ]]; then
+            history_tail "$TAIL_MODE"
+            exit 0
+        fi
+        if [[ -n "${DIFF_MODE:-}" ]]; then
+            history_diff "$DIFF_MODE"
+            exit 0
         fi
 
         # --- JSON collector -------------------------------------------------------
@@ -525,6 +540,14 @@ report_security() {
         outbound_remote_sample=$(echo "$suspicious_ips" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -v '^$' | /usr/bin/head -5 | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')
     fi
     [[ $outbound_remote_count -gt $(get_outbound_threshold) ]] && out="$out\n🌐 OUTBOUND: $outbound_remote_count non-LAN remote IP(s) connected: $outbound_remote_sample"
+    # Delta finding — only fires if today's count is 2x AND 5+ above yesterday.
+    # When yesterday's snapshot is missing the delta is mute and the absolute
+    # threshold above is the only signal (graceful degradation: ~day 1 of use).
+    if [[ -n "${YESTERDAY_OUTBOUND_COUNT:-}" ]]; then
+        local delta_thresh=$(( YESTERDAY_OUTBOUND_COUNT * 2 ))
+        [[ $outbound_remote_count -gt 5 && $outbound_remote_count -gt $delta_thresh ]] \
+            && out="$out\n🌐 OUTBOUND-DELTA: $outbound_remote_count non-LAN remote IP(s), was $YESTERDAY_OUTBOUND_COUNT yesterday (>2x growth)"
+    fi
 
     # SUID binary count — catches a rootkit that dropped a SUID binary to
     # escalate. Standard Ubuntu desktop has ~18-25 SUID files (passwd,
@@ -539,6 +562,13 @@ report_security() {
     suid_count=${suid_count:-0}
     # Baseline 18 measured 2026-09-14 on this box; flag if > 30 (50%+ growth).
     [[ $suid_count -gt 30 ]] && out="$out\n🔓 SUID: $suid_count SUID binaries on disk (baseline ~18-25) — review for unauthorised additions"
+    # Delta: new SUID binaries are a classic rootkit persistence move. On
+    # day 1 (no yesterday snapshot) the absolute check above is the only
+    # signal; thereafter a +2 jump is more meaningful than +5 of 18.
+    if [[ -n "${YESTERDAY_SUID_COUNT:-}" ]]; then
+        local suid_delta=$(( suid_count - YESTERDAY_SUID_COUNT ))
+        [[ $suid_delta -gt 2 ]] && out="$out\n🔓 SUID-DELTA: +${suid_delta} new SUID binaries vs yesterday (${YESTERDAY_SUID_COUNT} → ${suid_count})"
+    fi
 
     echo "$out"
 }
@@ -721,6 +751,13 @@ report_updates() {
 
     [[ $updatable -gt $UPDATE_THRESHOLD ]] && out="$out\n📦 UPDATES: $updatable packages upgradable (distro: $distro · 3rd-party: $third_party)"
     [[ $security -gt 0 ]] && out="$out\n🔒 SECURITY: $security security update(s) pending"
+    # Delta: when yesterday's count is known, flag a security queue that
+    # is GROWING — that's unattended-upgrades failing faster than it can
+    # drain. The absolute check above is the signal for "any" pending.
+    if [[ -n "${YESTERDAY_SECURITY_PEND:-}" ]]; then
+        local sec_delta=$(( security - YESTERDAY_SECURITY_PEND ))
+        [[ $sec_delta -gt 1 ]] && out="$out\n🔒 SECURITY-DELTA: security queue grew by $sec_delta vs yesterday (${YESTERDAY_SECURITY_PEND} → $security)"
+    fi
     [[ $kernel_security -gt 0 ]] && out="$out\n🛡️ KERNEL-CVE: $kernel_security kernel security package(s) — reboot required to apply"
 
     echo "$out"
@@ -846,6 +883,128 @@ report_maintenance() {
     fi
 
     echo "$out"
+}
+
+# --- History dir + delta mode ---------------------------------------------
+# Each daily run writes /var/log/box-audit/history/YYYY-MM-DD.json. The
+# next day's run reads yesterday's file and computes deltas (today > 2x
+# yesterday AND > 5 absolute is the typical heuristic; thresholds are
+# inlined in each report_* function). Day-1 has no yesterday file —
+# those checks stay silent and the absolute-threshold finding above is
+# the only signal (graceful degradation during the first ~24h of use).
+HISTORY_DIR="/var/log/box-audit/history"
+
+# Read yesterday's counts from the sidecar written by the prior run.
+# Robust to missing / corrupt files (leaves the vars unset, which makes
+# the delta checks silent).
+history_load_counts() {
+    local counts_file="$HISTORY_DIR/.latest-counts.json"
+    [[ -r "$counts_file" ]] || return 0
+    while IFS="=" read -r key val; do
+        case "$key" in
+            outbound_count)   YESTERDAY_OUTBOUND_COUNT="$val" ;;
+            suid_count)       YESTERDAY_SUID_COUNT="$val" ;;
+            security_pending) YESTERDAY_SECURITY_PEND="$val" ;;
+        esac
+    done < <(/usr/bin/python3 -c '
+import json
+try:
+    d = json.load(open("'"$counts_file"'"))
+    for k in ("outbound_count","suid_count","security_pending"):
+        v = d.get(k, 0)
+        if isinstance(v, int): print(f"{k}={v}")
+except Exception:
+    pass
+')
+}
+history_load_counts
+
+# Re-reads today's counts out of the JSON snapshot main() just printed,
+# then writes a tiny sidecar the next day's delta mode reads. Both fail
+# silently: history is best-effort and a missing dir must not break the
+# audit. The numbers come from the JSON (single source of truth) so the
+# sidecar agrees with what `--json` printed this run.
+history_persist_counts_from_json() {
+    local json_text="$1"
+    /usr/bin/mkdir -p "$HISTORY_DIR" 2>/dev/null || return 0
+    [[ -d "$HISTORY_DIR" ]] || return 0
+    /usr/bin/python3 -c '
+import json, sys, re, datetime, socket
+try:
+    d = json.loads(sys.argv[1])
+    out_c = sui_c = sec_c = 0
+    for f in d.get("findings", []):
+        cid = f.get("check_id", f.get("id",""))
+        m = re.match(r"^(\d+)", f.get("message",""))
+        if not m: continue
+        n = int(m.group(1))
+        if cid == "security.outbound_remote_count": out_c = n
+        elif cid == "security.suid_count": sui_c = n
+        elif cid == "updates.security_pending": sec_c = n
+    payload = {
+        "outbound_count": out_c,
+        "suid_count": sui_c,
+        "security_pending": sec_c,
+        "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "host": socket.gethostname(),
+    }
+    with open("'"$HISTORY_DIR"'/.latest-counts.json","w") as fh:
+        fh.write(json.dumps(payload))
+except Exception:
+    pass
+' "$json_text" 2>/dev/null
+    return 0
+}
+
+# Tail mode: read-only summary of the last N daily snapshots. Sorted
+# most-recent-first.
+history_tail() {
+    local n="${1:-7}"
+    /usr/bin/mkdir -p "$HISTORY_DIR" 2>/dev/null
+    [[ -d "$HISTORY_DIR" ]] || { echo "box-audit: no history directory at $HISTORY_DIR" >&2; exit 1; }
+    local files
+    files=$(find "$HISTORY_DIR" -maxdepth 1 -type f -name '*.json' ! -name '.*' -printf '%T@ %f\n' \
+        | sort -rn | head -n "$n" | awk '{print $2}')
+    [[ -z "$files" ]] && { echo "box-audit: history is empty (run --json once to seed)"; return; }
+    local fname fdate
+    while IFS= read -r fname; do
+        [[ -z "$fname" ]] && continue
+        fdate="${fname%.json}"
+        /usr/bin/python3 -c "
+import json
+try:
+    d = json.load(open('$HISTORY_DIR/$fname'))
+    status = d.get('status', '?')
+    n = len(d.get('findings', []))
+    print(f'$fdate  {status:8}  {n} finding(s)')
+except Exception:
+    print(f'$fdate  (corrupt or unreadable)')
+"
+    done <<< "$files"
+}
+
+# Diff mode: what changed between today and N days ago. Read-only.
+history_diff() {
+    local n="${1:-1}"
+    local diff_file1 diff_file2
+    diff_file1="$HISTORY_DIR/$(date -u +%Y-%m-%d).json"
+    diff_file2="$HISTORY_DIR/$(date -u -d "$n days ago" +%Y-%m-%d).json"
+    [[ -r "$diff_file2" ]] || { echo "box-audit: --diff cannot find $diff_file2 — need at least one prior snapshot" >&2; exit 1; }
+    /usr/bin/python3 -c "
+import json
+def load(p):
+    try: return {f.get('id'): f for f in json.load(open(p)).get('findings', [])}
+    except Exception: return {}
+base = load('$diff_file2')
+today = load('$diff_file1')
+added = today.keys() - base.keys()
+removed = base.keys() - today.keys()
+for k in sorted(added):
+    print(f'+ ADDED  [{today[k].get(chr(34)+\"severity\"+chr(34),\"?\")[:4]:<4}] {today[k].get(\"message\",\"\")}')
+for k in sorted(removed):
+    print(f'- GONE   [{base[k].get(chr(34)+\"severity\"+chr(34),\"?\")[:4]:<4}] {base[k].get(\"message\",\"\")}')
+print(f'  baseline=$(date -u -d "$n days ago" +%Y-%m-%d).json today=$(date -u +%Y-%m-%d).json  (+{len(added)} -{len(removed)})')
+"
 }
 
 # --- File-integrity baseline -----------------------------------------------
@@ -1050,11 +1209,48 @@ main() {
                 "⚠️"*) id_prefix="warn" ;;
                 "📅"*|"📦"*|"🆕"*|"🔄"*|"🔁"*) id_prefix="info" ;;
             esac
+            # Stable check_id from emoji (new in v0.5.0). Downstream tools
+            # can branch on this without parsing the human message text.
+            # The "DELTA" suffix on outbound/suid/security distinguishes
+            # history-driven findings from absolute-threshold ones.
+            local check_id=""
+            case "$msg" in
+                "🚨"*) check_id="security.fail2ban_banned" ;;
+                "⚠️ SSH:"*) check_id="security.ssh_fails" ;;
+                "⚠️ sudo:"*) check_id="security.sudo_fails" ;;
+                "🆕 PORT:"*) check_id="security.new_port" ;;
+                "🌐 OUTBOUND-DELTA:"*) check_id="security.outbound_delta" ;;
+                "🌐"*) check_id="security.outbound_remote_count" ;;
+                "🔓 SUID-DELTA:"*) check_id="security.suid_delta" ;;
+                "🔓"*) check_id="security.suid_count" ;;
+                "🔴 SYSTEMD:"*) check_id="system.failed_units" ;;
+                "⏰ CUSTOM-TIMERS:"*) check_id="system.custom_timers" ;;
+                "📅 USER-CRON:"*) check_id="system.user_cron" ;;
+                "📅 /etc/cron.d/:"*) check_id="system.cron_d_dropins" ;;
+                "🔴 DOCKER:"*) check_id="system.docker_unhealthy" ;;
+                "💥"*) check_id="system.crash_dumps" ;;
+                "🔴 KERNEL:"*) check_id="system.kernel_errors" ;;
+                "📦"*) check_id="updates.upgradable" ;;
+                "🔒 SECURITY-DELTA:"*) check_id="updates.security_delta" ;;
+                "🔒 SECURITY:"*) check_id="updates.security_pending" ;;
+                "🛡️ KERNEL-CVE:"*) check_id="updates.kernel_cve" ;;
+                "🔁"*) check_id="maintenance.reboot_required" ;;
+                "⏳"*) check_id="maintenance.apt_cache_stale" ;;
+                "⏰ TIMER:"*) check_id="maintenance.timer_drift" ;;
+                "⏰ UNATTENDED-UPGRADES:"*) check_id="maintenance.unattended_upgrades" ;;
+                "🛡️ KERNEL-RESTART:"*) check_id="maintenance.kernel_restart" ;;
+                "🔄"*) check_id="maintenance.services_restart" ;;
+                "⚠️ NEEDRESTART-WARN:"*) check_id="maintenance.needrestart_warn" ;;
+                "🔒 INTEGRITY:"*) check_id="integrity.change" ;;
+                "⚠️ DISK:"*) check_id="resources.disk_high" ;;
+                "⚠️ SWAP:"*) check_id="resources.swap_high" ;;
+                "⚠️ LOAD:"*) check_id="resources.load_high" ;;
+            esac
             msg=$(echo "$msg" | /usr/bin/sed -E 's/^[^ ]+ //')
             # Generate a stable-ish id from the first few words of the message
             local id
             id=$(echo "$msg" | /usr/bin/awk '{for(i=1;i<=3 && i<=NF;i++) printf "%s_", tolower($i); print ""}' | /usr/bin/sed 's/_$//' | /usr/bin/tr -d ',' | /usr/bin/cut -c1-50)
-            json_push "$id_prefix" "$id" "$msg"
+            json_push "$id_prefix" "${check_id:-$id}" "$msg"
             findings_count=$((findings_count + 1))
         done <<< "$report_for_parsing"
 
@@ -1066,12 +1262,20 @@ main() {
         safe_report_json=$(/usr/bin/printf '%s' "$report_real_newlines" | /usr/bin/python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
         local status="ok"
         [[ "$findings_count" -gt 0 ]] && status="findings"
-        /usr/bin/printf '{"status":"%s","timestamp":"%s","host":"%s","findings":[%s],"raw_output":%s}\n' \
+        local full_json
+        full_json=$(/usr/bin/printf '{"status":"%s","timestamp":"%s","host":"%s","findings":[%s],"raw_output":%s}\n' \
             "$status" \
             "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" \
             "$(/usr/bin/hostname)" \
             "$JSON_FINDINGS" \
-            "$safe_report_json"
+            "$safe_report_json")
+        /usr/bin/printf '%s' "$full_json"
+        # History write: copy the day's snapshot to history/YYYY-MM-DD.json
+        # so --tail/--diff and tomorrow's delta mode have something to read.
+        history_write "$full_json" || true
+        # Persist the per-day count sidecar for delta mode tomorrow.
+        # Best-effort: a failing write is silent (history dir is optional).
+        history_persist_counts_from_json "$full_json" || true
         # Always exit 0 in JSON mode — the JSON itself encodes "status:ok"
         # vs "status:findings", so callers can branch on that instead of
         # the exit code. This matters because pipefail in shells / systemd
