@@ -80,9 +80,17 @@ INTEGRITY_TARGETS=(
 #            source of truth — the script carries no copy that can drift.
 #            "unknown" is the fallback for a checkout that never went
 #            through install.sh.
+# Repo root for dev-checkout fallbacks. Same shape as install.sh:27 so a
+# checkout run directly (no install.sh) still resolves its own VERSION file
+# without depending on the install marker at /usr/local/share/box-audit/version.
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
 BOX_AUDIT_VERSION="unknown"
 if [[ -r /usr/local/share/box-audit/version ]]; then
     _BA_VERSION="$(</usr/local/share/box-audit/version)"
+    BOX_AUDIT_VERSION="${_BA_VERSION//[$'\r\n ']/}"
+elif [[ -r "$REPO_ROOT/VERSION" ]]; then
+    _BA_VERSION="$(<"$REPO_ROOT/VERSION")"
     BOX_AUDIT_VERSION="${_BA_VERSION//[$'\r\n ']/}"
 fi
 OUTPUT_MODE="text"   # "text" (default) or "json"
