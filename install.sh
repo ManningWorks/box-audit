@@ -12,11 +12,12 @@
 
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+
 # Single source of truth for the version (matches the script's --version and
 # the skill frontmatter). The script also carries its own copy so `box-audit
 # --version` works standalone after install.
 VERSION="$(<"$REPO_ROOT/VERSION")"
-REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_SRC="$REPO_ROOT/scripts/box-audit.sh"
 SCRIPT_DST="/usr/local/bin/box-audit"
 SERVICE_UNIT="/etc/systemd/system/box-audit.service"
@@ -74,11 +75,7 @@ install_file() {
     fi
     install -m "$mode" "$tmp" "$dst"
     rm -f "$tmp"
-    if [[ -f "$dst" ]]; then
-        say "  updated:   $dst"
-    else
-        say "  installed: $dst"
-    fi
+    say "  updated:   $dst"
     return 0
 }
 
