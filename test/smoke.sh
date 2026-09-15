@@ -94,7 +94,9 @@ if missing:
 schema = json.load(open(sys.argv[1]))["check_ids"]
 ids = []
 for f in d["findings"]:
-    cid = f.get("check_id", f.get("id"))
+    cid = f.get("check_id")
+    if not cid:
+        print("MISSING_CHECK_ID"); sys.exit(3)
     ids.append(cid)
     if cid not in schema:
         print("UNKNOWN_CHECK:" + str(cid)); sys.exit(2)
