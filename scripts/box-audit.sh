@@ -767,7 +767,7 @@ report_system() {
             [[ -z "$timer_name" ]] && continue
             # box-audit.timer (or any name the script is installed under) is
             # this very audit — flagging it would self-report on every run.
-            [[ "$timer_name" == *"box-audit"* || "$timer_name" == *"healthcheck"* ]] && continue
+            [[ "$timer_name" == "box-audit.timer" || "$timer_name" == "healthcheck.timer" ]] && continue
             if [[ -n "$timer_pat" ]]; then
                 # Extended regex alternation. get_timers_baseline returns
                 # names without the .timer suffix; systemd reports them
@@ -791,12 +791,16 @@ report_system() {
     # User crontab — flag if a non-empty user crontab exists. (You schedule
     # via Hermes cron, not system cron, so anything here is suspicious.)
     # `crontab -l` with no crontab prints "no crontab for <user>" to stdout,
-    # which a naive grep counts as 1 line. Filter that out first.
+    # which a naive grep counts as 1 line. Filter that out first. $USER is
+    # empty under the root systemd unit, and `crontab -l` as root reads
+    # root's crontab anyway — so the display name is "root" when EUID is 0.
+    local cron_user="root"
+    [[ $EUID -ne 0 ]] && cron_user="${USER:-$(id -un)}"
     local user_cron_raw user_cron_entries
     user_cron_raw=$($T /usr/bin/crontab -l 2>/dev/null | /usr/bin/grep -vE '^no crontab for ')
     user_cron_entries=$(echo "$user_cron_raw" | /usr/bin/grep -cvE '^[[:space:]]*(#|$)')
     user_cron_entries=${user_cron_entries:-0}
-    [[ $user_cron_entries -gt 0 ]] && out="$out\n📅 USER-CRON: $user_cron_entries entry/entries in $USER's crontab (Hermes schedules via its own cron — investigate)"
+    [[ $user_cron_entries -gt 0 ]] && out="$out\\n📅 USER-CRON: $user_cron_entries entry/entries in $cron_user's crontab (Hermes schedules via its own cron — investigate)"
 
     # /etc/cron.d/ — flag unknown drop-ins beyond the standard 3.
     local cron_d_files
@@ -1118,8 +1122,12 @@ history_write() {
     local json_text="$1"
     /usr/bin/mkdir -p "$HISTORY_DIR" 2>/dev/null || return 0
     [[ -d "$HISTORY_DIR" ]] || return 0
-    /usr/bin/printf '%s\n' "$json_text" \
-        > "$HISTORY_DIR/$(/usr/bin/date -u +%Y-%m-%d).json" 2>/dev/null || return 0
+    # Write under a 077 umask: snapshots carry host info, findings and IP
+    # samples — 0600 like the integrity baseline, regardless of the process
+    # umask (0644 under the root unit). Subshell keeps the rest of the run
+    # unaffected.
+    ( umask 077; /usr/bin/printf '%s\n' "$json_text" \
+        > "$HISTORY_DIR/$(/usr/bin/date -u +%Y-%m-%d).json" ) 2>/dev/null || return 0
     # Retention: delete snapshots older than the window. -mtime +30 =
     # strictly older than 30 days, so 31 calendar files remain.
     /usr/bin/find "$HISTORY_DIR" -maxdepth 1 -type f -name '????-??-??.json' \
