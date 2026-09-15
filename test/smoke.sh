@@ -188,14 +188,34 @@ fi
 
 # --- shellcheck across the shipped shell surface ----------------------------
 if command -v shellcheck >/dev/null 2>&1; then
-    if (cd "$REPO" && shellcheck scripts/box-audit.sh scripts/notify-webhook.sh install.sh); then
-        ok "shellcheck passes on box-audit.sh, notify-webhook.sh, install.sh"
+    if (cd "$REPO" && shellcheck scripts/box-audit.sh scripts/notify-webhook.sh install.sh test/properties/*.sh test/properties/live/*.sh); then
+        ok "shellcheck passes on box-audit.sh, notify-webhook.sh, install.sh, property suite"
     else
         fail "shellcheck reported issues"
     fi
 else
     fail "shellcheck not installed — cannot verify"
 fi
+
+# --- property suite (issue #16) ----------------------------------------------
+# The suite must be green AND fast: the spec caps it at 5 seconds so it
+# stays CI-cheap. One assertion covers both; a failure prints which half
+# broke. (The opt-in live-agreement suite under test/properties/live/ is
+# excluded from run.sh and from this budget — see run.sh's header.)
+PROPS_START_NS=$(date +%s%N)
+if bash "$REPO/test/properties/run.sh" > /tmp/smoke.props.$$ 2>&1; then
+    PROPS_RC=0
+else
+    PROPS_RC=$?
+fi
+PROPS_ELAPSED_MS=$(( ($(date +%s%N) - PROPS_START_NS) / 1000000 ))
+if [[ $PROPS_RC -eq 0 && $PROPS_ELAPSED_MS -lt 5000 ]]; then
+    ok "property suite green and under 5s (${PROPS_ELAPSED_MS}ms)"
+else
+    fail "property suite rc=$PROPS_RC elapsed=${PROPS_ELAPSED_MS}ms (budget 5000ms) — tail of output:"
+    tail -15 /tmp/smoke.props.$$
+fi
+rm -f /tmp/smoke.props.$$
 
 echo
 echo "smoke: $PASS passed, $FAIL failed"
