@@ -167,7 +167,7 @@ STATUS="$(systemctl show box-audit.service -p ExecMainStatus --value)"
 [[ "$RESULT" == "success" && "$STATUS" == "0" ]] \
     || die "service run failed: Result=$RESULT ExecMainStatus=$STATUS (see journalctl -u box-audit)"
 
-GATE_JSON="$(python3 -c "import json; d=json.load(open('$LOG_DIR/latest.json')); print(d['status'], len(d['findings']))")" \
+GATE_JSON="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["status"], len(d["findings"]))' "$LOG_DIR/latest.json")" \
     || die "latest.json does not parse — service ran but output is corrupt"
 read -r FINDING_STATUS FINDING_COUNT <<<"$GATE_JSON"
 systemctl is-active --quiet box-audit.timer || die "timer is not active"
