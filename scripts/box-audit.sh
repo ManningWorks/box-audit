@@ -1327,6 +1327,10 @@ main() {
     # Today's per-check label text is preserved verbatim (including the
     # lowercase `fail2ban:`); findings carry label-free messages, so the
     # label is prefixed exactly once here.
+    # The whole render is ONE python pass over the findings file. A
+    # bash loop that spawns python3 per line costs ~200ms per finding
+    # (~10s per run on a chatty box); one interpreter keeps the
+    # audit's ~2s budget.
     render_text_report() {
         if [[ "$findings_count" -eq 0 ]]; then
             printf '\n=== SYSTEM HEALTH - %s ===\n' "$(date '+%Y-%m-%d %H:%M')"
@@ -1334,50 +1338,65 @@ main() {
             return 0
         fi
         printf '\n=== SYSTEM HEALTH REPORT - %s ===\n' "$(date '+%Y-%m-%d %H:%M')"
-        local section emoji label line line_section
-        for section in resources security system updates maintenance integrity; do
-            while IFS= read -r line; do
-                [[ -z "$line" ]] && continue
-                line_section=$(printf '%s' "$line" | /usr/bin/python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("section",""))' 2>/dev/null)
-                [[ "$line_section" == "$section" ]] || continue
-                emoji=""; label=""
-                case "$(printf '%s' "$line" | /usr/bin/python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("check_id",""))' 2>/dev/null)" in
-                    resources.disk_high)             emoji="⚠️"; label="DISK" ;;
-                    resources.swap_high)             emoji="⚠️"; label="SWAP" ;;
-                    resources.load_high)             emoji="⚠️"; label="LOAD" ;;
-                    security.fail2ban_banned)        emoji="🚨"; label="fail2ban" ;;
-                    security.ssh_fails)              emoji="⚠️"; label="SSH" ;;
-                    security.sudo_fails)             emoji="⚠️"; label="sudo" ;;
-                    security.new_port)               emoji="🆕"; label="PORT" ;;
-                    security.outbound_remote_count)  emoji="🌐"; label="OUTBOUND" ;;
-                    security.outbound_delta)         emoji="🌐"; label="OUTBOUND-DELTA" ;;
-                    security.suid_count)             emoji="🔓"; label="SUID" ;;
-                    security.suid_delta)             emoji="🔓"; label="SUID-DELTA" ;;
-                    system.failed_units)             emoji="🔴"; label="SYSTEMD" ;;
-                    system.custom_timers)            emoji="⏰"; label="CUSTOM-TIMERS" ;;
-                    system.user_cron)                emoji="📅"; label="USER-CRON" ;;
-                    system.cron_d_dropins)           emoji="📅"; label="/etc/cron.d/" ;;
-                    system.docker_unhealthy)         emoji="🔴"; label="DOCKER" ;;
-                    system.crash_dumps)              emoji="💥"; label="CORES" ;;
-                    system.kernel_errors)            emoji="🔴"; label="KERNEL" ;;
-                    updates.upgradable)              emoji="📦"; label="UPDATES" ;;
-                    updates.security_pending)        emoji="🔒"; label="SECURITY" ;;
-                    updates.security_delta)          emoji="🔒"; label="SECURITY-DELTA" ;;
-                    updates.kernel_cve)              emoji="🛡️"; label="KERNEL-CVE" ;;
-                    maintenance.reboot_required)     emoji="🔁"; label="REBOOT" ;;
-                    maintenance.apt_cache_stale)     emoji="⏳"; label="APT-CACHE" ;;
-                    maintenance.timer_drift)         emoji="⏰"; label="TIMER" ;;
-                    maintenance.unattended_upgrades) emoji="⏰"; label="UNATTENDED-UPGRADES" ;;
-                    maintenance.kernel_restart)      emoji="🛡️"; label="KERNEL-RESTART" ;;
-                    maintenance.services_restart)    emoji="🔄"; label="SERVICES-RESTART" ;;
-                    maintenance.needrestart_warn)    emoji="⚠️"; label="NEEDRESTART-WARN" ;;
-                    integrity.change)                emoji="🔒"; label="INTEGRITY" ;;
-                    degraded.check)                  emoji="❓"; label="DEGRADED" ;;
-                    *) continue ;;
-                esac
-                printf '%s\n' "${emoji} ${label}: $(printf '%s' "$line" | /usr/bin/python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("message",""))' 2>/dev/null)"
-            done < "$FINDINGS_FILE"
-        done
+        FINDINGS_FILE="$FINDINGS_FILE" /usr/bin/python3 -c '
+import json, os
+
+EMOJI_LABEL = {
+    "resources.disk_high":             ("⚠️", "DISK"),
+    "resources.swap_high":             ("⚠️", "SWAP"),
+    "resources.load_high":             ("⚠️", "LOAD"),
+    "security.fail2ban_banned":        ("🚨", "fail2ban"),
+    "security.ssh_fails":              ("⚠️", "SSH"),
+    "security.sudo_fails":             ("⚠️", "sudo"),
+    "security.new_port":               ("🆕", "PORT"),
+    "security.outbound_remote_count":  ("🌐", "OUTBOUND"),
+    "security.outbound_delta":         ("🌐", "OUTBOUND-DELTA"),
+    "security.suid_count":             ("🔓", "SUID"),
+    "security.suid_delta":             ("🔓", "SUID-DELTA"),
+    "system.failed_units":             ("🔴", "SYSTEMD"),
+    "system.custom_timers":            ("⏰", "CUSTOM-TIMERS"),
+    "system.user_cron":                ("📅", "USER-CRON"),
+    "system.cron_d_dropins":           ("📅", "/etc/cron.d/"),
+    "system.docker_unhealthy":         ("🔴", "DOCKER"),
+    "system.crash_dumps":              ("💥", "CORES"),
+    "system.kernel_errors":            ("🔴", "KERNEL"),
+    "updates.upgradable":              ("📦", "UPDATES"),
+    "updates.security_pending":        ("🔒", "SECURITY"),
+    "updates.security_delta":          ("🔒", "SECURITY-DELTA"),
+    "updates.kernel_cve":              ("🛡️", "KERNEL-CVE"),
+    "maintenance.reboot_required":     ("🔁", "REBOOT"),
+    "maintenance.apt_cache_stale":     ("⏳", "APT-CACHE"),
+    "maintenance.timer_drift":         ("⏰", "TIMER"),
+    "maintenance.unattended_upgrades": ("⏰", "UNATTENDED-UPGRADES"),
+    "maintenance.kernel_restart":      ("🛡️", "KERNEL-RESTART"),
+    "maintenance.services_restart":    ("🔄", "SERVICES-RESTART"),
+    "maintenance.needrestart_warn":    ("⚠️", "NEEDRESTART-WARN"),
+    "integrity.change":                ("🔒", "INTEGRITY"),
+    "degraded.check":                  ("❓", "DEGRADED"),
+}
+SECTION_ORDER = ["resources", "security", "system", "updates", "maintenance", "integrity"]
+SECTION_RANK = {s: i for i, s in enumerate(SECTION_ORDER)}
+
+findings = []
+with open(os.environ["FINDINGS_FILE"]) as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            findings.append(json.loads(line))
+        except Exception:
+            continue
+
+# Section order first, then insertion order within a section.
+findings.sort(key=lambda f: SECTION_RANK.get(f.get("section", ""), len(SECTION_ORDER)))
+for f in findings:
+    emoji, label = EMOJI_LABEL.get(f.get("check_id", ""), (None, None))
+    if emoji is None:
+        continue
+    msg = f.get("message", "")
+    print(f"{emoji} {label}: {msg}")
+' 2>/dev/null
     }
 
     if [[ "$OUTPUT_MODE" == "json" ]]; then
