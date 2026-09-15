@@ -117,6 +117,75 @@ else
     fail "--json key/finding check failed (rc=$rc): $JSON_ERR"
 fi
 
+# --- --replay [DIR] mode (issue #15) ---------------------------------------
+# Replay is read-only against the live /var/log/box-audit/history — the
+# smoke checks here don't touch live state, only the test/fixtures/replay
+# corpus and an ephemeral empty dir. The mtime-unwritten invariant is
+# checked in the brief's verification block, not here (the smoke runs as
+# a non-root user without /var/log/box-audit access anyway).
+FIX="$REPO/test/fixtures/replay"
+EMPTY_REPLAY_DIR="$(mktemp -d)"
+trap 'rm -rf "$EMPTY_REPLAY_DIR"' EXIT
+
+# 1. Empty-dir contract: stdout says "replay directory is empty", exit 0,
+#    stderr silent. Stdout/stderr captured separately so a stderr leak fails.
+REPLAY_EMPTY_OUT="$(bash "$SCRIPT" --replay "$EMPTY_REPLAY_DIR" 2>/tmp/smoke.err.$$)"
+REPLAY_EMPTY_RC=$?
+REPLAY_EMPTY_ERR="$(cat /tmp/smoke.err.$$)"
+rm -f /tmp/smoke.err.$$
+if [[ $REPLAY_EMPTY_RC -eq 0 ]]; then
+    ok "--replay <empty-dir> exits 0"
+else
+    fail "--replay <empty-dir> expected exit 0, got $REPLAY_EMPTY_RC"
+fi
+if [[ "$REPLAY_EMPTY_OUT" == *"replay directory is empty"* ]]; then
+    ok "--replay <empty-dir> stdout contains 'replay directory is empty'"
+else
+    fail "--replay <empty-dir> stdout missing 'replay directory is empty' (got: $REPLAY_EMPTY_OUT)"
+fi
+if [[ -z "$REPLAY_EMPTY_ERR" ]]; then
+    ok "--replay <empty-dir> stderr empty"
+else
+    fail "--replay <empty-dir> stderr not empty: $REPLAY_EMPTY_ERR"
+fi
+
+# 2. Corpus summary (no --diff): exits 0, stderr silent, no crash.
+check "--replay <corpus> exits 0" '^0$' bash "$SCRIPT" --replay "$FIX"
+if [[ -z "$ERR" ]]; then ok "--replay <corpus> stderr empty"; else fail "--replay <corpus> stderr not empty: $ERR"; fi
+
+# 3. --diff 1: exits 0, deterministic across two consecutive runs.
+check "--replay <corpus> --diff 1 exits 0" '^0$' bash "$SCRIPT" --replay "$FIX" --diff 1
+if [[ -z "$ERR" ]]; then ok "--replay <corpus> --diff 1 stderr empty"; else fail "--replay <corpus> --diff 1 stderr not empty: $ERR"; fi
+bash "$SCRIPT" --replay "$FIX" --diff 1 > /tmp/smoke.r1.$$
+bash "$SCRIPT" --replay "$FIX" --diff 1 > /tmp/smoke.r2.$$
+if diff -q /tmp/smoke.r1.$$ /tmp/smoke.r2.$$ >/dev/null; then
+    ok "--replay <corpus> --diff 1 output deterministic (two runs byte-identical)"
+else
+    fail "--replay <corpus> --diff 1 output differs across runs"
+    diff /tmp/smoke.r1.$$ /tmp/smoke.r2.$$ | head -5
+fi
+rm -f /tmp/smoke.r1.$$ /tmp/smoke.r2.$$
+
+# 4. --diff 2: exits 0, deterministic.
+check "--replay <corpus> --diff 2 exits 0" '^0$' bash "$SCRIPT" --replay "$FIX" --diff 2
+if [[ -z "$ERR" ]]; then ok "--replay <corpus> --diff 2 stderr empty"; else fail "--replay <corpus> --diff 2 stderr not empty: $ERR"; fi
+bash "$SCRIPT" --replay "$FIX" --diff 2 > /tmp/smoke.r1.$$
+bash "$SCRIPT" --replay "$FIX" --diff 2 > /tmp/smoke.r2.$$
+if diff -q /tmp/smoke.r1.$$ /tmp/smoke.r2.$$ >/dev/null; then
+    ok "--replay <corpus> --diff 2 output deterministic"
+else
+    fail "--replay <corpus> --diff 2 output differs across runs"
+fi
+rm -f /tmp/smoke.r1.$$ /tmp/smoke.r2.$$
+
+# 5. --version carries the +replay suffix.
+check "--version exits 0 (replay suffix check)" '^0$' bash "$SCRIPT" --version
+if [[ "$OUT" == *"+replay"* ]]; then
+    ok "--version contains '+replay' suffix"
+else
+    fail "--version missing '+replay' suffix (got: $OUT)"
+fi
+
 # --- shellcheck across the shipped shell surface ----------------------------
 if command -v shellcheck >/dev/null 2>&1; then
     if (cd "$REPO" && shellcheck scripts/box-audit.sh scripts/notify-webhook.sh install.sh); then
