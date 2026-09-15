@@ -136,11 +136,25 @@ EOF
                             [[ $# -ge 2 ]] || { echo "box-audit: --outbound-threshold requires an integer" >&2; exit 2; }
                             MANAGE_MODE="outbound-threshold"; MANAGE_ARG="$2"; shift 2 ;;
                         --tail)
-                            [[ $# -ge 2 ]] || TAIL_MODE="7"
-                            TAIL_MODE="$2"; shift 2 ;;
-                        --diff)
-                                    [[ $# -ge 2 ]] || { echo "box-audit: --diff requires N (days back, default 1)" >&2; exit 2; }
-                                    DIFF_MODE="$2"; shift 2 ;;
+                    # Optional arg: consume $2 only when it exists AND is not
+                    # another flag. Bare `--tail` defaults to 7 (help text,
+                    # cli.md, and this parser must agree). The old form —
+                    # `[[ $# -ge 2 ]] || TAIL_MODE="7"; TAIL_MODE="$2"` — was
+                    # two statements, so bare `--tail` read unbound $2 and
+                    # died under `set -u`.
+                    if [[ $# -ge 2 && "$2" != -* ]]; then
+                        TAIL_MODE="$2"; shift 2
+                    else
+                        TAIL_MODE="7"; shift
+                    fi ;;
+                --diff)
+                    # Same optional-arg pattern; bare `--diff` defaults to 1
+                    # (docs said so; the parser used to demand an argument).
+                    if [[ $# -ge 2 && "$2" != -* ]]; then
+                        DIFF_MODE="$2"; shift 2
+                    else
+                        DIFF_MODE="1"; shift
+                    fi ;;
                                 --print-schema)
                                     PRINT_SCHEMA=1; shift ;;
                 *) /usr/bin/echo "Unknown arg: $1 (try --help)" >&2; exit 2 ;;
@@ -265,6 +279,78 @@ EOF
         if [[ -n "${MANAGE_MODE:-}" ]]; then
             main_manage
         fi
+        # --- History query functions ------------------------------------------
+        # These MUST be defined before the dispatch block below: bash reads
+        # top-to-bottom, and the dispatch calls history_tail/history_diff
+        # directly when the matching flag was parsed. (Before v0.5.0 these
+        # lived below, so `--tail` printed "command not found" and exited 0.)
+        # Read-only; /var/log/box-audit/history is optional state.
+        # --tail [N] (default 7) / --diff [N] (default 1); the parser in the
+        # CLI block above applies those defaults, matching the help text.
+        HISTORY_DIR="/var/log/box-audit/history"
+
+        # Tail mode: read-only summary of the last N daily snapshots. Sorted
+        # most-recent-first.
+        history_tail() {
+            local n="${1:-7}"
+            # 2>/dev/null: history is best-effort. When /var/log/box-audit
+            # exists but history/ doesn't (fresh install pre-first-JSON-run),
+            # mkdir can't create it as non-root — that's not an error worth
+            # noise; the "history is empty" message below is the signal.
+            /usr/bin/mkdir -p "$HISTORY_DIR" 2>/dev/null
+            # Missing history is a successful empty answer for a read-only
+            # query (stdout, exit 0) — same as the empty-dir case below. On
+            # CI / fresh boxes /var/log/box-audit can't even be created by a
+            # non-root user; that must not look like a failure.
+            if [[ ! -d "$HISTORY_DIR" ]]; then
+                echo "box-audit: no history directory at $HISTORY_DIR (run --json once to seed)"
+                return 0
+            fi
+            local files
+            files=$(find "$HISTORY_DIR" -maxdepth 1 -type f -name '*.json' ! -name '.*' -printf '%T@ %f\n' \
+                | sort -rn | head -n "$n" | awk '{print $2}')
+            [[ -z "$files" ]] && { echo "box-audit: history is empty (run --json once to seed)"; return; }
+            local fname fdate
+            while IFS= read -r fname; do
+                [[ -z "$fname" ]] && continue
+                fdate="${fname%.json}"
+                /usr/bin/python3 -c "
+import json
+try:
+    d = json.load(open('$HISTORY_DIR/$fname'))
+    status = d.get('status', '?')
+    n = len(d.get('findings', []))
+    print(f'$fdate  {status:8}  {n} finding(s)')
+except Exception:
+    print(f'$fdate  (corrupt or unreadable)')
+"
+            done <<< "$files"
+        }
+
+        # Diff mode: what changed between today and N days ago. Read-only.
+        history_diff() {
+            local n="${1:-1}"
+            local diff_file1 diff_file2
+            diff_file1="$HISTORY_DIR/$(date -u +%Y-%m-%d).json"
+            diff_file2="$HISTORY_DIR/$(date -u -d "$n days ago" +%Y-%m-%d).json"
+            [[ -r "$diff_file2" ]] || { echo "box-audit: --diff cannot find $diff_file2 — need at least one prior snapshot" >&2; exit 1; }
+            /usr/bin/python3 -c "
+import json
+def load(p):
+    try: return {f.get('id'): f for f in json.load(open(p)).get('findings', [])}
+    except Exception: return {}
+base = load('$diff_file2')
+today = load('$diff_file1')
+added = today.keys() - base.keys()
+removed = base.keys() - today.keys()
+for k in sorted(added):
+    print(f'+ ADDED  [{today[k].get(chr(34)+\"severity\"+chr(34),\"?\")[:4]:<4}] {today[k].get(\"message\",\"\")}')
+for k in sorted(removed):
+    print(f'- GONE   [{base[k].get(chr(34)+\"severity\"+chr(34),\"?\")[:4]:<4}] {base[k].get(\"message\",\"\")}')
+print(f'  baseline=$(date -u -d "$n days ago" +%Y-%m-%d).json today=$(date -u +%Y-%m-%d).json  (+{len(added)} -{len(removed)})')
+"
+        }
+
         # --tail / --diff are read-only history queries; same dispatch path.
         if [[ -n "${TAIL_MODE:-}" ]]; then
             history_tail "$TAIL_MODE"
@@ -949,7 +1035,8 @@ report_maintenance() {
 # inlined in each report_* function). Day-1 has no yesterday file —
 # those checks stay silent and the absolute-threshold finding above is
 # the only signal (graceful degradation during the first ~24h of use).
-HISTORY_DIR="/var/log/box-audit/history"
+# HISTORY_DIR itself is defined above the CLI dispatch block, next to the
+# history_tail/history_diff functions it serves.
 
 # Read yesterday's counts from the sidecar written by the prior run.
 # Robust to missing / corrupt files (leaves the vars unset, which makes
@@ -981,6 +1068,8 @@ history_load_counts
 # silently: history is best-effort and a missing dir must not break the
 # audit. The numbers come from the JSON (single source of truth) so the
 # sidecar agrees with what `--json` printed this run.
+# (history_tail/history_diff live above the CLI dispatch block — they are
+# dispatch targets and must be defined before the dispatch runs.)
 history_persist_counts_from_json() {
     local json_text="$1"
     /usr/bin/mkdir -p "$HISTORY_DIR" 2>/dev/null || return 0
@@ -1011,57 +1100,6 @@ except Exception:
     pass
 ' "$json_text" 2>/dev/null
     return 0
-}
-
-# Tail mode: read-only summary of the last N daily snapshots. Sorted
-# most-recent-first.
-history_tail() {
-    local n="${1:-7}"
-    /usr/bin/mkdir -p "$HISTORY_DIR" 2>/dev/null
-    [[ -d "$HISTORY_DIR" ]] || { echo "box-audit: no history directory at $HISTORY_DIR" >&2; exit 1; }
-    local files
-    files=$(find "$HISTORY_DIR" -maxdepth 1 -type f -name '*.json' ! -name '.*' -printf '%T@ %f\n' \
-        | sort -rn | head -n "$n" | awk '{print $2}')
-    [[ -z "$files" ]] && { echo "box-audit: history is empty (run --json once to seed)"; return; }
-    local fname fdate
-    while IFS= read -r fname; do
-        [[ -z "$fname" ]] && continue
-        fdate="${fname%.json}"
-        /usr/bin/python3 -c "
-import json
-try:
-    d = json.load(open('$HISTORY_DIR/$fname'))
-    status = d.get('status', '?')
-    n = len(d.get('findings', []))
-    print(f'$fdate  {status:8}  {n} finding(s)')
-except Exception:
-    print(f'$fdate  (corrupt or unreadable)')
-"
-    done <<< "$files"
-}
-
-# Diff mode: what changed between today and N days ago. Read-only.
-history_diff() {
-    local n="${1:-1}"
-    local diff_file1 diff_file2
-    diff_file1="$HISTORY_DIR/$(date -u +%Y-%m-%d).json"
-    diff_file2="$HISTORY_DIR/$(date -u -d "$n days ago" +%Y-%m-%d).json"
-    [[ -r "$diff_file2" ]] || { echo "box-audit: --diff cannot find $diff_file2 — need at least one prior snapshot" >&2; exit 1; }
-    /usr/bin/python3 -c "
-import json
-def load(p):
-    try: return {f.get('id'): f for f in json.load(open(p)).get('findings', [])}
-    except Exception: return {}
-base = load('$diff_file2')
-today = load('$diff_file1')
-added = today.keys() - base.keys()
-removed = base.keys() - today.keys()
-for k in sorted(added):
-    print(f'+ ADDED  [{today[k].get(chr(34)+\"severity\"+chr(34),\"?\")[:4]:<4}] {today[k].get(\"message\",\"\")}')
-for k in sorted(removed):
-    print(f'- GONE   [{base[k].get(chr(34)+\"severity\"+chr(34),\"?\")[:4]:<4}] {base[k].get(\"message\",\"\")}')
-print(f'  baseline=$(date -u -d "$n days ago" +%Y-%m-%d).json today=$(date -u +%Y-%m-%d).json  (+{len(added)} -{len(removed)})')
-"
 }
 
 # Write today's snapshot + enforce retention. The single mechanism for
