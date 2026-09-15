@@ -1,0 +1,3 @@
+Filesystem      Size  Used Avail Use%
+/dev/nvme0n1p2  468G   46G  398G  11%
+/dev/sdb1       233G  218G    3G  99%

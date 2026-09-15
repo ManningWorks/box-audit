@@ -5,6 +5,57 @@ All notable changes to box-audit are documented here. The format follows
 grouped by kind, not by PR, and are written for the person deciding
 whether to upgrade.
 
+## [0.7.0] - unreleased
+
+### Added
+
+- **Property-test suite** (`test/properties/`, issue #16, part of the
+  #14 three-tier test model). One bash test file per check family — the
+  ten families named in the issue: `resources.disk_high`,
+  `resources.swap_high`, `resources.load_high`, `security.ssh_fails`,
+  `security.new_port`, `system.failed_units`, `updates.upgradable`,
+  `maintenance.apt_cache_stale`, `maintenance.timer_drift`,
+  `integrity.change`. Each asserts a real invariant: schema membership,
+  delta semantics over the script's actual `--replay --diff` path
+  (added/removed/presence-based stability), or fixture-corpus integrity.
+  Shared `assert.sh` helpers (`assert_eq`, `assert_grep`, `assert_exit`)
+  mirror the smoke suite's style; `run.sh` orchestrates and exits
+  non-zero on aggregate failure. Plain bash + python3 only — no new
+  interpreter, no `jq`, no `bats`.
+- `test/properties/live/audit-agreement.sh` — opt-in suite that runs one
+  full `--json` audit and asserts its findings agree with independently
+  sampled ground truth (threshold iff-and-only-if per family, severity
+  classes, non-root integrity degradation). Excluded from `run.sh`
+  because a single audit costs ~7s on a box with broad NOPASSWD sudo —
+  over the suite's 5-second budget. T03's seeded container is expected
+  to promote this to fixture-driven CI.
+- **Fixture corpus** under `test/fixtures/` — one file per external tool
+  the script parses: `fail2ban-status.txt`,
+  `journalctl-ssh-auth-fail.txt` (plus empty variant), `ss-tln.txt`,
+  `df-output.txt`, `loadavg.txt` (plus high variant), `swap.txt` (plus
+  high variant), `apt-update-stamp-fresh`/`-stale`,
+  `systemctl-failed-units.txt`, `crontab-empty.txt`,
+  `crontab-with-entries.txt`, `integrity-baseline.json`,
+  `integrity-changed.json`. All real tool-output shapes; all IPs are
+  documentation ranges. `test/fixtures/README.md` documents each fixture,
+  its regeneration command, and the record-once/freeze-forever policy.
+- `test/fixtures/snapshot-fixtures.py` — records a live box's
+  external-tool outputs into the corpus (root; `--dry-run` to preview).
+  Lands in this PR as the documented regeneration path; T03 exercises it
+  on the seeded container.
+- `test/smoke.sh` — one new assertion: the property suite runs green and
+  under 5 seconds (33 total). The existing shellcheck assertion now also
+  covers the property-suite files.
+
+### Changed
+
+- Nothing. The audit script itself is untouched: every input path it
+  reads (CONFIG_DIR, HISTORY_DIR, /proc/loadavg, journalctl, ss, apt,
+  the apt stamp, integrity baseline) has no env-var override, so the
+  property tests assert on the script's seam-less surfaces (schema,
+  replay deltas) and document the gaps for T03 rather than patching
+  around them.
+
 ## [0.6.0] - 2026-09-15
 
 ### Added
