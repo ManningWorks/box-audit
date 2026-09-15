@@ -1,159 +1,129 @@
 ---
 name: box-audit
-version: 0.2.0
-description: Install or repair the box-audit daily security + health audit (script + systemd timer) on a Linux box. Use when the user names "box-audit", pastes a github.com/ManningWorks/box-audit URL, or asks for a daily Telegram/Discord system audit of their machine.
+version: 0.3.0
+description: Run and interpret box-audit, a daily security + health audit for Linux boxes. Use when asked to check box health/security, run or schedule box-audit, read its latest.json report, triage its findings, or repair its timer/baseline. Installs nothing by default; the one-time install procedure lives in references/install.md.
 ---
 
-# box-audit installer
+# box-audit operator
 
-Install the box-audit daily-delta audit: script on PATH, systemd timer for
-the daily run, output file the user (or a bot) reads. ~10 minutes end to end.
+box-audit answers one question daily: what changed on this box since the
+last run? It observes; it never remediates. Every finding is a pointer for
+a human decision, not a trigger for action.
 
-The verify gate (step 4) is the skill. A timer that fails silently every
-morning hands the user false peace of mind. That's the exact opposite of
-what an audit is for. No gate pass, no "done".
+The script lives at `/usr/local/bin/box-audit`. Output: text report
+(default) or JSON (`--json`). Latest JSON snapshot:
+`/var/log/box-audit/latest.json`. Exit codes: 0 = clear, 1 = findings,
+2 = bad flag. `--json` always exits 0; branch on the `status` field
+instead (`ok` vs `findings`).
 
-Upstream source of truth: https://github.com/ManningWorks/box-audit
-This skill describes the install; the script's own behaviour is documented
-in its `--help` and the repo README. Where they disagree with this file,
-trust the script and file an issue.
+Not installed yet, or the timer is missing? The one-time procedure is in
+`references/install.md`. Everything below assumes the daily timer exists.
 
-## 1. Fetch and sanity-check the script
+## 1. Run or read
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/ManningWorks/box-audit/master/scripts/box-audit.sh \
-    -o /tmp/box-audit-install/box-audit.sh
-bash -n /tmp/box-audit-install/box-audit.sh \
-  && grep -q 'report_security' /tmp/box-audit-install/box-audit.sh \
-  && grep -q -- '--json' /tmp/box-audit-install/box-audit.sh
-```
-
-`bash -n` parses the whole file, so a truncated or corrupted download fails
-here rather than at 9am on the box.
-
-**Done when:** the compound command exits 0. On failure, stop and report the
-fetch as bad; install nothing.
-
-## 2. Install the script and check dependencies
+Fresh check, right now:
 
 ```bash
-sudo install -m 0755 /tmp/box-audit-install/box-audit.sh /usr/local/bin/box-audit
-box-audit --help        # usage text, exit 0
-sudo box-audit          # first run, as root
+sudo box-audit            # text, exit 1 when findings exist
+sudo box-audit --json     # machine-readable, always exit 0
 ```
 
-The first run must be root so the file-integrity baseline reads all
-crown-jewel files; a non-root first run leaves the integrity check degraded.
-Collect any `❓ DEGRADED:` lines from the output. Each names the missing
-binary and the check it would enable (`needrestart`, `fail2ban-client`,
-`docker`). List them for the user and install the ones they want before
-moving on; the checks are the product.
-
-**Done when:** `box-audit --help` exits 0 and the first run prints a report
-(ok or findings; findings are fine, they're the tool working).
-
-## 3. Install the systemd units
-
-Create `/var/log/box-audit/` first, then write both units:
-
-`/etc/systemd/system/box-audit.service`:
-
-```ini
-[Unit]
-Description=box-audit daily system health + security check
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=oneshot
-User=root
-# truncate:, not file: — file: never truncates, so a shorter JSON document
-# following a longer one leaves stale bytes glued to the end and the file
-# stops parsing. truncate: cuts on service start.
-StandardOutput=truncate:/var/log/box-audit/latest.json
-StandardError=journal
-ExecStart=/usr/local/bin/box-audit --json
-```
-
-`/etc/systemd/system/box-audit.timer`:
-
-```ini
-[Unit]
-Description=Run box-audit daily
-
-[Timer]
-OnCalendar=daily
-RandomizedDelaySec=15min
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
+The daily run has usually already happened. Read it instead of re-running
+when the question is "how is the box this morning":
 
 ```bash
-sudo mkdir -p /var/log/box-audit
-sudo systemctl daemon-reload
-sudo systemctl enable --now box-audit.timer
+python3 -c "import json; d=json.load(open('/var/log/box-audit/latest.json')); print(d['timestamp'], d['status'], len(d['findings']))"
 ```
 
-**Done when:** `systemctl is-active box-audit.timer` prints `active` and
-`systemctl list-timers box-audit.timer` shows a next-run time.
+**Done when:** you have either a fresh run's output or today's snapshot,
+and you know which one you're looking at. `latest.json` is overwritten on
+each run — stale data and fresh data look identical, so check the
+timestamp against the timer's last-fire time
+(`systemctl show box-audit.timer -p LastTriggerUSec`).
 
-## 4. Verify gate
+## 2. Read the findings
+
+Each JSON finding carries `severity`, `id`, `message`:
+
+| severity | meaning | your move |
+|---|---|---|
+| `degraded` | a check couldn't run, so this run is partially blind | fix the named cause before trusting "no findings" |
+| `alert` | active security signal (🚨) | look now |
+| `warn` | deviation from baseline or above threshold (🔒 🛡️ 🔴 ⚠️ etc.) | look today |
+| `info` | routine state worth knowing (📦 🔄 etc.) | skim |
+
+Severity is assigned from the report line's leading emoji, so the table
+above is the full contract — there are no hidden levels.
+
+Check `degraded` first, always. "0 findings" from a run where the
+integrity check was skipped is not a clean bill; it's a blind spot. A
+`degraded.check` finding names the cause (missing binary, no root, no
+NOPASSWD sudo).
+
+**Done when:** you can state the finding count, the highest severity
+present, and — if any `degraded` finding exists — what it blinds.
+
+## 3. Triage by finding type
+
+Delta findings compare against yesterday; reading them wrong usually means
+forgetting that. The recurring ones:
+
+- **`INTEGRITY: changed/added/removed <path>`** — a crown-jewel file
+  (sudoers, sshd_config, crontabs, authorized_keys) differs from the
+  baseline. Legitimate config changes trip this too. Verify the change is
+  one you made; the baseline self-updates after each run, so an
+  unexplained change is only visible until the next daily run erases it.
+  Investigate *before* the next timer fire, or capture the baseline:
+  `cp /var/lib/box-audit/integrity-baseline.json /tmp/`.
+- **`SUID: N suid binaries (baseline M)`** — count drift. New SUID
+  binaries are a classic rootkit persistence move. Check the diff, not
+  just the count.
+- **`OUTBOUND: <ip>`** — a non-LAN outbound connection. Expected for apt,
+  NTP, your own services. Unexpected IPs are the C2 question; resolve and
+  identify before dismissing.
+- **`CUSTOM-TIMERS: N non-standard`** — systemd timers outside the known
+  set. Persistence mechanism of choice. box-audit's own timer is exempt
+  from this check.
+- **`SECURITY: N updates`**, **`REBOOT: required`**,
+  **`KERNEL-RESTART`**, **`SERVICES-RESTART`** — maintenance debt.
+  Routine; batch them into the next maintenance window.
+- **`SSH-FAIL` / `SUDO-FAIL`** — brute-force or fat-fingers. Thresholds:
+  15 fails/24h (SSH), 100 (sudo).
+
+**Done when:** every finding has a disposition — known-good, maintenance
+debt, or needs-investigation — with the needs-investigation ones named
+explicitly to the user.
+
+## 4. Report
+
+Match the report to the question asked:
+
+- "Any problems?" → count, highest severity, each non-info finding in one
+  line, degraded-causes called out first.
+- "How's the box?" → one line: status, finding count, anything above info.
+- Full detail → `raw_output` from the JSON, which is the exact text report.
+
+Never report "all clear" from a run with `degraded` findings without
+saying what was skipped. A blind pass is not a clean pass.
+
+## Repair branch: timer or baseline
+
+Symptoms that the daily machinery broke: `latest.json` timestamp older
+than ~48h, timer inactive, or JSON parse errors on the snapshot.
 
 ```bash
-sudo systemctl start box-audit.service
-systemctl show box-audit.service -p Result -p ExecMainStatus
-python3 -c "import json; d=json.load(open('/var/log/box-audit/latest.json')); print(d['status'], len(d['findings']), 'findings')"
+systemctl status box-audit.timer --no-pager
+sudo systemctl start box-audit.service && systemctl show box-audit.service -p Result -p ExecMainStatus
 ```
 
-**Done when all three hold:**
-- `Result=success`, `ExecMainStatus=0`
-- `latest.json` parses and prints its status + finding count
-- the timer from step 3 still shows `active` with a next-run time
+If the snapshot is corrupted JSON (a known cause was `StandardOutput=file:`
+leaving stale bytes after a shorter document — fixed to `truncate:` in the
+unit in `references/install.md`), delete the file and start the service
+once to regenerate. Don't trust the *content* of a file that failed to
+parse.
 
-If the gate fails, debug before declaring done. The usual suspects, in
-order of likelihood:
-- `sudo: a password is required` in the journal: the script shells out to
-  `sudo -n` for `fail2ban-client` and `docker`. Either run the service as
-  root (as above) or grant NOPASSWD for exactly those two commands.
-- directory missing. `/var/log/box-audit/` doesn't exist when the service
-  first runs, and the run fails on output.
-- exit 2 from the script itself. A bad CLI flag reached `ExecStart`; run
-  the same command by hand to see the error.
-
-## 5. Report
-
-Tell the user, with real values from the gate run:
-- script path (`/usr/local/bin/box-audit`) and version from `--help`
-- timer active, with the actual next-run time
-- where output lands (`/var/log/box-audit/latest.json`) and today's
-  finding count
-- any DEGRADED lines left unfixed, as explicit follow-ups
-- one line on pairing with monthly Lynis for absolute (non-delta) scoring
-
-## Webhook delivery (optional branch)
-
-If the user already has a Telegram/Discord bot for system notifications,
-replace the service's stdout capture with a POST:
-
-```ini
-ExecStart=/bin/bash -c '/usr/local/bin/box-audit --json | curl -fsS -X POST -H "Content-Type: application/json" -d @- https://your-webhook.example.com/audit'
-```
-
-The JSON's `severity`, `id`, and `message` fields per finding are the
-formatter contract. Everything else in the skill is unchanged; the gate
-still runs, checking the webhook received the payload instead of the file.
-
-## Pitfalls
-
-- Run the verify gate before declaring done. A unit that fails silently
-  every day is worse than no unit.
-- Check sudo policy before the first service run: the script probes
-  `sudo -n` per command (`fail2ban-client`, `docker`) and degrades the
-  check when the probe fails, which is easy to miss in JSON output.
-- Keep the timer daily. Hourly re-runs generate noise the user learns to
-  ignore, which defeats a delta audit.
-- Install the upstream script as-is; wrap or fork for local changes so the
-  next update doesn't silently revert them.
-- Create `/var/log/box-audit/` before the first service run, not after.
+If the integrity baseline is genuinely poisoned (non-root run wrote
+partial hashes — the script guards against this, so treat it as
+last-resort), `sudo rm /var/lib/box-audit/integrity-baseline.json` and the
+next run silently rebuilds it. That erases all remembered history: after
+this, drift from before the reset is invisible. Say so when doing it.
