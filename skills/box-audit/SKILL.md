@@ -27,19 +27,29 @@ CLI flags are summarized in § 5 below and detailed in
 
 ## 1. Run or read
 
-Fresh check, right now:
+**0. Check freshness first.** `latest.json` is overwritten on each daily
+run — stale data and fresh data look identical. Read the timestamp
+before doing anything else:
+
+```bash
+python3 -c "import json;d=json.load(open('/var/log/box-audit/latest.json'));print(d['timestamp'],d['status'],len(d['findings']))"
+```
+
+If the timestamp is more than ~26 hours old, the daily run is overdue.
+Say so to the user *before* reporting findings. Triggering a fresh run
+is a user decision (`sudo systemctl start box-audit.service` or wait
+for the next timer fire), not yours.
+
+Fresh check, right now (only on user request):
 
 ```bash
 sudo box-audit            # text, exit 1 when findings exist
 sudo box-audit --json     # machine-readable, always exit 0
 ```
 
-The daily run has usually already happened. Read it instead of re-running
-when the question is "how is the box this morning":
-
-```bash
-python3 -c "import json; d=json.load(open('/var/log/box-audit/latest.json')); print(d['timestamp'], d['status'], len(d['findings']))"
-```
+The daily run has usually already happened. Read
+`/var/log/box-audit/latest.json` instead of re-running when the question
+is "how is the box this morning".
 
 **Done when:** you have either a fresh run's output or today's snapshot,
 and you know which one you're looking at. `latest.json` is overwritten on
@@ -68,6 +78,31 @@ NOPASSWD sudo).
 
 **Done when:** you can state the finding count, the highest severity
 present, and — if any `degraded` finding exists — what it blinds.
+
+## 2b. Don't
+
+box-audit observes; it doesn't remediate. Agents handling this skill's
+output have a strong reflex to *do something* about findings — resist.
+Specifically:
+
+- **Don't restart services** that `needrestart` flags (`sshd`,
+  `fail2ban`, etc.). The user decides the maintenance window.
+- **Don't run `apt upgrade` or trigger unattended-upgrades by hand.**
+  Same reason.
+- **Don't modify `/var/lib/box-audit/` baselines** directly. If a
+  port/timer/threshold needs updating, suggest the matching manage
+  flag (`--accept-port`, `--accept-timer`, `--outbound-threshold`) as
+  a discrete step for the user, don't run it yourself.
+- **Don't re-run the script to "verify" a finding.** The flock-guarded
+  daily timer is the canonical run; you read its output. Re-running
+  changes the snapshot timestamp, which makes "what changed since
+  yesterday?" diffs unreliable.
+- **Don't open firewall rules, kill processes, edit configs, or delete
+  files** based on a finding's hint. The finding surfaces the question;
+  the human answers it.
+- **Don't treat "0 findings" with `degraded` findings as "all clear".**
+  Report degraded-blindness explicitly. "Yes, no findings, but the
+  integrity check was skipped because the script wasn't root."
 
 ## 3. Triage by finding type
 
@@ -155,3 +190,11 @@ Full reference in `references/cli.md`. Quick:
 | `--accept-port N` | (root) Append port N to `ports-allowlist.txt`. |
 | `--accept-timer NAME` | (root) Append NAME.timer to `timers-baseline.txt`. |
 | `--outbound-threshold N` | (root) Write the OUTBOUND threshold. |
+| `--tail [N]` | Read-only summary of the last N daily snapshots (default 7). |
+| `--diff [N]` | Read-only diff of today's findings vs N days back (default 1). |
+| `--print-schema` | Emit severity + check_id mapping as JSON (don't parse text). |
+
+For programmatic consumption, the JSON output now carries stable
+`check_id` strings (`security.outbound_remote_count`,
+`updates.security_pending`, `integrity.change`, etc.) — see
+`box-audit --print-schema` for the full table.
