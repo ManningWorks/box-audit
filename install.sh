@@ -14,12 +14,16 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 
-# Single source of truth for the version (matches the script's --version and
-# the skill frontmatter). The script also carries its own copy so `box-audit
-# --version` works standalone after install.
+# Single source of truth for the version. install.sh copies it to
+# VERSION_MARKER, which `box-audit --version` reads at runtime — the script
+# itself carries no copy that can drift. The skill frontmatter version is
+# kept in sync by hand: the skill ships separately from the script, and
+# install.sh never edits skill files.
 VERSION="$(<"$REPO_ROOT/VERSION")"
 SCRIPT_SRC="$REPO_ROOT/scripts/box-audit.sh"
 SCRIPT_DST="/usr/local/bin/box-audit"
+VERSION_MARKER_DIR="/usr/local/share/box-audit"
+VERSION_MARKER="$VERSION_MARKER_DIR/version"
 SERVICE_UNIT="/etc/systemd/system/box-audit.service"
 TIMER_UNIT="/etc/systemd/system/box-audit.timer"
 LOG_DIR="/var/log/box-audit"
@@ -104,6 +108,13 @@ if install_file "$SCRIPT_DST" 0755 "$(<"$SCRIPT_SRC")"; then
 else
     SCRIPT_CHANGED=0
 fi
+
+# 1b. Version marker — `box-audit --version` reads this at runtime, so it
+#     must exist even when the script didn't change (a v0.3 → v0.4 upgrade
+#     stamps it the first time). Not a systemd unit, so it doesn't count
+#     toward the daemon-reload trigger below.
+mkdir -p "$VERSION_MARKER_DIR"
+install_file "$VERSION_MARKER" 0644 "$VERSION" || true
 
 say "  running first audit as root (builds the integrity baseline)…"
 "$SCRIPT_DST" > /dev/null || true   # exit 1 = findings, which is fine
