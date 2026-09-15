@@ -58,7 +58,26 @@ field (`ok` vs `findings`) is the signal instead.
 
 ## Install
 
-### Manual install
+### One command (recommended)
+
+```bash
+git clone https://github.com/ManningWorks/box-audit && cd box-audit
+sudo ./install.sh
+```
+
+Same command for fresh installs and upgrades. It sanity-checks the script
+before installing, writes the systemd units below, and finishes on a
+verify gate (service success, `latest.json` parses, timer active with a
+real next-run time) — non-zero exit on any failure. Re-runs only touch
+files that changed, and a customized timer schedule is preserved with a
+warning, never clobbered.
+
+Dependencies: `sudo apt install -y needrestart fail2ban python3`
+(docker only if you run containers and want the health check). Install
+them before or after — the audit degrades those checks gracefully and
+names what's missing.
+
+### Manual install (fallback)
 
 ```bash
 # 1. Install dependencies (Ubuntu/Debian)
@@ -77,7 +96,7 @@ Run it with sudo at least once (or via the systemd unit, which runs as
 root) so the file-integrity baseline can read all crown-jewel files.
 Non-root runs skip the integrity check rather than poison the baseline.
 
-### Via an AI agent (recommended)
+### Via an AI agent
 
 If you use an AI agent that supports the [Skills](https://agentskills.io) format
 (Hermes, opencode, Claude Code, etc.), point it at the `skills/box-audit/SKILL.md` file:
@@ -85,10 +104,14 @@ If you use an AI agent that supports the [Skills](https://agentskills.io) format
 > "Install the box-audit skill from
 > https://github.com/ManningWorks/box-audit/tree/master/skills/box-audit"
 
-The agent will walk through: copy the script, set up a daily systemd timer,
-verify with a dry-run, and report back.
+The agent runs the same `install.sh` you'd run by hand, walks the verify
+gate, reads the findings, and reports back — the skill encodes how to
+interpret and triage the output, not a separate install path.
 
 ### Schedule daily
+
+`install.sh` writes these units for you; shown here for the manual path or
+if you want to know what lands on your box:
 
 ```ini
 # /etc/systemd/system/box-audit.service
@@ -132,6 +155,62 @@ WantedBy=timers.target
 sudo systemctl daemon-reload
 sudo systemctl enable --now box-audit.timer
 ```
+
+## Getting the report off the box
+
+### Default is pull, and that's deliberate
+
+Every run leaves the full report in `/var/log/box-audit/latest.json`. You
+— or your agent — read it when you ask "how's the box?". Nothing arrives
+unprompted.
+
+That's not a missing feature. A daily audit that pings "all clear!" every
+morning trains you to ignore it within a week, and then the one morning it
+says something real, you will too. Silence means nothing changed. When
+something does, the report is already on disk, waiting to be read — and
+the severity table in `skills/box-audit/SKILL.md` says how to read it.
+
+### Webhook push (optional)
+
+If you'd rather certain findings come to you, ship them with
+`scripts/notify-webhook.sh`: it reads `latest.json` and POSTs the JSON
+body to `$BOX_AUDIT_WEBHOOK_URL` (set it in the environment or in
+`/etc/default/box-audit`). Any incoming-webhook endpoint works — Discord
+webhook, a Telegram bot via a relay, ntfy, your own receiver.
+
+Wire it into the daily run with a drop-in, not a second unit:
+
+```bash
+sudo systemctl edit box-audit.service
+```
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/bin/sh -c '/usr/local/bin/box-audit --json | /usr/local/bin/notify-webhook.sh'
+```
+
+Then `sudo systemctl daemon-reload`. (The empty `ExecStart=` clears the
+default before the replacement — systemd requires both lines.) The
+install skill's `references/install.md` describes the same wiring with
+the verify-gate caveat.
+
+### Hermes recipe
+
+What the author actually runs: a Hermes cron job once a day that reads
+`latest.json` and formats the findings into a Telegram message —
+roughly:
+
+```bash
+# in the cron job's script:
+python3 -c "import json; d=json.load(open('/var/log/box-audit/latest.json')); \
+  print(d['status'], len(d['findings']), 'findings')"
+# then format each finding (severity → emoji → message) per the
+# severity table in skills/box-audit/SKILL.md
+```
+
+Five lines and the severity table; no separate delivery daemon to keep
+alive. The severity table doubles as the message-formatting contract.
 
 ## Compatibility
 
