@@ -1,0 +1,1 @@
+{"status":"findings","timestamp":"2026-09-15T03:00:03Z","host":"luke-NucBoxG3-Plus","findings":[{"severity": "warn", "check_id": "security.new_port", "section": "security", "message": "22000 is open (not in baseline) [syncthing]"}],"raw_output":"\n=== SYSTEM HEALTH - 2026-09-XX HH:MM ===\n\ud83c\udd95 PORT: 22000 is open (not in baseline) [syncthing]\n"}

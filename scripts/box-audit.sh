@@ -87,6 +87,16 @@ if [[ -r /usr/local/share/box-audit/version ]]; then
 fi
 OUTPUT_MODE="text"   # "text" (default) or "json"
 
+# --- Build the version suffix at runtime ----------------------------------
+# The release VERSION file (single source of truth) carries only the bare
+# semantic version — the script appends +replay when this binary supports
+# the --replay mode. Editing the file on every replay change would be a
+# churn trap; a constant here makes it auditable in one place.
+REPLAY_IMPLEMENTED=1
+VERSION_SUFFIX=""
+[[ -n "${REPLAY_IMPLEMENTED}" ]] && VERSION_SUFFIX="+replay"
+BOX_AUDIT_VERSION_DISPLAY="${BOX_AUDIT_VERSION}${VERSION_SUFFIX}"
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --json) OUTPUT_MODE="json"; shift ;;
@@ -100,7 +110,7 @@ Usage: $(/usr/bin/basename "$0") [OPTIONS]
 
   (default)   Human-readable report suitable for Telegram / Discord.
   --json      Machine-readable JSON to stdout, e.g. for webhook delivery.
-  --version   Print version ($BOX_AUDIT_VERSION) and exit.
+  --version   Print version ($BOX_AUDIT_VERSION_DISPLAY) and exit.
 
   Manage per-box config under /var/lib/box-audit/ (run as root):
   --init                       Snapshot the current box into the config files
@@ -114,6 +124,9 @@ Usage: $(/usr/bin/basename "$0") [OPTIONS]
   History (read-only):
   --tail [N]                   List the last N daily snapshots (default 7).
   --diff [N]                   Findings added/gone since N days ago (default 1).
+  --replay [DIR]               Treat DIR as the history root (read-only). Use
+                               alone for a today-only run summary; with
+                               --diff [N] for an N-positions-earlier diff.
   --print-schema               Emit the severity + check_id mapping as JSON.
 
 Exit codes: 0 = all clear (or manage-op success), 1 = findings present,
@@ -122,7 +135,7 @@ EOF
             exit 0
             ;;
         --version)
-                    /usr/bin/echo "box-audit $BOX_AUDIT_VERSION"
+                    /usr/bin/echo "box-audit $BOX_AUDIT_VERSION_DISPLAY"
                     exit 0
                     ;;
                 --init)
@@ -155,6 +168,19 @@ EOF
                         DIFF_MODE="$2"; shift 2
                     else
                         DIFF_MODE="1"; shift
+                    fi ;;
+                --replay)
+                    # Same optional-arg pattern; bare `--replay` is rejected
+                    # explicitly below because the dir is the whole point.
+                    # The one-statement if/then/else/shift form is required
+                    # under `set -u` — the two-statement default form
+                    # (`[[ $# -ge 2 ]] || VAR=default; VAR="$2"`) reads
+                    # unbound $2 on a bare flag.
+                    if [[ $# -ge 2 && "$2" != -* ]]; then
+                        REPLAY_DIR="$2"; shift 2
+                    else
+                        echo "box-audit: --replay requires a directory argument" >&2
+                        exit 2
                     fi ;;
                                 --print-schema)
                                     PRINT_SCHEMA=1; shift ;;
@@ -378,11 +404,29 @@ except Exception:
         }
 
         # Diff mode: what changed between today and N days ago. Read-only.
+        # Optional $2 lets the replay path reuse the same comparison logic
+        # against a different history directory and an explicit file pair
+        # (replay's "today" is the last lex-sorted snapshot, not the wall
+        # clock — date math doesn't apply). The default $2 path keeps the
+        # live-history contract intact.
+        # For the replay branch, the caller passes the resolved today/baseline
+        # filenames as $3 and $4 — the footer line uses them verbatim instead
+        # of `date -u` so the summary matches the files actually compared.
         history_diff() {
             local n="${1:-1}"
-            local diff_file1 diff_file2
-            diff_file1="$HISTORY_DIR/$(date -u +%Y-%m-%d).json"
-            diff_file2="$HISTORY_DIR/$(date -u -d "$n days ago" +%Y-%m-%d).json"
+            local dir="${2:-$HISTORY_DIR}"
+            local diff_file1 diff_file2 today_label baseline_label
+            if [[ "$dir" == "$HISTORY_DIR" ]]; then
+                diff_file1="$dir/$(date -u +%Y-%m-%d).json"
+                diff_file2="$dir/$(date -u -d "$n days ago" +%Y-%m-%d).json"
+                today_label="$(date -u +%Y-%m-%d).json"
+                baseline_label="$(date -u -d "$n days ago" +%Y-%m-%d).json"
+            else
+                diff_file1="${3:-}"
+                diff_file2="${4:-}"
+                today_label="${3##*/}"
+                baseline_label="${4##*/}"
+            fi
             [[ -r "$diff_file2" ]] || { echo "box-audit: --diff cannot find $diff_file2 — need at least one prior snapshot" >&2; exit 1; }
             /usr/bin/python3 -c "
 import json
@@ -397,9 +441,70 @@ for k in sorted(added):
     print(f'+ ADDED  [{today[k].get(chr(34)+\"severity\"+chr(34),\"?\")[:4]:<4}] {today[k].get(\"message\",\"\")}')
 for k in sorted(removed):
     print(f'- GONE   [{base[k].get(chr(34)+\"severity\"+chr(34),\"?\")[:4]:<4}] {base[k].get(\"message\",\"\")}')
-print(f'  baseline=$(date -u -d "$n days ago" +%Y-%m-%d).json today=$(date -u +%Y-%m-%d).json  (+{len(added)} -{len(removed)})')
+print(f'  baseline=$baseline_label today=$today_label  (+{len(added)} -{len(removed)})')
 "
         }
+
+        # --replay <DIR>: treat DIR as a self-contained history root.
+        # Read-only against the live /var/log/box-audit/: no history_write,
+        # no history_persist_counts_from_json, no mkdir of live paths. The
+        # dir-override plumbing reuses history_diff (see the $2 / $3 / $4
+        # branch above) so the comparison logic is not forked.
+        run_replay() {
+            local dir="$1"
+            # Empty / missing dir → success with a clear message on stdout.
+            # Match the wording the issue specifies: "box-audit: replay
+            # directory is empty", exit 0, stderr silent.
+            if [[ ! -d "$dir" ]]; then
+                echo "box-audit: replay directory is empty"
+                return 0
+            fi
+            # Lex sort = chronological for YYYY-MM-DD.json filenames. We
+            # explicitly do NOT use mtime here: a re-stamped fixture (e.g.
+            # copy-into-place during testing) would otherwise reorder the
+            # timeline silently.
+            local replay_files=()
+            local f
+            while IFS= read -r f; do
+                replay_files+=("$f")
+            done < <(/usr/bin/find "$dir" -maxdepth 1 -type f -name '*.json' ! -name '.*' -printf '%f\n' | /usr/bin/sort)
+            if [[ ${#replay_files[@]} -eq 0 ]]; then
+                echo "box-audit: replay directory is empty"
+                return 0
+            fi
+            local last_idx=$((${#replay_files[@]} - 1))
+            local today_file="$dir/${replay_files[$last_idx]}"
+            if [[ -n "${DIFF_MODE:-}" ]]; then
+                # N positions earlier from the last file. Off-by-one protection:
+                # requesting diff 5 against a 3-file corpus is an error, not a
+                # silent truncation.
+                local earlier_idx=$((last_idx - DIFF_MODE))
+                if (( earlier_idx < 0 )); then
+                    echo "box-audit: --diff $DIFF_MODE out of range (corpus has $((last_idx + 1)) snapshot(s))" >&2
+                    return 1
+                fi
+                local baseline_file="$dir/${replay_files[$earlier_idx]}"
+                history_diff "$DIFF_MODE" "$dir" "$today_file" "$baseline_file"
+                return 0
+            fi
+            # No --diff: print a one-line summary of the latest snapshot —
+            # date, status, finding count — the same shape history_tail
+            # prints for the live history.
+            local fdate
+            fdate="${replay_files[$last_idx]%.json}"
+            /usr/bin/python3 -c "
+import json
+try:
+    d = json.load(open('$today_file'))
+    print(f\"$fdate  {d.get('status','?'):8}  {len(d.get('findings', []))} finding(s)\")
+except Exception:
+    print(f'$fdate  (corrupt or unreadable)')
+"
+        }
+        if [[ -n "${REPLAY_DIR:-}" ]]; then
+            run_replay "$REPLAY_DIR"
+            exit $?
+        fi
 
         # --tail / --diff are read-only history queries; same dispatch path.
         if [[ -n "${TAIL_MODE:-}" ]]; then
