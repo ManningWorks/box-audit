@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # shellcheck ships preinstalled on ubuntu-latest images, but pin the
+      # install so a runner-image cleanup can't silently break the gate.
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      # The suite is written for a bare non-root runner: no systemd units,
+      # no /var/log/box-audit, no sudo NOPASSWD. Every degraded-path
+      # branch the audit has is exercised here rather than hidden.
+      - name: Smoke test
+        run: bash test/smoke.sh
