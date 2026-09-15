@@ -446,9 +446,9 @@ today = load('$diff_file1')
 added = today.keys() - base.keys()
 removed = base.keys() - today.keys()
 for k in sorted(added):
-    print(f'+ ADDED  [{today[k].get(chr(34)+\"severity\"+chr(34),\"?\")[:4]:<4}] {today[k].get(\"message\",\"\")}')
+    print(f'+ ADDED  [{today[k].get(\"severity\", \"?\")[:4]:<4}] {today[k].get(\"message\", \"\")}')
 for k in sorted(removed):
-    print(f'- GONE   [{base[k].get(chr(34)+\"severity\"+chr(34),\"?\")[:4]:<4}] {base[k].get(\"message\",\"\")}')
+    print(f'- GONE   [{base[k].get(\"severity\", \"?\")[:4]:<4}] {base[k].get(\"message\", \"\")}')
 print(f'  baseline=$baseline_label today=$today_label  (+{len(added)} -{len(removed)})')
 "
         }
