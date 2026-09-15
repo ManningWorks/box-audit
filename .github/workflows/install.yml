@@ -1,0 +1,74 @@
+name: install-ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  install-regression-fix1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Regression assertion for the seed-config fix (fix/seed-config-and-notice-reset).
+      # On a fresh install, the "no /var/lib/box-audit config, using built-in
+      # defaults" notice must appear zero times. Before the fix it printed
+      # twice — once for cron-d-allowlist.txt, once for suid-threshold.conf —
+      # because install.sh failed to seed them. install.sh now seeds both, so
+      # the helpers see a present file and never fall into the defaults branch.
+      #
+      # The assertion is:
+      #   1. install.sh runs to completion on a fresh container (seeds the dir).
+      #   2. /var/lib/box-audit has all five expected config files.
+      #   3. box-audit --json runs to completion with no "no /var/lib/box-audit
+      #      config" line on stderr.
+      - name: Install fresh + assert notice printed 0 times
+        run: |
+          set -euo pipefail
+          docker build -t box-audit-install:regression-fix1 \
+              -f test/install-docker/Dockerfile . >/dev/null
+          WORK="$(mktemp -d)"
+          cp -R . "$WORK/"
+          CID="$(docker run -d --privileged \
+              --cgroupns=host \
+              --tmpfs /run \
+              --tmpfs /var/log \
+              -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+              -v "$WORK":/work \
+              -e container=docker \
+              box-audit-install:regression-fix1)"
+          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+          STATE=""
+          for _ in $(seq 1 30); do
+              STATE="$(docker exec "$CID" systemctl is-system-running 2>/dev/null || true)"
+              case "$STATE" in running|degraded) break ;; esac
+              sleep 1
+          done
+          [[ "$STATE" == "running" || "$STATE" == "degraded" ]] \
+              || { echo "systemd did not become ready (last state: '${STATE:-none}')" >&2; exit 1; }
+          # Install (seeds the config dir).
+          docker exec "$CID" /bin/bash -c 'cd /work && bash install.sh'
+          # All five expected files must exist post-install.
+          docker exec "$CID" /bin/bash -c '
+              for f in ports-allowlist.txt timers-baseline.txt outbound-threshold.conf \
+                       cron-d-allowlist.txt suid-threshold.conf; do
+                  [[ -f /var/lib/box-audit/$f ]] || { echo "MISSING: /var/lib/box-audit/$f" >&2; exit 1; }
+              done
+              echo "all five config files seeded"
+          '
+          # Now run box-audit as root (the timer runs it as root too, since
+          # the service file has no User= directive) and assert no default-
+          # notice on stderr.
+          docker exec "$CID" /bin/bash -c '
+              /usr/local/bin/box-audit --json 2>/tmp/ba-stderr.log >/dev/null || true
+              cat /tmp/ba-stderr.log
+          '
+          NOTICE_COUNT="$(docker exec "$CID" bash -c 'grep -c "no /var/lib/box-audit config" /tmp/ba-stderr.log 2>/dev/null; true' | tr -d '\r\n' || echo 0)"
+          # grep -c returns exit 1 when the count is 0 (no matches), but the
+          # number is still printed. We strip the newline and fall back to 0
+          # only if the output is empty.
+          NOTICE_COUNT="${NOTICE_COUNT:-0}"
+          echo "notice-count=${NOTICE_COUNT}"
+          [[ "$NOTICE_COUNT" == "0" ]] \
+              || { echo "FAIL: expected 0 occurrences of the default-notice, got ${NOTICE_COUNT}" >&2; exit 1; }

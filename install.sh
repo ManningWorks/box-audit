@@ -161,9 +161,27 @@ if [[ $IS_FRESH_INSTALL -eq 1 ]]; then
             '25' \
             > /var/lib/box-audit/outbound-threshold.conf
     fi
+    if [[ ! -f /var/lib/box-audit/cron-d-allowlist.txt ]]; then
+        printf '%s\n' \
+            '# cron.d entries that box-audit will NOT flag as unexpected.' \
+            '# One name per line (the entry filename, no .cron.d/ prefix).' \
+            '# Edit with: sudo box-audit --accept-cron-d <name>' \
+            '# Or rebuild from current /etc/cron.d/ contents with: sudo box-audit --init' \
+            'anacron' 'e2scrub_all' 'sysstat' '0hourly' \
+            > /var/lib/box-audit/cron-d-allowlist.txt
+    fi
+    if [[ ! -f /var/lib/box-audit/suid-threshold.conf ]]; then
+        printf '%s\n' \
+            '# Threshold (single integer) for the SUID count check.' \
+            '# Set with: sudo box-audit --suid-threshold <N>' \
+            '30' \
+            > /var/lib/box-audit/suid-threshold.conf
+    fi
     chmod 0644 /var/lib/box-audit/ports-allowlist.txt \
               /var/lib/box-audit/timers-baseline.txt \
-              /var/lib/box-audit/outbound-threshold.conf
+              /var/lib/box-audit/outbound-threshold.conf \
+              /var/lib/box-audit/cron-d-allowlist.txt \
+              /var/lib/box-audit/suid-threshold.conf
 fi
 
 say "  running first audit as root (builds the integrity baseline)…"
