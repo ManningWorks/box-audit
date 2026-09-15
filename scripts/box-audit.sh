@@ -95,7 +95,8 @@ while [[ $# -gt 0 ]]; do
             /usr/bin/cat <<EOF
 Usage: $(/usr/bin/basename "$0") [OPTIONS]
                 [--init|--accept-port N|--accept-timer NAME|
-                 --outbound-threshold N]
+                 --outbound-threshold N|--tail [N]|--diff [N]|
+                 --print-schema]
 
   (default)   Human-readable report suitable for Telegram / Discord.
   --json      Machine-readable JSON to stdout, e.g. for webhook delivery.
@@ -108,6 +109,11 @@ Usage: $(/usr/bin/basename "$0") [OPTIONS]
   --accept-port N              Append port N to ports-allowlist.txt.
   --accept-timer NAME          Append timer NAME to timers-baseline.txt.
   --outbound-threshold N       Write outbound-threshold.conf (single integer).
+
+  History (read-only):
+  --tail [N]                   List the last N daily snapshots (default 7).
+  --diff [N]                   Findings added/gone since N days ago (default 1).
+  --print-schema               Emit the severity + check_id mapping as JSON.
 
 Exit codes: 0 = all clear (or manage-op success), 1 = findings present,
              2 = bad CLI flag. (--json mode always exits 0; see status field.)
@@ -133,8 +139,10 @@ EOF
                             [[ $# -ge 2 ]] || TAIL_MODE="7"
                             TAIL_MODE="$2"; shift 2 ;;
                         --diff)
-                            [[ $# -ge 2 ]] || { echo "box-audit: --diff requires N (days back, default 1)" >&2; exit 2; }
-                            DIFF_MODE="$2"; shift 2 ;;
+                                    [[ $# -ge 2 ]] || { echo "box-audit: --diff requires N (days back, default 1)" >&2; exit 2; }
+                                    DIFF_MODE="$2"; shift 2 ;;
+                                --print-schema)
+                                    PRINT_SCHEMA=1; shift ;;
                 *) /usr/bin/echo "Unknown arg: $1 (try --help)" >&2; exit 2 ;;
             esac
         done
@@ -264,6 +272,54 @@ EOF
         fi
         if [[ -n "${DIFF_MODE:-}" ]]; then
             history_diff "$DIFF_MODE"
+            exit 0
+        fi
+        if [[ -n "${PRINT_SCHEMA:-}" ]]; then
+            /usr/bin/python3 -c '
+import json
+out = {
+    "severities": {
+        "alert": "🚨 active security signal (look now)",
+        "warn": "🔒🛡️🔴⚠️💥🌐🔓⏰ above-threshold or delta (look today)",
+        "info": "📅📦🆕🔄🔁 routine state (skim)",
+        "degraded": "❓ a check could not run (fix before trusting no findings)",
+    },
+    "check_ids": {
+        "security.fail2ban_banned":      "Currently banned IPs on fail2ban jail",
+        "security.ssh_fails":            "SSH auth failures in last 24h",
+        "security.sudo_fails":           "sudo auth failures in last 24h",
+        "security.new_port":             "open port not in ports-allowlist",
+        "security.outbound_remote_count":"non-LAN remote IPs established",
+        "security.outbound_delta":       "today > 2x yesterday AND > 5 absolute",
+        "security.suid_count":           "SUID binary count",
+        "security.suid_delta":           "today suid - yesterday suid > 2",
+        "system.failed_units":           "failed systemd unit names",
+        "system.custom_timers":          "non-standard systemd timers",
+        "system.user_cron":              "non-empty user crontab",
+        "system.cron_d_dropins":         "unexpected /etc/cron.d/ entries",
+        "system.docker_unhealthy":       "unhealthy docker containers",
+        "system.crash_dumps":            "var crash files present",
+        "system.kernel_errors":          "kernel errors in last 24h journal",
+        "updates.upgradable":            "packages upgradable over threshold",
+        "updates.security_pending":      "security updates pending",
+        "updates.security_delta":        "security queue grew by over 1 vs yesterday",
+        "updates.kernel_cve":            "kernel security CVEs pending",
+        "maintenance.reboot_required":   "var run reboot-required present",
+        "maintenance.apt_cache_stale":   "apt update stamp over 48h",
+        "maintenance.timer_drift":       "apt-daily timer hasnt fired in 26h",
+        "maintenance.unattended_upgrades": "unattended-upgrades log anomalies",
+        "maintenance.kernel_restart":    "kernel mismatch installed vs running",
+        "maintenance.services_restart":  "services running pre-upgrade libs",
+        "maintenance.needrestart_warn":  "needrestart WARNING class",
+        "integrity.change":              "crown-jewel file modified vs baseline",
+        "resources.disk_high":           "root partition over 85 percent",
+        "resources.swap_high":           "swap over 70 percent",
+        "resources.load_high":           "1-min loadavg over 3.0",
+        "degraded.check":                "a check could not run (see message)",
+    },
+}
+print(json.dumps(out, indent=2, sort_keys=True))
+'
             exit 0
         fi
 

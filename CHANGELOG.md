@@ -44,6 +44,9 @@ whether to upgrade.
   `updates.security_pending`, `integrity.change`, etc.). Downstream
   tooling can branch on this without parsing free text. The heuristic
   id is gone — the table replaces it.
+- `box-audit --print-schema` (PR 4). Emits the severity + check_id
+  mapping as JSON, so downstream tooling (Hermes cron, Discord relay,
+  etc.) doesn't have to parse human text or hardcode the table.
 
 ### Changed
 
@@ -54,6 +57,13 @@ whether to upgrade.
   the `id` values changed (now stable strings vs. heuristic word-
   trigrams) but consumers reading human `message` or `severity` are
   unaffected.
+- **Agent-facing skill** (PR 4). `skills/box-audit/SKILL.md`:
+  - § 1 Step 0 is now a freshness check (read the snapshot timestamp
+    before reporting findings).
+  - New `## 2b. Don't` section — explicit guard against agents
+    restarting services, re-running the script, modifying baselines,
+    or treating "0 findings with degraded" as a clean pass.
+  - § 5 CLI summary expanded with `--tail`, `--diff`, `--print-schema`.
 
 ## [0.4.0] - 2026-09-15
 
