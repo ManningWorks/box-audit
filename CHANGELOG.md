@@ -5,6 +5,39 @@ All notable changes to box-audit are documented here. The format follows
 grouped by kind, not by PR, and are written for the person deciding
 whether to upgrade.
 
+## [0.6.0] - 2026-09-15
+
+### Added
+
+- **`box-audit --replay [DIR]`** (issue #15). Treat DIR as a self-contained
+  history root: read-only against the live `/var/log/box-audit/history/`,
+  never writes a snapshot there. The "today" snapshot is the
+  lex-sorted last file; with `--diff [N]`, the comparison is against the
+  file N positions earlier in that same dir (mirrors `--diff`'s live
+  semantics). An empty dir prints `box-audit: replay directory is empty`
+  on stdout and exits 0. Lets you triage historical runs (or fixtures)
+  without ever touching live state.
+- `box-audit --version` now appends `+replay` when the replay mode is
+  present in this build. The suffix is built at runtime from a constant
+  in the script — the `VERSION` file remains the bare `0.6.0` single
+  source of truth.
+- `test/fixtures/replay/` — three snapshot fixtures
+  (`2026-09-13.json` baseline, `2026-09-14.json` one finding,
+  `2026-09-15.json` "today" with the deliberate added/gone delta) that
+  exercise `--diff 1` and `--diff 2` deterministically. Byte-compatible
+  with `--json` output; no new fields.
+- `test/smoke.sh` — 13 new assertions covering the empty-dir contract,
+  corpus exit codes, `--diff 1` / `--diff 2` determinism (two
+  consecutive runs diffed), and the version suffix. Existing 19
+  assertions unchanged.
+
+### Changed
+
+- `history_diff` now accepts an optional directory override (and an
+  explicit today/baseline file pair) so the replay path reuses the
+  exact same comparison logic instead of forking a replay-specific
+  function. Live `--diff` behavior is unchanged.
+
 ## [0.5.0] - 2026-09-15
 
 ### Fixed
