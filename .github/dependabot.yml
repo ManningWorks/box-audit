@@ -1,0 +1,6 @@
+version: 2
+updates:
+  - package-ecosystem: "docker"
+    directory: "/test/install-docker"
+    schedule:
+      interval: "weekly"
