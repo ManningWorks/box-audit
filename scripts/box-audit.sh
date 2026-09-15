@@ -93,26 +93,166 @@ while [[ $# -gt 0 ]]; do
         --text) OUTPUT_MODE="text"; shift ;;
         -h|--help)
             /usr/bin/cat <<EOF
-Usage: $(/usr/bin/basename "$0") [--json|--text|--version]
+Usage: $(/usr/bin/basename "$0") [OPTIONS]
+                [--init|--accept-port N|--accept-timer NAME|
+                 --outbound-threshold N]
 
   (default)   Human-readable report suitable for Telegram / Discord.
   --json      Machine-readable JSON to stdout, e.g. for webhook delivery.
   --version   Print version ($BOX_AUDIT_VERSION) and exit.
 
-Exit codes: 0 = all clear, 1 = findings present, 2 = bad CLI flag.
-             (--json mode always exits 0; see the status field.)
+  Manage per-box config under /var/lib/box-audit/ (run as root):
+  --init                       Snapshot the current box into the config files
+                               (ports listening now, timers active now,
+                               outbound threshold = 25).
+  --accept-port N              Append port N to ports-allowlist.txt.
+  --accept-timer NAME          Append timer NAME to timers-baseline.txt.
+  --outbound-threshold N       Write outbound-threshold.conf (single integer).
+
+Exit codes: 0 = all clear (or manage-op success), 1 = findings present,
+             2 = bad CLI flag. (--json mode always exits 0; see status field.)
 EOF
             exit 0
             ;;
         --version)
-            /usr/bin/echo "box-audit $BOX_AUDIT_VERSION"
-            exit 0
-            ;;
-        *) /usr/bin/echo "Unknown arg: $1 (try --help)" >&2; exit 2 ;;
-    esac
-done
+                    /usr/bin/echo "box-audit $BOX_AUDIT_VERSION"
+                    exit 0
+                    ;;
+                --init)
+                    MANAGE_MODE="init"; shift ;;
+                --accept-port)
+                    [[ $# -ge 2 ]] || { echo "box-audit: --accept-port requires an integer" >&2; exit 2; }
+                    MANAGE_MODE="accept-port"; MANAGE_ARG="$2"; shift 2 ;;
+                --accept-timer)
+                    [[ $# -ge 2 ]] || { echo "box-audit: --accept-timer requires a name" >&2; exit 2; }
+                    MANAGE_MODE="accept-timer"; MANAGE_ARG="$2"; shift 2 ;;
+                --outbound-threshold)
+                    [[ $# -ge 2 ]] || { echo "box-audit: --outbound-threshold requires an integer" >&2; exit 2; }
+                    MANAGE_MODE="outbound-threshold"; MANAGE_ARG="$2"; shift 2 ;;
+                *) /usr/bin/echo "Unknown arg: $1 (try --help)" >&2; exit 2 ;;
+            esac
+        done
 
-# --- JSON collector ------------------------------------------------------
+        # --- Per-box config lookups -----------------------------------------------
+        # /var/lib/box-audit/ holds per-box state: ports-allowlist.txt,
+        # timers-baseline.txt, outbound-threshold.conf. The helpers below read
+        # them, falling back to small built-in defaults when the file is missing
+        # (fresh install before --init ran; or just-installed agent-path clone).
+        # Each first-miss per run prints a one-time stderr note telling the user
+        # how to populate them.
+        CONFIG_DIR="/var/lib/box-audit"
+        PORTS_FILE="$CONFIG_DIR/ports-allowlist.txt"
+        TIMERS_FILE="$CONFIG_DIR/timers-baseline.txt"
+        OUTBOUND_FILE="$CONFIG_DIR/outbound-threshold.conf"
+        CONFIG_NOTICE_PRINTED=0
+        note_default_used() {
+            [[ $CONFIG_NOTICE_PRINTED -eq 0 ]] || return 0
+            CONFIG_NOTICE_PRINTED=1
+            echo "box-audit: no /var/lib/box-audit config, using built-in defaults — run 'sudo box-audit --init' to learn your box" >&2
+        }
+        get_ports_allowlist() {
+            if [[ -r "$PORTS_FILE" ]]; then
+                # One port per non-comment, non-blank line. Trim whitespace.
+                /usr/bin/grep -vE '^[[:space:]]*(#|$)' "$PORTS_FILE" 2>/dev/null \
+                    | /usr/bin/sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+                    | /usr/bin/tr '\n' ' ' \
+                    | /usr/bin/sed -E 's/[[:space:]]+$//'
+            else
+                note_default_used
+                echo "22 53 80 443 631"
+            fi
+        }
+        get_timers_baseline() {
+            if [[ -r "$TIMERS_FILE" ]]; then
+                /usr/bin/grep -vE '^[[:space:]]*(#|$)' "$TIMERS_FILE" 2>/dev/null \
+                    | /usr/bin/sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/\.timer$//'
+            else
+                note_default_used
+                echo "anacron apport-autoreport apt-daily apt-daily-upgrade dpkg-db-backup e2scrub_all fstrim fwupd-refresh logrotate man-db motd-news snapd-snap-repair sysstat-collect sysstat-summary systemd-tmpfiles-clean ua-timer update-notifier-download update-notifier-motd"
+            fi
+        }
+        get_outbound_threshold() {
+            if [[ -r "$OUTBOUND_FILE" ]]; then
+                local v
+                v=$(/usr/bin/grep -vE '^[[:space:]]*(#|$)' "$OUTBOUND_FILE" 2>/dev/null | /usr/bin/head -1 | /usr/bin/tr -d ' \r\n')
+                if [[ "$v" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "$v"; return 0
+                fi
+            fi
+            note_default_used
+            echo "25"
+        }
+        main_manage() {
+            # Validate the argument FIRST so a bad value is reported regardless of
+            # EUID; the root check below then becomes a permission gate, not a
+            # syntax gate. (Without this, a non-root user invoking e.g.
+            # `--accept-port foo` sees "needs root" instead of "invalid integer".)
+            case "$MANAGE_MODE" in
+                accept-port)
+                    if ! [[ "$MANAGE_ARG" =~ ^[0-9]+$ ]] || (( MANAGE_ARG < 1 || MANAGE_ARG > 65535 )); then
+                        echo "box-audit: --accept-port requires an integer 1..65535, got '$MANAGE_ARG'" >&2
+                        exit 2
+                    fi
+                    ;;
+                accept-timer)
+                    if [[ -z "$MANAGE_ARG" || "$MANAGE_ARG" =~ [[:space:]/] ]]; then
+                        echo "box-audit: --accept-timer requires a name (no spaces or slashes), got '$MANAGE_ARG'" >&2
+                        exit 2
+                    fi
+                    ;;
+                outbound-threshold)
+                    if ! [[ "$MANAGE_ARG" =~ ^[1-9][0-9]*$ ]]; then
+                        echo "box-audit: --outbound-threshold requires a positive integer, got '$MANAGE_ARG'" >&2
+                        exit 2
+                    fi
+                    ;;
+            esac
+            [[ $EUID -eq 0 ]] || { echo "box-audit: manage commands require root (sudo)" >&2; exit 1; }
+            /usr/bin/mkdir -p "$CONFIG_DIR" || { echo "box-audit: cannot create $CONFIG_DIR" >&2; exit 1; }
+            case "$MANAGE_MODE" in
+                init)
+                    /usr/bin/ss -tlnH 2>/dev/null \
+                        | /usr/bin/awk '{print $4}' | /usr/bin/grep -oP ':\K\d+$' \
+                        | /usr/bin/sort -un > "$PORTS_FILE"
+                    /usr/bin/systemctl list-timers --all --no-pager --no-legend --output json 2>/dev/null \
+                        | /usr/bin/python3 -c '
+        import sys, json
+        for row in json.load(sys.stdin):
+            u = row.get("unit", "")
+            if u.endswith(".timer"):
+                print(u)' > "$TIMERS_FILE"
+                    /usr/bin/printf '25\n' > "$OUTBOUND_FILE"
+                    echo "box-audit: seeded $PORTS_FILE, $TIMERS_FILE, $OUTBOUND_FILE"
+                    ;;
+                accept-port)
+                    [[ -f "$PORTS_FILE" ]] || /usr/bin/install -D -m 0644 /dev/null "$PORTS_FILE"
+                    /usr/bin/grep -qxF "$MANAGE_ARG" "$PORTS_FILE" 2>/dev/null \
+                        || /usr/bin/printf '%s\n' "$MANAGE_ARG" >> "$PORTS_FILE"
+                    echo "box-audit: added port $MANAGE_ARG to $PORTS_FILE"
+                    ;;
+                accept-timer)
+                    local tname="${MANAGE_ARG%.timer}"
+                    [[ -f "$TIMERS_FILE" ]] || /usr/bin/install -D -m 0644 /dev/null "$TIMERS_FILE"
+                    /usr/bin/grep -qxF "${tname}.timer" "$TIMERS_FILE" 2>/dev/null \
+                        || /usr/bin/printf '%s.timer\n' "$tname" >> "$TIMERS_FILE"
+                    echo "box-audit: added timer ${tname}.timer to $TIMERS_FILE"
+                    ;;
+                outbound-threshold)
+                    /usr/bin/printf '%s\n' "$MANAGE_ARG" > "$OUTBOUND_FILE"
+                    echo "box-audit: set outbound threshold to $MANAGE_ARG (in $OUTBOUND_FILE)"
+                    ;;
+                *)
+                    echo "box-audit: unknown manage mode '$MANAGE_MODE'" >&2
+                    exit 2
+                    ;;
+            esac
+            exit 0
+        }
+        if [[ -n "${MANAGE_MODE:-}" ]]; then
+            main_manage
+        fi
+
+        # --- JSON collector -------------------------------------------------------
 # Each report_*() function can push findings via json_push <severity> <id> <message>
 # In text mode this is a no-op; in json mode it's collected and emitted as
 # a single {"findings":[...]} object.
@@ -304,7 +444,8 @@ report_security() {
     # 22(SSH) 53(DNS) 631(IPP) 5006(Actual) 5173(Vite) 8384(Syncthing HTTP)
     # 9377(?) 22000(Syncthing BEP) 3000/3001(Next.js) 61271(?) 34042(Tailscale DERP)
     # 8787(Hermes WebUI - hermes-webui/server.py, HERMES_WEBUI_PORT)
-    local known_ports="22 53 631 5006 5173 8384 9377 22000 3000 3001 61271 34042 8787"
+    local known_ports
+    known_ports="$(get_ports_allowlist)"
     local ss_output
     ss_output=$($T /usr/bin/ss -tlnp 2>/dev/null | grep LISTEN)
     local open_ports
@@ -383,7 +524,7 @@ report_security() {
         outbound_remote_count=${outbound_remote_count:-0}
         outbound_remote_sample=$(echo "$suspicious_ips" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -v '^$' | /usr/bin/head -5 | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')
     fi
-    [[ $outbound_remote_count -gt 25 ]] && out="$out\n🌐 OUTBOUND: $outbound_remote_count non-LAN remote IP(s) connected: $outbound_remote_sample"
+    [[ $outbound_remote_count -gt $(get_outbound_threshold) ]] && out="$out\n🌐 OUTBOUND: $outbound_remote_count non-LAN remote IP(s) connected: $outbound_remote_sample"
 
     # SUID binary count — catches a rootkit that dropped a SUID binary to
     # escalate. Standard Ubuntu desktop has ~18-25 SUID files (passwd,
@@ -418,47 +559,56 @@ report_system() {
 
     # Persistence check — non-standard systemd timers + user crontabs.
     # Catches an attacker adding a cron job or timer to re-establish access
-    # after a reboot. Standard set is the Ubuntu desktop defaults:
-    #   anacron, apport-autoreport, apt-daily, apt-daily-upgrade,
-    #   dpkg-db-backup, e2scrub_all, fstrim, fwupd-refresh, logrotate,
-    #   man-db, motd-news, snapd.snap-repair, sysstat-collect,
-    #   sysstat-summary, systemd-tmpfiles-clean, ua-timer,
-    #   update-notifier-download, update-notifier-motd
-    # Anything outside that gets flagged with its name.
-    #
-    # Use JSON output and jq so we extract the actual `unit` field rather
-    # than miscounting the human-readable columns (which include the
-    # activates-target .service on the same line).
-    local timer_list custom_timers timer_name
-    timer_list=$($T /usr/bin/systemctl list-timers --all --no-pager --no-legend --output json 2>/dev/null \
-        | /usr/bin/python3 -c "import sys,json
-data = json.load(sys.stdin)
-for row in data:
-    u = row.get('unit','')
-    if u.endswith('.timer'):
-        print(u)" 2>/dev/null)
-    custom_timers=""
-    while IFS= read -r timer_name; do
-        [[ -z "$timer_name" ]] && continue
-        # box-audit.timer (or any name the script is installed under) is
-        # this very audit — flagging it would self-report on every run.
-        [[ "$timer_name" == *"box-audit"* || "$timer_name" == *"healthcheck"* ]] && continue
-        case "$timer_name" in
-            anacron.timer|apport-autoreport.timer|apt-daily.timer|\
-            apt-daily-upgrade.timer|dpkg-db-backup.timer|\
-            e2scrub_all.timer|fstrim.timer|fwupd-refresh.timer|\
-            logrotate.timer|man-db.timer|motd-news.timer|\
-            snapd.snap-repair.timer|sysstat-collect.timer|\
-            sysstat-summary.timer|systemd-tmpfiles-clean.timer|\
-            ua-timer.timer|update-notifier-download.timer|\
-            update-notifier-motd.timer)
-                # standard, ignore
-                ;;
-            *)
+    # Anything outside that gets flagged with its name. The list itself
+        # is per-box (see /var/lib/box-audit/timers-baseline.txt) so this
+        # audit learns what's "standard" on *this* box instead of carrying
+        # a hardcoded Ubuntu Desktop list everywhere.
+        #
+        # Use JSON output and jq so we extract the actual `unit` field rather
+        # than miscounting the human-readable columns (which include the
+        # activates-target .service on the same line).
+        local timer_list custom_timers timer_name
+        timer_list=$($T /usr/bin/systemctl list-timers --all --no-pager --no-legend --output json 2>/dev/null \
+            | /usr/bin/python3 -c "import sys,json
+    data = json.load(sys.stdin)
+    for row in data:
+        u = row.get('unit','')
+        if u.endswith('.timer'):
+            print(u)" 2>/dev/null)
+        # Build the per-box allowlist as a pipe-separated regex pattern. The
+            # baseline is one name per line, no .timer suffix; systemd reports
+            # the .timer suffix; the regex below optionally matches the suffix.
+            # Empty pattern means nothing matches (every timer is "custom") which
+            # is the right fresh-install behaviour: alert on everything until
+            # --init runs.
+            local timer_baseline
+            timer_baseline="$(get_timers_baseline)"
+            local timer_pat=""
+            if [[ -n "$timer_baseline" ]]; then
+                # join names with '|'
+                timer_pat="$(printf '%s' "$timer_baseline" | /usr/bin/tr '\n' '|')"
+                # trim trailing '|' from the join
+                timer_pat="${timer_pat%%|}"
+            fi
+        custom_timers=""
+        while IFS= read -r timer_name; do
+            [[ -z "$timer_name" ]] && continue
+            # box-audit.timer (or any name the script is installed under) is
+            # this very audit — flagging it would self-report on every run.
+            [[ "$timer_name" == *"box-audit"* || "$timer_name" == *"healthcheck"* ]] && continue
+            if [[ -n "$timer_pat" ]]; then
+                # Extended regex alternation. get_timers_baseline returns
+                # names without the .timer suffix; systemd reports them
+                # with the suffix. Match either form.
+                if [[ "$timer_name" =~ ^($timer_pat)(\.timer)?$ ]]; then
+                    :   # standard, ignore
+                else
+                    custom_timers="$custom_timers $timer_name"
+                fi
+            else
                 custom_timers="$custom_timers $timer_name"
-                ;;
-        esac
-    done <<< "$timer_list"
+            fi
+        done <<< "$timer_list"
     local custom_count
     custom_count=$(echo "$custom_timers" | /usr/bin/wc -w)
     custom_count=${custom_count:-0}

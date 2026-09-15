@@ -113,6 +113,11 @@ interpret and triage the output, not a separate install path.
 `install.sh` writes these units for you; shown here for the manual path or
 if you want to know what lands on your box:
 
+The unit runs `box-audit --json` once a day. To inspect or tweak the
+allowlists (`--init`, `--accept-port`, `--accept-timer`,
+`--outbound-threshold`), see
+[`skills/box-audit/references/cli.md`](skills/box-audit/references/cli.md).
+
 ```ini
 # /etc/systemd/system/box-audit.service
 [Unit]
