@@ -1,6 +1,6 @@
 ---
 name: box-audit
-version: 0.4.0
+version: 0.5.0
 description: Run and interpret box-audit, a daily security + health audit for Linux boxes. Use when asked to check box health/security, run or schedule box-audit, install or upgrade it, read its latest.json report, triage its findings, or repair its timer/baseline. Installation is one command (install.sh), covered in references/install.md.
 ---
 
@@ -59,7 +59,7 @@ timestamp against the timer's last-fire time
 
 ## 2. Read the findings
 
-Each JSON finding carries `severity`, `id`, `message`:
+Each JSON finding carries `severity`, `check_id`, `message`:
 
 | severity | meaning | your move |
 |---|---|---|

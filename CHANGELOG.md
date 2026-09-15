@@ -5,7 +5,56 @@ All notable changes to box-audit are documented here. The format follows
 grouped by kind, not by PR, and are written for the person deciding
 whether to upgrade.
 
-## [Unreleased]
+## [0.5.0] - 2026-09-15
+
+### Fixed
+
+- `--tail` and `--diff` never worked: the CLI dispatch called the
+  history functions before bash had read their definitions, so every
+  invocation died with `command not found` and exit 0. Functions now
+  precede the dispatch.
+- `--tail` with no argument crashed under `set -u` (unbound `$2`), and
+  `--diff` with no argument errored despite docs advertising a default
+  of 1. Both now take the documented optional `[N]`.
+- **Delta mode now actually fires.** The counts sidecar extracted
+  yesterday's numbers by regex-matching leading digits from finding
+  messages — which never matched, because every message starts with a
+  label (`SUID: 37 ...`). The sidecar now reads the structured `count`
+  field on `security.outbound_remote_count`, `security.suid_count`,
+  and `updates.security_pending`. SUID-DELTA, OUTBOUND-DELTA, and
+  SECURITY-DELTA are functional for the first time since PR 3.
+- USER-CRON finding no longer renders "in ''s crontab" under the root
+  systemd unit (`$USER` is empty there).
+- Timer self-exemption is exact (`box-audit.timer`,
+  `healthcheck.timer`) — a substring match would also have exempted an
+  attacker timer named `box-audit-helper.timer`.
+- History snapshots are written 0600 instead of inheriting the process
+  umask (0644 under the root unit). They contain host info, findings,
+  and IP samples.
+
+### Changed
+
+- **BREAKING (JSON consumers):** finding field `id` → `check_id`.
+- **Findings-first pipeline.** Checks push structured findings to a
+  file-backed collector; the text report and the `--json` document are
+  both renderings of that one list. Adding a check is now one
+  `json_push` call instead of edits in 3–4 places (report function,
+  emoji case map, schema, docs). Output shape is unchanged: same
+  emojis, labels, severities, exit codes, `raw_output`, `status`.
+- cron.d allowlist and SUID threshold moved from hardcoded values to
+  per-box config (`/var/lib/box-audit/cron-d-allowlist.txt`,
+  `suid-threshold.conf`), seeded by `--init`, with built-in fallbacks.
+  The `--init` seed now reflects the box's actual /etc/cron.d/ contents.
+- USER-CRON message wording is tool-neutral ("verify you created it")
+  instead of assuming the author's Hermes-specific scheduling.
+
+### Added
+
+- `test/smoke.sh` — 19-assertion CLI contract suite, CI-safe (non-root,
+  bare runner). Asserts exit codes, JSON shape, schema/check_id
+  agreement, and shellcheck cleanliness across all three scripts.
+
+## [0.4.0] - 2026-09-15
 
 ### Added
 
