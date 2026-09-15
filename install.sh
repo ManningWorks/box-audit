@@ -172,6 +172,10 @@ say "  done. Findings, if any, are the tool working."
 
 # 2. Log dir before the first service run, or the run fails on output.
 mkdir -p "$LOG_DIR"
+# History dir for delta-mode / --tail / --diff. Same dir tree, separate
+# subdirectory so logrotate configs targeting /var/log/box-audit/ don't
+# sweep daily snapshots. The script writes here on every --json run.
+mkdir -p "$LOG_DIR/history"
 
 # 3. Units. On upgrades, preserve a customized OnCalendar rather than
 #    silently resetting the user's schedule.

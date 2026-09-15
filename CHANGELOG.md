@@ -9,30 +9,51 @@ whether to upgrade.
 
 ### Added
 
-- Per-box config for ports, timers, and outbound threshold. The hardcoded
-  `known_ports` list, custom-timer allowlist, and outbound threshold of 25
-  all moved from the script to `/var/lib/box-audit/`. Each gets a small
-  built-in fallback when the file is missing (with a one-time stderr note
-  pointing at `--init`). The NucBox-specific ports (`5006`, `5173`,
-  `8384`, `3000`/`3001`, `8787`, `22000`, `34042`, `61271`) are gone from
-  the script — no longer bleed into other boxes via the README example.
-- `box-audit --init` snapshots the live box (currently-listening ports +
-  active `.timer` units) into the three config files. Idempotent.
+- Per-box config for ports, timers, and outbound threshold (PR 2). The
+  hardcoded `known_ports` list, custom-timer allowlist, and outbound
+  threshold of 25 all moved from the script to `/var/lib/box-audit/`.
+  Each gets a small built-in fallback when the file is missing (with a
+  one-time stderr note pointing at `--init`). The NucBox-specific ports
+  are gone from the script — no longer bleed into other boxes via
+  yesterday's README example.
+- `box-audit --init` snapshots the live box into the three config files.
+  Idempotent.
 - `box-audit --accept-port N` appends a port to `ports-allowlist.txt`.
 - `box-audit --accept-timer NAME` appends a timer to
   `timers-baseline.txt`. Accepts both `name` and `name.timer`.
 - `box-audit --outbound-threshold N` writes the threshold integer.
-- `install.sh` seeds the three config files on FRESH install only (an
-  upgrade leaves user-edited allowlists alone).
-- `skills/box-audit/references/cli.md` — full CLI reference, with the
-  manage flags table.
-- Skill `§ 5. CLI summary` — quick table pointing at `references/cli.md`.
+- `install.sh` seeds the three config files on FRESH install only.
+- `skills/box-audit/references/cli.md` — full CLI reference.
+- Skill `§ 5. CLI summary` — quick table.
+- **Delta mode** (PR 3). Each `--json` run writes today's snapshot to
+  `/var/log/box-audit/history/YYYY-MM-DD.json`. The next day's run
+  reads yesterday's snapshot and fires delta findings
+  (`OUTBOUND-DELTA`, `SUID-DELTA`, `SECURITY-DELTA`) when today's
+  count exceeds 2× AND is ≥5 absolute above yesterday. Day 1 (no
+  prior snapshot) is silent; absolute-threshold findings still fire.
+- **`box-audit --tail [N]`** (default 7). Read-only summary of the
+  last N daily snapshots — `date status findings_count` per file.
+  Doesn't touch state.
+- **`box-audit --diff [N]`** (default 1). Read-only diff: shows the
+  findings added today that weren't in the snapshot N days ago
+  (and vice versa). Useful for "what changed since Tuesday?"
+- **Stable `check_id` field** in JSON output. Previously the JSON `id`
+  field was a heuristic word-trigram derived from the message text,
+  so any reword silently renamed the id. Now each finding maps to a
+  stable string (`security.outbound_remote_count`,
+  `updates.security_pending`, `integrity.change`, etc.). Downstream
+  tooling can branch on this without parsing free text. The heuristic
+  id is gone — the table replaces it.
 
 ### Changed
 
-- Arg validation in manage flags runs BEFORE the root check, so a non-root
-  user invoking `--accept-port foo` sees "invalid integer" instead of
-  "needs root." Permission gate is no longer a syntax gate.
+- Arg validation in manage flags runs BEFORE the root check, so a
+  non-root user invoking `--accept-port foo` sees "invalid integer"
+  instead of "needs root." Permission gate is no longer a syntax gate.
+- The script's JSON output structure carries the same fields as before;
+  the `id` values changed (now stable strings vs. heuristic word-
+  trigrams) but consumers reading human `message` or `severity` are
+  unaffected.
 
 ## [0.4.0] - 2026-09-15
 
