@@ -74,9 +74,17 @@ INTEGRITY_TARGETS=(
 #            piping into a webhook / Slack / Discord / Pushover / etc. so the
 #            downstream tool can format the message itself.
 # --help   : show usage and exit 0.
-# --version: print the script version and exit 0. install.sh stamps this in
-#            from the repo's VERSION file at install time.
-BOX_AUDIT_VERSION="0.4.0"
+# --version: print the script version and exit 0. install.sh copies the
+#            repo's VERSION file to /usr/local/share/box-audit/version at
+#            install time; reading it from there keeps VERSION the single
+#            source of truth — the script carries no copy that can drift.
+#            "unknown" is the fallback for a checkout that never went
+#            through install.sh.
+BOX_AUDIT_VERSION="unknown"
+if [[ -r /usr/local/share/box-audit/version ]]; then
+    _BA_VERSION="$(</usr/local/share/box-audit/version)"
+    BOX_AUDIT_VERSION="${_BA_VERSION//[$'\r\n ']/}"
+fi
 OUTPUT_MODE="text"   # "text" (default) or "json"
 
 while [[ $# -gt 0 ]]; do
@@ -254,7 +262,7 @@ report_resources() {
     df_output=$(df -h / --output=source,size,used,avail,pcent -x tmpfs -x devtmpfs -x squashfs 2>/dev/null | tail -1)
     swap_pct=$(free | awk '/Swap:/ {if($2>0) printf "%.0f", $3/$2*100; else print "0"}')
     swap_pct=${swap_pct:-0}
-    load=$(cat /proc/loadavg | awk '{print $1}')
+    load=$(awk '{print $1}' /proc/loadavg)
 
     [[ $disk_pct -gt $DISK_THRESHOLD ]] && out="$out\n⚠️ DISK: ${df_output} (${disk_pct}% used)"
     [[ $swap_pct -gt $SWAP_THRESHOLD ]] && out="$out\n⚠️ SWAP: ${swap_pct}% used"
