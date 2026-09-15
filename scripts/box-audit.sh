@@ -168,17 +168,27 @@ EOF
         # them, falling back to small built-in defaults when the file is missing
         # (fresh install before --init ran; or just-installed agent-path clone).
         # Each first-miss per run prints a one-time stderr note telling the user
-        # how to populate them.
+        # how to populate them. The gate is a sentinel file (see
+        # note_default_used) because all helpers are called via $(...)
+        # command substitution — an in-process variable would be lost when
+        # the subshell exits.
         CONFIG_DIR="/var/lib/box-audit"
         PORTS_FILE="$CONFIG_DIR/ports-allowlist.txt"
         TIMERS_FILE="$CONFIG_DIR/timers-baseline.txt"
         OUTBOUND_FILE="$CONFIG_DIR/outbound-threshold.conf"
         CRON_D_ALLOWLIST_FILE="$CONFIG_DIR/cron-d-allowlist.txt"
         SUID_THRESHOLD_FILE="$CONFIG_DIR/suid-threshold.conf"
-        CONFIG_NOTICE_PRINTED=0
         note_default_used() {
-            [[ $CONFIG_NOTICE_PRINTED -eq 0 ]] || return 0
-            CONFIG_NOTICE_PRINTED=1
+            # Gate via a sentinel file rather than an in-process variable.
+            # The five helpers are all called via $(...) command substitution,
+            # which runs in a subshell — any variable set inside is discarded
+            # when the subshell exits, so an in-process gate like
+            # CONFIG_NOTICE_PRINTED resets between calls. The sentinel survives
+            # across runs and across subshells; --init clears it so a fresh
+            # learn-box pass starts clean.
+            local _sentinel="/var/lib/box-audit/.defaults-notice-printed"
+            [[ -f "$_sentinel" ]] && return 0
+            : > "$_sentinel"
             echo "box-audit: no /var/lib/box-audit config, using built-in defaults — run 'sudo box-audit --init' to learn your box" >&2
         }
         get_ports_allowlist() {
@@ -285,6 +295,11 @@ EOF
                     } | /usr/bin/sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
                         | /usr/bin/awk 'NF && !seen[$0]++' > "$CRON_D_ALLOWLIST_FILE"
                     /usr/bin/printf '30\n' > "$SUID_THRESHOLD_FILE"
+                    # --init has now produced a fresh, accurate config — clear
+                    # the defaults-notice sentinel so the next run starts with
+                    # a clean slate (no notice unless something is missing
+                    # again).
+                    /usr/bin/rm -f /var/lib/box-audit/.defaults-notice-printed
                     echo "box-audit: seeded $PORTS_FILE, $TIMERS_FILE, $OUTBOUND_FILE, $CRON_D_ALLOWLIST_FILE, $SUID_THRESHOLD_FILE"
                     ;;
                 accept-port)
