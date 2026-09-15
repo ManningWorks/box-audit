@@ -48,12 +48,16 @@ sudo systemctl edit box-audit.service
 
 ```ini
 [Service]
-ExecStart=
-ExecStart=/bin/sh -c '/usr/local/bin/box-audit --json | /usr/local/bin/notify-webhook.sh'
+ExecStartPost=/usr/local/bin/notify-webhook.sh
 ```
 
-Then `sudo systemctl daemon-reload`. The verify gate still applies — it
-just checks the webhook received the payload instead of the file.
+Then `sudo systemctl daemon-reload`. `ExecStartPost` runs after the main
+process exits, so the POST carries this run's fresh snapshot and
+`latest.json` stays intact for pull readers. Don't replace `ExecStart`
+with a pipe into the notifier: the pipe eats the run's output, the
+notifier doesn't read stdin, and the unit's `truncate:` capture would
+then overwrite `latest.json` with nothing. The verify gate still applies
+to the file; the webhook POST now also counts toward unit success.
 
 The delivery philosophy behind this (pull by default, push opt-in) is in
 the README's "Getting the report off the box" section.

@@ -18,11 +18,13 @@
 # and add:
 #
 #   [Service]
-#   ExecStart=
-#   ExecStart=/bin/sh -c '/usr/local/bin/box-audit --json | /usr/local/bin/notify-webhook.sh'
+#   ExecStartPost=/usr/local/bin/notify-webhook.sh
 #
-# (The empty ExecStart= clears the default before the replacement — systemd
-# requires both lines.) Then: sudo systemctl daemon-reload.
+# ExecStartPost runs after the main process exits, so the snapshot it reads
+# is the fresh one from this run. Do NOT pipe box-audit into this script in
+# a replaced ExecStart: the pipe consumes the run's output, this script
+# doesn't read stdin, and the unit's StandardOutput=truncate: capture would
+# then clobber latest.json with this script's (empty) stdout.
 
 set -euo pipefail
 

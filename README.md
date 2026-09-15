@@ -186,14 +186,18 @@ sudo systemctl edit box-audit.service
 
 ```ini
 [Service]
-ExecStart=
-ExecStart=/bin/sh -c '/usr/local/bin/box-audit --json | /usr/local/bin/notify-webhook.sh'
+ExecStartPost=/usr/local/bin/notify-webhook.sh
 ```
 
-Then `sudo systemctl daemon-reload`. (The empty `ExecStart=` clears the
-default before the replacement — systemd requires both lines.) The
-install skill's `references/install.md` describes the same wiring with
-the verify-gate caveat.
+Then `sudo systemctl daemon-reload`. `install.sh` puts the notifier at
+`/usr/local/bin/notify-webhook.sh` alongside the main script.
+`ExecStartPost` runs after the main process exits, so it pushes this
+run's fresh snapshot and `latest.json` stays intact for pull readers.
+Don't replace `ExecStart` with a pipe into the notifier — the pipe eats
+the run's output, the notifier doesn't read stdin, and the unit's
+`truncate:` capture would then overwrite `latest.json` with nothing.
+When the notifier is wired in, the verify gate still checks the file,
+plus the webhook POST now participates in the unit's success/failure.
 
 ### Hermes recipe
 

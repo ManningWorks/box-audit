@@ -119,6 +119,17 @@ if install_file "$SERVICE_UNIT" 0644 "$SERVICE_UNIT_CONTENT"; then
     TIMER_CHANGED=1
 fi
 
+# 3b. Optional push notifier, shipped but not wired in: the default is
+#     pull (see README "Getting the report off the box"). Users opt in
+#     with a systemd drop-in pointing ExecStartPost at it.
+NOTIFY_SRC="$REPO_ROOT/scripts/notify-webhook.sh"
+NOTIFY_DST="/usr/local/bin/notify-webhook.sh"
+if [[ -f "$NOTIFY_SRC" ]]; then
+    if install_file "$NOTIFY_DST" 0755 "$(cat "$NOTIFY_SRC")"; then
+        TIMER_CHANGED=1   # any change to installed files warrants a reload
+    fi
+fi
+
 if [[ -f "$TIMER_UNIT" ]] && ! grep -q '^OnCalendar=daily' "$TIMER_UNIT"; then
     say "  NOTE: existing $TIMER_UNIT has a customized OnCalendar — left untouched."
     grep '^OnCalendar=' "$TIMER_UNIT" | sed 's/^/    /'
