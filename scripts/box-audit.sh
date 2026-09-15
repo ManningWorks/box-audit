@@ -69,11 +69,14 @@ INTEGRITY_TARGETS=(
 )
 
 # --- CLI flags -----------------------------------------------------------
-# --json : emit machine-readable JSON to stdout (one object with findings[])
-#          instead of the human-readable Telegram-formatted text. Use when
-#          piping into a webhook / Slack / Discord / Pushover / etc. so the
-#          downstream tool can format the message itself.
-# --help : show usage and exit 0.
+# --json   : emit machine-readable JSON to stdout (one object with findings[])
+#            instead of the human-readable Telegram-formatted text. Use when
+#            piping into a webhook / Slack / Discord / Pushover / etc. so the
+#            downstream tool can format the message itself.
+# --help   : show usage and exit 0.
+# --version: print the script version and exit 0. install.sh stamps this in
+#            from the repo's VERSION file at install time.
+BOX_AUDIT_VERSION="0.4.0"
 OUTPUT_MODE="text"   # "text" (default) or "json"
 
 while [[ $# -gt 0 ]]; do
@@ -82,14 +85,19 @@ while [[ $# -gt 0 ]]; do
         --text) OUTPUT_MODE="text"; shift ;;
         -h|--help)
             /usr/bin/cat <<EOF
-Usage: $(/usr/bin/basename "$0") [--json|--text]
+Usage: $(/usr/bin/basename "$0") [--json|--text|--version]
 
-  (default)  Human-readable report suitable for Telegram / Discord.
-  --json     Machine-readable JSON to stdout, e.g. for webhook delivery.
+  (default)   Human-readable report suitable for Telegram / Discord.
+  --json      Machine-readable JSON to stdout, e.g. for webhook delivery.
+  --version   Print version ($BOX_AUDIT_VERSION) and exit.
 
 Exit codes: 0 = all clear, 1 = findings present, 2 = bad CLI flag.
              (--json mode always exits 0; see the status field.)
 EOF
+            exit 0
+            ;;
+        --version)
+            /usr/bin/echo "box-audit $BOX_AUDIT_VERSION"
             exit 0
             ;;
         *) /usr/bin/echo "Unknown arg: $1 (try --help)" >&2; exit 2 ;;

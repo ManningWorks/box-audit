@@ -1,7 +1,7 @@
 ---
 name: box-audit
-version: 0.3.0
-description: Run and interpret box-audit, a daily security + health audit for Linux boxes. Use when asked to check box health/security, run or schedule box-audit, read its latest.json report, triage its findings, or repair its timer/baseline. Installs nothing by default; the one-time install procedure lives in references/install.md.
+version: 0.4.0
+description: Run and interpret box-audit, a daily security + health audit for Linux boxes. Use when asked to check box health/security, run or schedule box-audit, install or upgrade it, read its latest.json report, triage its findings, or repair its timer/baseline. Installation is one command (install.sh), covered in references/install.md.
 ---
 
 # box-audit operator
@@ -16,7 +16,8 @@ The script lives at `/usr/local/bin/box-audit`. Output: text report
 2 = bad flag. `--json` always exits 0; branch on the `status` field
 instead (`ok` vs `findings`).
 
-Not installed yet, or the timer is missing? The one-time procedure is in
+Not installed yet, or upgrading? That's one command — `sudo ./install.sh`
+from a repo checkout. Prerequisites, the verify gate, and pitfalls are in
 `references/install.md`. Everything below assumes the daily timer exists.
 
 ## 1. Run or read
@@ -127,3 +128,12 @@ partial hashes — the script guards against this, so treat it as
 last-resort), `sudo rm /var/lib/box-audit/integrity-baseline.json` and the
 next run silently rebuilds it. That erases all remembered history: after
 this, drift from before the reset is invisible. Say so when doing it.
+
+## Delivery
+
+Default is pull: findings land in `/var/log/box-audit/latest.json` and the
+user (or you) reads them when asked — a daily audit that pings "all
+clear!" trains the user to ignore it; silence means nothing changed.
+Optional push (webhook) and a Hermes cron recipe are in the README's
+"Getting the report off the box" section; format pushed messages using the
+severity table in section 2.
