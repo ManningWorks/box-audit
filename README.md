@@ -80,10 +80,10 @@ Non-root runs skip the integrity check rather than poison the baseline.
 ### Via an AI agent (recommended)
 
 If you use an AI agent that supports the [Skills](https://agentskills.io) format
-(Hermes, opencode, Claude Code, etc.), point it at the `skill/SKILL.md` file:
+(Hermes, opencode, Claude Code, etc.), point it at the `skills/box-audit/SKILL.md` file:
 
 > "Install the box-audit skill from
-> https://github.com/ManningWorks/box-audit/tree/master/skill"
+> https://github.com/ManningWorks/box-audit/tree/master/skills/box-audit"
 
 The agent will walk through: copy the script, set up a daily systemd timer,
 verify with a dry-run, and report back.
