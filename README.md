@@ -201,20 +201,23 @@ plus the webhook POST now participates in the unit's success/failure.
 
 ### Hermes recipe
 
-What the author actually runs: a Hermes cron job once a day that reads
-`latest.json` and formats the findings into a Telegram message —
-roughly:
+What the author actually runs: a Hermes cron job once a day whose entire
+configuration is this prompt — the agent does the reading and the
+sending, the box-audit timer does the auditing:
 
-```bash
-# in the cron job's script:
-python3 -c "import json; d=json.load(open('/var/log/box-audit/latest.json')); \
-  print(d['status'], len(d['findings']), 'findings')"
-# then format each finding (severity → emoji → message) per the
-# severity table in skills/box-audit/SKILL.md
-```
+> Read `/var/log/box-audit/latest.json`. If the file is missing, empty,
+> or unparseable, send a single Telegram message: '❌ box-audit:
+> latest.json missing or unreadable — check the systemd timer'.
+> Otherwise, parse the JSON. If `status == 'ok'`, send '✅ Box audit
+> clean (timestamp <ts>)'. If `status == 'findings'`, send each entry
+> from `findings[]` as one Telegram line using `hermes-telegram-send`.
+> Group findings with the same severity together. Include the timestamp
+> from the JSON. Do NOT run the script yourself — only read the JSON
+> file written by the box-audit systemd timer.
 
-Five lines and the severity table; no separate delivery daemon to keep
-alive. The severity table doubles as the message-formatting contract.
+No separate delivery daemon to keep alive. Severity → Telegram format:
+see the severity table in `skills/box-audit/SKILL.md` § 2, which is
+also the contract the cron should follow.
 
 ## Compatibility
 
