@@ -105,7 +105,8 @@ Usage: $(/usr/bin/basename "$0") [OPTIONS]
   Manage per-box config under /var/lib/box-audit/ (run as root):
   --init                       Snapshot the current box into the config files
                                (ports listening now, timers active now,
-                               outbound threshold = 25).
+                               cron.d allowlist, outbound threshold = 25,
+                               SUID threshold = 30).
   --accept-port N              Append port N to ports-allowlist.txt.
   --accept-timer NAME          Append timer NAME to timers-baseline.txt.
   --outbound-threshold N       Write outbound-threshold.conf (single integer).
@@ -136,11 +137,25 @@ EOF
                             [[ $# -ge 2 ]] || { echo "box-audit: --outbound-threshold requires an integer" >&2; exit 2; }
                             MANAGE_MODE="outbound-threshold"; MANAGE_ARG="$2"; shift 2 ;;
                         --tail)
-                            [[ $# -ge 2 ]] || TAIL_MODE="7"
-                            TAIL_MODE="$2"; shift 2 ;;
-                        --diff)
-                                    [[ $# -ge 2 ]] || { echo "box-audit: --diff requires N (days back, default 1)" >&2; exit 2; }
-                                    DIFF_MODE="$2"; shift 2 ;;
+                    # Optional arg: consume $2 only when it exists AND is not
+                    # another flag. Bare `--tail` defaults to 7 (help text,
+                    # cli.md, and this parser must agree). The old form —
+                    # `[[ $# -ge 2 ]] || TAIL_MODE="7"; TAIL_MODE="$2"` — was
+                    # two statements, so bare `--tail` read unbound $2 and
+                    # died under `set -u`.
+                    if [[ $# -ge 2 && "$2" != -* ]]; then
+                        TAIL_MODE="$2"; shift 2
+                    else
+                        TAIL_MODE="7"; shift
+                    fi ;;
+                --diff)
+                    # Same optional-arg pattern; bare `--diff` defaults to 1
+                    # (docs said so; the parser used to demand an argument).
+                    if [[ $# -ge 2 && "$2" != -* ]]; then
+                        DIFF_MODE="$2"; shift 2
+                    else
+                        DIFF_MODE="1"; shift
+                    fi ;;
                                 --print-schema)
                                     PRINT_SCHEMA=1; shift ;;
                 *) /usr/bin/echo "Unknown arg: $1 (try --help)" >&2; exit 2 ;;
@@ -158,6 +173,8 @@ EOF
         PORTS_FILE="$CONFIG_DIR/ports-allowlist.txt"
         TIMERS_FILE="$CONFIG_DIR/timers-baseline.txt"
         OUTBOUND_FILE="$CONFIG_DIR/outbound-threshold.conf"
+        CRON_D_ALLOWLIST_FILE="$CONFIG_DIR/cron-d-allowlist.txt"
+        SUID_THRESHOLD_FILE="$CONFIG_DIR/suid-threshold.conf"
         CONFIG_NOTICE_PRINTED=0
         note_default_used() {
             [[ $CONFIG_NOTICE_PRINTED -eq 0 ]] || return 0
@@ -195,6 +212,29 @@ EOF
             fi
             note_default_used
             echo "25"
+        }
+        get_cron_d_allowlist() {
+            if [[ -r "$CRON_D_ALLOWLIST_FILE" ]]; then
+                # One name per non-comment, non-blank line. Trim whitespace.
+                /usr/bin/grep -vE '^[[:space:]]*(#|$)' "$CRON_D_ALLOWLIST_FILE" 2>/dev/null \
+                    | /usr/bin/sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+                    | /usr/bin/tr '\n' ' ' \
+                    | /usr/bin/sed -E 's/[[:space:]]+$//'
+            else
+                note_default_used
+                echo "anacron e2scrub_all sysstat 0hourly"
+            fi
+        }
+        get_suid_threshold() {
+            if [[ -r "$SUID_THRESHOLD_FILE" ]]; then
+                local v
+                v=$(/usr/bin/grep -vE '^[[:space:]]*(#|$)' "$SUID_THRESHOLD_FILE" 2>/dev/null | /usr/bin/head -1 | /usr/bin/tr -d ' \r\n')
+                if [[ "$v" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "$v"; return 0
+                fi
+            fi
+            note_default_used
+            echo "30"
         }
         main_manage() {
             # Validate the argument FIRST so a bad value is reported regardless of
@@ -236,7 +276,16 @@ EOF
             if u.endswith(".timer"):
                 print(u)' > "$TIMERS_FILE"
                     /usr/bin/printf '25\n' > "$OUTBOUND_FILE"
-                    echo "box-audit: seeded $PORTS_FILE, $TIMERS_FILE, $OUTBOUND_FILE"
+                    # cron.d allowlist: learn the box's actual current
+                    # /etc/cron.d/ contents, but make sure the four standard
+                    # names are present too.
+                    {
+                        /usr/bin/ls /etc/cron.d/ 2>/dev/null | /usr/bin/sort -u
+                        /usr/bin/printf 'anacron\ne2scrub_all\nsysstat\n0hourly\n'
+                    } | /usr/bin/sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+                        | /usr/bin/awk 'NF && !seen[$0]++' > "$CRON_D_ALLOWLIST_FILE"
+                    /usr/bin/printf '30\n' > "$SUID_THRESHOLD_FILE"
+                    echo "box-audit: seeded $PORTS_FILE, $TIMERS_FILE, $OUTBOUND_FILE, $CRON_D_ALLOWLIST_FILE, $SUID_THRESHOLD_FILE"
                     ;;
                 accept-port)
                     [[ -f "$PORTS_FILE" ]] || /usr/bin/install -D -m 0644 /dev/null "$PORTS_FILE"
@@ -265,6 +314,78 @@ EOF
         if [[ -n "${MANAGE_MODE:-}" ]]; then
             main_manage
         fi
+        # --- History query functions ------------------------------------------
+        # These MUST be defined before the dispatch block below: bash reads
+        # top-to-bottom, and the dispatch calls history_tail/history_diff
+        # directly when the matching flag was parsed. (Before v0.5.0 these
+        # lived below, so `--tail` printed "command not found" and exited 0.)
+        # Read-only; /var/log/box-audit/history is optional state.
+        # --tail [N] (default 7) / --diff [N] (default 1); the parser in the
+        # CLI block above applies those defaults, matching the help text.
+        HISTORY_DIR="/var/log/box-audit/history"
+
+        # Tail mode: read-only summary of the last N daily snapshots. Sorted
+        # most-recent-first.
+        history_tail() {
+            local n="${1:-7}"
+            # 2>/dev/null: history is best-effort. When /var/log/box-audit
+            # exists but history/ doesn't (fresh install pre-first-JSON-run),
+            # mkdir can't create it as non-root — that's not an error worth
+            # noise; the "history is empty" message below is the signal.
+            /usr/bin/mkdir -p "$HISTORY_DIR" 2>/dev/null
+            # Missing history is a successful empty answer for a read-only
+            # query (stdout, exit 0) — same as the empty-dir case below. On
+            # CI / fresh boxes /var/log/box-audit can't even be created by a
+            # non-root user; that must not look like a failure.
+            if [[ ! -d "$HISTORY_DIR" ]]; then
+                echo "box-audit: no history directory at $HISTORY_DIR (run --json once to seed)"
+                return 0
+            fi
+            local files
+            files=$(find "$HISTORY_DIR" -maxdepth 1 -type f -name '*.json' ! -name '.*' -printf '%T@ %f\n' \
+                | sort -rn | head -n "$n" | awk '{print $2}')
+            [[ -z "$files" ]] && { echo "box-audit: history is empty (run --json once to seed)"; return; }
+            local fname fdate
+            while IFS= read -r fname; do
+                [[ -z "$fname" ]] && continue
+                fdate="${fname%.json}"
+                /usr/bin/python3 -c "
+import json
+try:
+    d = json.load(open('$HISTORY_DIR/$fname'))
+    status = d.get('status', '?')
+    n = len(d.get('findings', []))
+    print(f'$fdate  {status:8}  {n} finding(s)')
+except Exception:
+    print(f'$fdate  (corrupt or unreadable)')
+"
+            done <<< "$files"
+        }
+
+        # Diff mode: what changed between today and N days ago. Read-only.
+        history_diff() {
+            local n="${1:-1}"
+            local diff_file1 diff_file2
+            diff_file1="$HISTORY_DIR/$(date -u +%Y-%m-%d).json"
+            diff_file2="$HISTORY_DIR/$(date -u -d "$n days ago" +%Y-%m-%d).json"
+            [[ -r "$diff_file2" ]] || { echo "box-audit: --diff cannot find $diff_file2 — need at least one prior snapshot" >&2; exit 1; }
+            /usr/bin/python3 -c "
+import json
+def load(p):
+    try: return {f.get('check_id'): f for f in json.load(open(p)).get('findings', [])}
+    except Exception: return {}
+base = load('$diff_file2')
+today = load('$diff_file1')
+added = today.keys() - base.keys()
+removed = base.keys() - today.keys()
+for k in sorted(added):
+    print(f'+ ADDED  [{today[k].get(chr(34)+\"severity\"+chr(34),\"?\")[:4]:<4}] {today[k].get(\"message\",\"\")}')
+for k in sorted(removed):
+    print(f'- GONE   [{base[k].get(chr(34)+\"severity\"+chr(34),\"?\")[:4]:<4}] {base[k].get(\"message\",\"\")}')
+print(f'  baseline=$(date -u -d "$n days ago" +%Y-%m-%d).json today=$(date -u +%Y-%m-%d).json  (+{len(added)} -{len(removed)})')
+"
+        }
+
         # --tail / --diff are read-only history queries; same dispatch path.
         if [[ -n "${TAIL_MODE:-}" ]]; then
             history_tail "$TAIL_MODE"
@@ -323,30 +444,41 @@ print(json.dumps(out, indent=2, sort_keys=True))
             exit 0
         fi
 
-        # --- JSON collector -------------------------------------------------------
-# Each report_*() function can push findings via json_push <severity> <id> <message>
-# In text mode this is a no-op; in json mode it's collected and emitted as
-# a single {"findings":[...]} object.
-JSON_FINDINGS=""
-JSON_COUNT=0
+        # --- Findings collector ----------------------------------------------------
+# Checks push structured findings via json_push <severity> <check_id> <section>
+# <message> [count]. Each call appends ONE json.dumps'd line to $FINDINGS_FILE
+# (a mktemp file main() creates before any check runs — same lifetime pattern
+# the old $DEGRADED_FILE had). File-backed on purpose: report_* functions run
+# inside command substitutions, and an in-memory accumulator mutates a
+# subshell-local copy that is thrown away when the substitution returns.
+# BOTH the text report and the --json document are renderings of this one
+# findings list; adding a check means one json_push call, nothing else.
+FINDINGS_FILE=""
 
 json_push() {
-    # $1=severity (info|warn|error|degraded), $2=id (e.g. "disk.high"), $3=message
-    local severity="$1" id="$2" msg="$3"
-    JSON_COUNT=$((JSON_COUNT + 1))
-    # Build the entry by hand to avoid a hard jq/python3 dependency.
-    # Strings are escaped for JSON (backslash + double-quote only — the only
-    # characters our findings actually contain).
-    local safe_msg="${msg//\\/\\\\}"
-    safe_msg="${safe_msg//\"/\\\"}"
-    local safe_id="${id//\\/\\\\}"
-    safe_id="${safe_id//\"/\\\"}"
-    local entry="{\"severity\":\"${severity}\",\"id\":\"${safe_id}\",\"message\":\"${safe_msg}\"}"
-    if [[ -z "$JSON_FINDINGS" ]]; then
-        JSON_FINDINGS="$entry"
-    else
-        JSON_FINDINGS="${JSON_FINDINGS},${entry}"
-    fi
+    # $1=severity (info|warn|alert|degraded), $2=check_id (e.g. "security.ssh_fails"),
+    # $3=section (resources|security|system|updates|maintenance|integrity),
+    # $4=message, optional $5=integer count (persisted for next-day delta mode).
+    # Fields reach python via the environment so no shell->code quoting layer
+    # can mangle message content; json.dumps does the escaping, so messages
+    # containing quotes/backslashes are correct, not "usually correct".
+    local severity="$1" check_id="$2" section="$3" msg="$4" count="${5:-}"
+    [[ -n "$FINDINGS_FILE" ]] || return 0
+    BA_SEV="$severity" BA_CID="$check_id" BA_SEC="$section" BA_MSG="$msg" BA_COUNT="$count" \
+        FINDINGS_FILE="$FINDINGS_FILE" /usr/bin/python3 -c '
+import json, os
+finding = {
+    "severity": os.environ["BA_SEV"],
+    "check_id": os.environ["BA_CID"],
+    "section": os.environ["BA_SEC"],
+    "message": os.environ["BA_MSG"],
+}
+c = os.environ.get("BA_COUNT", "")
+if c:
+    finding["count"] = int(c)
+with open(os.environ["FINDINGS_FILE"], "a") as fh:
+    fh.write(json.dumps(finding) + "\n")
+' 2>/dev/null
 }
 
 # Bind the lock to the script name (stable across bash -c invocations
@@ -363,17 +495,12 @@ LOCK_DIR="/tmp"
 LOCK_FILE="$LOCK_DIR/sysadmin-healthcheck-box-audit.lock"
 LOCK_ENABLED="yes"
 # Track anything that couldn't run properly, so a silent/missing result
-# doesn't get reported as "all clear".
-#
-# Degraded findings are collected in a temp FILE, not a shell variable:
-# every report_* function runs inside a command substitution, which is a
-# subshell — appending to a global there mutates a copy that's thrown
-# away when the substitution returns. A file survives subshell boundaries
-# and main() reads it once at assembly time.
-DEGRADED_FILE=""
-DEGRADED=""
+# doesn't get reported as "all clear". Degraded findings ride the same
+# file-backed json_push collector as every other finding — they are raised
+# from inside command-substitution subshells, which would discard a plain
+# variable accumulator when the substitution returns.
 flag_degraded() {
-    /usr/bin/printf '%s\n' "$1" >> "$DEGRADED_FILE" 2>/dev/null
+    json_push degraded degraded.check system "$1"
 }
 
 # --- Single-instance guard -------------------------------------------------
@@ -467,7 +594,7 @@ gc() {
 }
 
 report_resources() {
-    local disk_pct df_output swap_pct load out=""
+    local disk_pct df_output swap_pct load
     disk_pct=$(df / --output=pcent -x tmpfs -x devtmpfs -x squashfs 2>/dev/null | tail -1 | tr -d ' %')
     disk_pct=${disk_pct:-0}
     df_output=$(df -h / --output=source,size,used,avail,pcent -x tmpfs -x devtmpfs -x squashfs 2>/dev/null | tail -1)
@@ -475,19 +602,12 @@ report_resources() {
     swap_pct=${swap_pct:-0}
     load=$(awk '{print $1}' /proc/loadavg)
 
-    [[ $disk_pct -gt $DISK_THRESHOLD ]] && out="$out\n⚠️ DISK: ${df_output} (${disk_pct}% used)"
-    [[ $swap_pct -gt $SWAP_THRESHOLD ]] && out="$out\n⚠️ SWAP: ${swap_pct}% used"
-    awk -v l="$load" -v thresh="$LOAD_THRESHOLD" 'BEGIN{exit !(l>thresh)}' && out="$out\n⚠️ LOAD: $load (high)"
-
-    [[ $disk_pct -gt $DISK_THRESHOLD ]] && json_push warn disk.high "${df_output} (${disk_pct}% used)"
-    [[ $swap_pct -gt $SWAP_THRESHOLD ]] && json_push warn swap.high "${swap_pct}% used"
-    awk -v l="$load" -v thresh="$LOAD_THRESHOLD" 'BEGIN{exit !(l>thresh)}' && json_push warn load.high "load ${load} (threshold ${LOAD_THRESHOLD})"
-
-    echo "$out"
+    [[ $disk_pct -gt $DISK_THRESHOLD ]] && json_push warn resources.disk_high resources "${df_output} (${disk_pct}% used)"
+    [[ $swap_pct -gt $SWAP_THRESHOLD ]] && json_push warn resources.swap_high resources "${swap_pct}% used"
+    awk -v l="$load" -v thresh="$LOAD_THRESHOLD" 'BEGIN{exit !(l>thresh)}' && json_push warn resources.load_high resources "load ${load} (threshold ${LOAD_THRESHOLD})"
 }
 
 report_security() {
-    local out=""
 
     # fail2ban banned IPs
     if /usr/bin/sudo -n /usr/bin/fail2ban-client status >/dev/null 2>&1; then
@@ -497,19 +617,19 @@ report_security() {
         if [[ $f2b_status -ne 0 ]]; then
             flag_degraded "fail2ban-client check failed or timed out (exit $f2b_status)"
         elif [[ -n "$currently_banned" ]] && [[ "$currently_banned" != "0" ]]; then
-            out="$out\n🚨 fail2ban: $currently_banned IP(s) banned on sshd"
+            json_push alert security.fail2ban_banned security "$currently_banned IP(s) banned on sshd"
         fi
     fi
 
     # SSH failures (last 24h)
     local ssh_fails
     ssh_fails=$($T /usr/bin/journalctl --since "24 hours ago" --facility=auth --no-pager 2>/dev/null | gc "Failed password|Invalid user")
-    [[ $ssh_fails -gt $SSH_FAIL_THRESHOLD ]] && out="$out\n⚠️ SSH: $ssh_fails failed auth attempts (24h)"
+    [[ $ssh_fails -gt $SSH_FAIL_THRESHOLD ]] && json_push warn security.ssh_fails security "$ssh_fails failed auth attempts (24h)"
 
     # sudo spam threshold (known gateway behavior, flag only if excessive)
     local sudo_fails
     sudo_fails=$($T /usr/bin/journalctl --since "24 hours ago" --facility=auth --priority=err --no-pager 2>/dev/null | gc "sudo.*true")
-    [[ $sudo_fails -gt $SUDO_FAIL_THRESHOLD ]] && out="$out\n⚠️ sudo: $sudo_fails auth failures (24h)"
+    [[ $sudo_fails -gt $SUDO_FAIL_THRESHOLD ]] && json_push warn security.sudo_fails security "$sudo_fails auth failures (24h)"
 
     # Open ports - flag unexpected ones, and who's listening on them
     # 22(SSH) 53(DNS) 631(IPP) 5006(Actual) 5173(Vite) 8384(Syncthing HTTP)
@@ -529,7 +649,7 @@ report_security() {
         if [[ $known -eq 0 ]]; then
             local proc
             proc=$(echo "$ss_output" | grep ":${port} " | grep -oP 'users:\(\("\K[^"]+' | head -1)
-            out="$out\n🆕 PORT: $port is open (not in baseline)${proc:+ [$proc]}"
+            json_push warn security.new_port security "$port is open (not in baseline)${proc:+ [$proc]}"
         fi
     done
 
@@ -595,14 +715,14 @@ report_security() {
         outbound_remote_count=${outbound_remote_count:-0}
         outbound_remote_sample=$(echo "$suspicious_ips" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -v '^$' | /usr/bin/head -5 | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')
     fi
-    [[ $outbound_remote_count -gt $(get_outbound_threshold) ]] && out="$out\n🌐 OUTBOUND: $outbound_remote_count non-LAN remote IP(s) connected: $outbound_remote_sample"
+    [[ $outbound_remote_count -gt $(get_outbound_threshold) ]] && json_push warn security.outbound_remote_count security "$outbound_remote_count non-LAN remote IP(s) connected: $outbound_remote_sample" "$outbound_remote_count"
     # Delta finding — only fires if today's count is 2x AND 5+ above yesterday.
     # When yesterday's snapshot is missing the delta is mute and the absolute
     # threshold above is the only signal (graceful degradation: ~day 1 of use).
     if [[ -n "${YESTERDAY_OUTBOUND_COUNT:-}" ]]; then
         local delta_thresh=$(( YESTERDAY_OUTBOUND_COUNT * 2 ))
         [[ $outbound_remote_count -gt 5 && $outbound_remote_count -gt $delta_thresh ]] \
-            && out="$out\n🌐 OUTBOUND-DELTA: $outbound_remote_count non-LAN remote IP(s), was $YESTERDAY_OUTBOUND_COUNT yesterday (>2x growth)"
+            && json_push warn security.outbound_delta security "$outbound_remote_count non-LAN remote IP(s), was $YESTERDAY_OUTBOUND_COUNT yesterday (>2x growth)" "$outbound_remote_count"
     fi
 
     # SUID binary count — catches a rootkit that dropped a SUID binary to
@@ -616,21 +736,19 @@ report_security() {
     local suid_count
     suid_count=$($T /usr/bin/find / -xdev -path '/var/lib/docker' -prune -o -perm -4000 -type f -print 2>/dev/null | /usr/bin/wc -l)
     suid_count=${suid_count:-0}
-    # Baseline 18 measured 2026-09-14 on this box; flag if > 30 (50%+ growth).
-    [[ $suid_count -gt 30 ]] && out="$out\n🔓 SUID: $suid_count SUID binaries on disk (baseline ~18-25) — review for unauthorised additions"
+    # Baseline 18 measured 2026-09-14 on this box; flag if above the
+    # per-box threshold (default 30, i.e. 50%+ growth).
+    [[ $suid_count -gt $(get_suid_threshold) ]] && json_push warn security.suid_count security "$suid_count SUID binaries on disk (baseline ~18-25) — review for unauthorised additions" "$suid_count"
     # Delta: new SUID binaries are a classic rootkit persistence move. On
     # day 1 (no yesterday snapshot) the absolute check above is the only
     # signal; thereafter a +2 jump is more meaningful than +5 of 18.
     if [[ -n "${YESTERDAY_SUID_COUNT:-}" ]]; then
         local suid_delta=$(( suid_count - YESTERDAY_SUID_COUNT ))
-        [[ $suid_delta -gt 2 ]] && out="$out\n🔓 SUID-DELTA: +${suid_delta} new SUID binaries vs yesterday (${YESTERDAY_SUID_COUNT} → ${suid_count})"
+        [[ $suid_delta -gt 2 ]] && json_push warn security.suid_delta security "+${suid_delta} new SUID binaries vs yesterday (${YESTERDAY_SUID_COUNT} → ${suid_count})" "$suid_count"
     fi
-
-    echo "$out"
 }
 
 report_system() {
-    local out=""
 
     # Failed systemd units
     local failed_list failed_units
@@ -640,7 +758,7 @@ report_system() {
     [[ $failed_units -gt 0 ]] && {
         local units
         units=$(echo "$failed_list" | awk '{print $1}' | head -5 | tr '\n' ' ')
-        out="$out\n🔴 SYSTEMD: $failed_units failed service(s): $units"
+        json_push warn system.failed_units system "$failed_units failed service(s): $units"
     }
 
     # Persistence check — non-standard systemd timers + user crontabs.
@@ -681,7 +799,7 @@ report_system() {
             [[ -z "$timer_name" ]] && continue
             # box-audit.timer (or any name the script is installed under) is
             # this very audit — flagging it would self-report on every run.
-            [[ "$timer_name" == *"box-audit"* || "$timer_name" == *"healthcheck"* ]] && continue
+            [[ "$timer_name" == "box-audit.timer" || "$timer_name" == "healthcheck.timer" ]] && continue
             if [[ -n "$timer_pat" ]]; then
                 # Extended regex alternation. get_timers_baseline returns
                 # names without the .timer suffix; systemd reports them
@@ -699,34 +817,42 @@ report_system() {
     custom_count=$(echo "$custom_timers" | /usr/bin/wc -w)
     custom_count=${custom_count:-0}
     [[ $custom_count -gt 0 ]] && {
-        out="$out\n⏰ CUSTOM-TIMERS: $custom_count non-standard timer(s): $(echo "$custom_timers" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -v '^$' | /usr/bin/head -3 | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')"
+        json_push warn system.custom_timers system "$custom_count non-standard timer(s): $(echo "$custom_timers" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -v '^$' | /usr/bin/head -3 | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')"
     }
 
     # User crontab — flag if a non-empty user crontab exists. (You schedule
     # via Hermes cron, not system cron, so anything here is suspicious.)
     # `crontab -l` with no crontab prints "no crontab for <user>" to stdout,
-    # which a naive grep counts as 1 line. Filter that out first.
+    # which a naive grep counts as 1 line. Filter that out first. $USER is
+    # empty under the root systemd unit, and `crontab -l` as root reads
+    # root's crontab anyway — so the display name is "root" when EUID is 0.
+    local cron_user="root"
+    [[ $EUID -ne 0 ]] && cron_user="${USER:-$(id -un)}"
     local user_cron_raw user_cron_entries
     user_cron_raw=$($T /usr/bin/crontab -l 2>/dev/null | /usr/bin/grep -vE '^no crontab for ')
     user_cron_entries=$(echo "$user_cron_raw" | /usr/bin/grep -cvE '^[[:space:]]*(#|$)')
     user_cron_entries=${user_cron_entries:-0}
-    [[ $user_cron_entries -gt 0 ]] && out="$out\n📅 USER-CRON: $user_cron_entries entry/entries in $USER's crontab (Hermes schedules via its own cron — investigate)"
+    [[ $user_cron_entries -gt 0 ]] && json_push warn system.user_cron system "$user_cron_entries entry/entries in $cron_user's crontab (unexpected user crontab — verify you created it)"
 
-    # /etc/cron.d/ — flag unknown drop-ins beyond the standard 3.
+    # /etc/cron.d/ — flag unknown drop-ins beyond the per-box allowlist
+    # (default: the standard Ubuntu entries).
     local cron_d_files
     cron_d_files=$($T /usr/bin/ls /etc/cron.d/ 2>/dev/null | /usr/bin/sort -u)
+    local cron_d_allowlist
+    cron_d_allowlist="$(get_cron_d_allowlist)"
     local unexpected_cron=""
     local f
     for f in $cron_d_files; do
-        case "$f" in
-            anacron|e2scrub_all|sysstat|0hourly) ;;  # standard
-            *) unexpected_cron="$unexpected_cron $f" ;;
-        esac
+        local known_cron=0
+        for cf in $cron_d_allowlist; do
+            [[ "$f" == "$cf" ]] && known_cron=1 && break
+        done
+        [[ $known_cron -eq 1 ]] || unexpected_cron="$unexpected_cron $f"
     done
     local ucron_count
     ucron_count=$(echo "$unexpected_cron" | /usr/bin/wc -w)
     ucron_count=${ucron_count:-0}
-    [[ $ucron_count -gt 0 ]] && out="$out\n📅 /etc/cron.d/: unexpected drop-in(s): $(echo "$unexpected_cron" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -v '^$' | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')"
+    [[ $ucron_count -gt 0 ]] && json_push warn system.cron_d_dropins system "unexpected drop-in(s): $(echo "$unexpected_cron" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -v '^$' | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')"
 
     # Docker containers - use Docker's own health filter (containers with no
     # HEALTHCHECK defined are correctly ignored, not false-flagged)
@@ -735,7 +861,7 @@ report_system() {
         unhealthy_names=$($T /usr/bin/sudo /usr/bin/docker ps --filter health=unhealthy --format '{{.Names}}' 2>/dev/null)
         unhealthy=$(echo "$unhealthy_names" | grep -c . | tr -d ' \n')
         unhealthy=${unhealthy:-0}
-        [[ $unhealthy -gt 0 ]] && out="$out\n🔴 DOCKER: $unhealthy unhealthy container(s): $(echo "$unhealthy_names" | tr '\n' ' ')"
+        [[ $unhealthy -gt 0 ]] && json_push warn system.docker_unhealthy system "$unhealthy unhealthy container(s): $(echo "$unhealthy_names" | tr '\n' ' ')"
     fi
 
     # Apport crashes
@@ -745,20 +871,17 @@ report_system() {
     [[ $crash_count -gt 0 ]] && {
         local crash_files
         crash_files=$(find /var/crash -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | head -3 | tr '\n' ' ')
-        out="$out\n💥 CORES: $crash_count crash dump(s): $crash_files"
+        json_push warn system.crash_dumps system "$crash_count crash dump(s): $crash_files"
     }
 
     # Kernel errors
     local kerr
     kerr=$($T /usr/bin/journalctl --since "24 hours ago" --priority=err --kernel --no-pager 2>/dev/null | grep -c "" | tr -d ' \n' || echo "0")
     kerr=${kerr:-0}
-    [[ $kerr -gt 0 ]] && out="$out\n🔴 KERNEL: $kerr error(s) in last 24h"
-
-    echo "$out"
+    [[ $kerr -gt 0 ]] && json_push warn system.kernel_errors system "$kerr error(s) in last 24h"
 }
 
 report_updates() {
-    local out=""
     local updatable security kernel_security distro third_party
 
     # Force a cache refresh before reading `apt list --upgradable`.
@@ -805,23 +928,19 @@ report_updates() {
     third_party=$(echo "$apt_output" | grep -ciE "/(unknown|docker|github|tailscale|brave|vscode|signal|element|spotify|slack) " | tr -d ' \n' || echo "0")
     third_party=${third_party:-0}
 
-    [[ $updatable -gt $UPDATE_THRESHOLD ]] && out="$out\n📦 UPDATES: $updatable packages upgradable (distro: $distro · 3rd-party: $third_party)"
-    [[ $security -gt 0 ]] && out="$out\n🔒 SECURITY: $security security update(s) pending"
+    [[ $updatable -gt $UPDATE_THRESHOLD ]] && json_push info updates.upgradable updates "$updatable packages upgradable (distro: $distro · 3rd-party: $third_party)"
+    [[ $security -gt 0 ]] && json_push warn updates.security_pending updates "$security security update(s) pending" "$security"
     # Delta: when yesterday's count is known, flag a security queue that
     # is GROWING — that's unattended-upgrades failing faster than it can
     # drain. The absolute check above is the signal for "any" pending.
     if [[ -n "${YESTERDAY_SECURITY_PEND:-}" ]]; then
         local sec_delta=$(( security - YESTERDAY_SECURITY_PEND ))
-        [[ $sec_delta -gt 1 ]] && out="$out\n🔒 SECURITY-DELTA: security queue grew by $sec_delta vs yesterday (${YESTERDAY_SECURITY_PEND} → $security)"
+        [[ $sec_delta -gt 1 ]] && json_push warn updates.security_delta updates "security queue grew by $sec_delta vs yesterday (${YESTERDAY_SECURITY_PEND} → $security)" "$security"
     fi
-    [[ $kernel_security -gt 0 ]] && out="$out\n🛡️ KERNEL-CVE: $kernel_security kernel security package(s) — reboot required to apply"
-
-    echo "$out"
+    [[ $kernel_security -gt 0 ]] && json_push warn updates.kernel_cve updates "$kernel_security kernel security package(s) — reboot required to apply"
 }
 
 report_maintenance() {
-    local out=""
-
     # Reboot required — surface the WHY by reading reboot-required.pkgs.
     # This file names the packages whose on-disk version requires a reboot
     # to be loaded by running processes (typically libc6, openssh, kernel).
@@ -832,7 +951,7 @@ report_maintenance() {
         if [[ -f /var/run/reboot-required.pkgs ]]; then
             reason=$(/usr/bin/tr '\n' ' ' < /var/run/reboot-required.pkgs | /usr/bin/sed 's/ $//')
         fi
-        out="$out\n🔁 REBOOT: required since ${since}${reason:+ ($reason)}"
+        json_push warn maintenance.reboot_required maintenance "required since ${since}${reason:+ ($reason)}"
     fi
 
     # apt cache freshness — /var/lib/apt/periodic/update-success-stamp is
@@ -842,10 +961,10 @@ report_maintenance() {
     if [[ -f /var/lib/apt/periodic/update-success-stamp ]]; then
         local age=$(( $(/usr/bin/date +%s) - $(/usr/bin/stat -c %Y /var/lib/apt/periodic/update-success-stamp) ))
         if [[ $age -gt $APT_CACHE_STALE_SECS ]]; then
-            out="$out\n⏳ APT-CACHE: stale (${age}s / $((APT_CACHE_STALE_SECS / 3600))h since last apt update)"
+            json_push warn maintenance.apt_cache_stale maintenance "stale (${age}s / $((APT_CACHE_STALE_SECS / 3600))h since last apt update)"
         fi
     else
-        out="$out\n⏳ APT-CACHE: no update-success-stamp found — apt update has never succeeded?"
+        json_push warn maintenance.apt_cache_stale maintenance "no update-success-stamp found — apt update has never succeeded?"
     fi
 
     # Timer health — apt-daily.timer and apt-daily-upgrade.timer should fire
@@ -854,7 +973,7 @@ report_maintenance() {
         local last_trigger
         last_trigger=$($T /usr/bin/systemctl show "$t" --property=LastTriggerUSec --value 2>/dev/null)
         if [[ "$last_trigger" == "n/a" ]] || [[ -z "$last_trigger" ]]; then
-            out="$out\n⏰ TIMER: $t has never fired"
+            json_push warn maintenance.timer_drift maintenance "$t has never fired"
         else
             # LastTriggerUSec is a human-readable timestamp in modern systemd.
             # Convert to epoch seconds and compare against now.
@@ -863,7 +982,7 @@ report_maintenance() {
             if [[ -n "$last_epoch" ]] && [[ "$last_epoch" =~ ^[0-9]+$ ]]; then
                 local drift=$(( $(/usr/bin/date +%s) - last_epoch ))
                 if [[ $drift -gt $TIMER_DRIFT_SECS ]]; then
-                    out="$out\n⏰ TIMER: $t hasn't fired in ${drift}s ($((drift / 3600))h)"
+                    json_push warn maintenance.timer_drift maintenance "$t hasn't fired in ${drift}s ($((drift / 3600))h)"
                 fi
             fi
         fi
@@ -882,9 +1001,9 @@ report_maintenance() {
         uu_last=$($T /usr/bin/grep -E "^20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2},[0-9]{3} INFO " "$uu_log" 2>/dev/null | /usr/bin/tail -n 1)
         uu_age=$(( $(/usr/bin/date +%s) - $(/usr/bin/stat -c %Y "$uu_log") ))
         if [[ -z "$uu_last" ]]; then
-            out="$out\n⏰ UNATTENDED-UPGRADES: no INFO line found in log"
+            json_push warn maintenance.unattended_upgrades maintenance "no INFO line found in log"
         elif [[ $uu_age -gt $TIMER_DRIFT_SECS ]]; then
-            out="$out\n⏰ UNATTENDED-UPGRADES: log not updated in ${uu_age}s — service may be broken"
+            json_push warn maintenance.unattended_upgrades maintenance "log not updated in ${uu_age}s — service may be broken"
         # NOTE: do NOT use 'echo "$uu_last" | grep -qE ...' here — the echo's
         # stdout leaks into the function's stdout, polluting the captured
         # report with the raw log line. Use a here-string so $uu_last goes
@@ -892,7 +1011,7 @@ report_maintenance() {
         elif ! grep -qE "All upgrades installed|No packages found that can be upgraded unattended|kept packages can't be calculated in dry-run mode|Initial whitelist \(not strict\)" <<<"$uu_last"; then
             # Strip the timestamp prefix so the snippet fits Telegram's char
             # budget and answers "old artifact?" vs "current anomaly" at a glance.
-            out="$out\n⏰ UNATTENDED-UPGRADES: last INFO line unexpected — $(echo "$uu_last" | /usr/bin/sed -E 's/^[^ ]+ +[0-9:,-]+ INFO //' | /usr/bin/cut -c1-100)"
+            json_push warn maintenance.unattended_upgrades maintenance "last INFO line unexpected — $(echo "$uu_last" | /usr/bin/sed -E 's/^[^ ]+ +[0-9:,-]+ INFO //' | /usr/bin/cut -c1-100)"
         elif [[ $uu_age -gt $APT_CACHE_STALE_SECS ]] && grep -qE "Starting unattended upgrades script|Initial whitelist" <<<"$uu_last"; then
             # Log is fresh and the last line is a mid-run marker: a run is
             # in progress (or the last one died mid-flight). Freshness
@@ -900,7 +1019,7 @@ report_maintenance() {
             :  # no finding — a run in progress is normal at audit time
         fi
     else
-        out="$out\n⏰ UNATTENDED-UPGRADES: log file missing"
+        json_push warn maintenance.unattended_upgrades maintenance "log file missing"
     fi
 
     # needrestart — find daemons linked against an older libc / running an old
@@ -923,22 +1042,20 @@ report_maintenance() {
             # Kernel mismatch means a newer kernel is installed but we're
             # still booting the old one — real reboot-required state.
             if [[ -n "$kernel_line" ]]; then
-                out="$out\n🛡️ KERNEL-RESTART: $kernel_line (newer kernel on disk, current kernel still running)"
+                json_push warn maintenance.kernel_restart maintenance "$kernel_line (newer kernel on disk, current kernel still running)"
             fi
             if [[ -n "$services_count" ]] && [[ "$services_count" -gt 0 ]]; then
-                out="$out\n🔄 SERVICES-RESTART: $services_count service(s) running pre-upgrade libs (e.g. sshd, fail2ban) — restart or reboot"
+                json_push warn maintenance.services_restart maintenance "$services_count service(s) running pre-upgrade libs (e.g. sshd, fail2ban) — restart or reboot"
             fi
         elif [[ $nr_rc -eq 1 ]]; then
             # WARNING state (e.g. microcode outdated, sessions active) — surface too.
             local warning_msg
             warning_msg=$(echo "$nr_out" | /usr/bin/head -1)
-            [[ -n "$warning_msg" ]] && out="$out\n⚠️ NEEDRESTART-WARN: $warning_msg"
+            [[ -n "$warning_msg" ]] && json_push warn maintenance.needrestart_warn maintenance "$warning_msg"
         elif [[ $nr_rc -gt 2 ]]; then
             flag_degraded "needrestart returned $nr_rc (expected 0, 1, or 2)"
         fi
     fi
-
-    echo "$out"
 }
 
 # --- History dir + delta mode ---------------------------------------------
@@ -949,7 +1066,8 @@ report_maintenance() {
 # inlined in each report_* function). Day-1 has no yesterday file —
 # those checks stay silent and the absolute-threshold finding above is
 # the only signal (graceful degradation during the first ~24h of use).
-HISTORY_DIR="/var/log/box-audit/history"
+# HISTORY_DIR itself is defined above the CLI dispatch block, next to the
+# history_tail/history_diff functions it serves.
 
 # Read yesterday's counts from the sidecar written by the prior run.
 # Robust to missing / corrupt files (leaves the vars unset, which makes
@@ -981,20 +1099,21 @@ history_load_counts
 # silently: history is best-effort and a missing dir must not break the
 # audit. The numbers come from the JSON (single source of truth) so the
 # sidecar agrees with what `--json` printed this run.
+# (history_tail/history_diff live above the CLI dispatch block — they are
+# dispatch targets and must be defined before the dispatch runs.)
 history_persist_counts_from_json() {
     local json_text="$1"
     /usr/bin/mkdir -p "$HISTORY_DIR" 2>/dev/null || return 0
     [[ -d "$HISTORY_DIR" ]] || return 0
     /usr/bin/python3 -c '
-import json, sys, re, datetime, socket
+import json, sys, datetime, socket
 try:
     d = json.loads(sys.argv[1])
     out_c = sui_c = sec_c = 0
     for f in d.get("findings", []):
-        cid = f.get("check_id", f.get("id",""))
-        m = re.match(r"^(\d+)", f.get("message",""))
-        if not m: continue
-        n = int(m.group(1))
+        cid = f.get("check_id", "")
+        n = f.get("count")
+        if not isinstance(n, int): continue
         if cid == "security.outbound_remote_count": out_c = n
         elif cid == "security.suid_count": sui_c = n
         elif cid == "updates.security_pending": sec_c = n
@@ -1013,57 +1132,6 @@ except Exception:
     return 0
 }
 
-# Tail mode: read-only summary of the last N daily snapshots. Sorted
-# most-recent-first.
-history_tail() {
-    local n="${1:-7}"
-    /usr/bin/mkdir -p "$HISTORY_DIR" 2>/dev/null
-    [[ -d "$HISTORY_DIR" ]] || { echo "box-audit: no history directory at $HISTORY_DIR" >&2; exit 1; }
-    local files
-    files=$(find "$HISTORY_DIR" -maxdepth 1 -type f -name '*.json' ! -name '.*' -printf '%T@ %f\n' \
-        | sort -rn | head -n "$n" | awk '{print $2}')
-    [[ -z "$files" ]] && { echo "box-audit: history is empty (run --json once to seed)"; return; }
-    local fname fdate
-    while IFS= read -r fname; do
-        [[ -z "$fname" ]] && continue
-        fdate="${fname%.json}"
-        /usr/bin/python3 -c "
-import json
-try:
-    d = json.load(open('$HISTORY_DIR/$fname'))
-    status = d.get('status', '?')
-    n = len(d.get('findings', []))
-    print(f'$fdate  {status:8}  {n} finding(s)')
-except Exception:
-    print(f'$fdate  (corrupt or unreadable)')
-"
-    done <<< "$files"
-}
-
-# Diff mode: what changed between today and N days ago. Read-only.
-history_diff() {
-    local n="${1:-1}"
-    local diff_file1 diff_file2
-    diff_file1="$HISTORY_DIR/$(date -u +%Y-%m-%d).json"
-    diff_file2="$HISTORY_DIR/$(date -u -d "$n days ago" +%Y-%m-%d).json"
-    [[ -r "$diff_file2" ]] || { echo "box-audit: --diff cannot find $diff_file2 — need at least one prior snapshot" >&2; exit 1; }
-    /usr/bin/python3 -c "
-import json
-def load(p):
-    try: return {f.get('id'): f for f in json.load(open(p)).get('findings', [])}
-    except Exception: return {}
-base = load('$diff_file2')
-today = load('$diff_file1')
-added = today.keys() - base.keys()
-removed = base.keys() - today.keys()
-for k in sorted(added):
-    print(f'+ ADDED  [{today[k].get(chr(34)+\"severity\"+chr(34),\"?\")[:4]:<4}] {today[k].get(\"message\",\"\")}')
-for k in sorted(removed):
-    print(f'- GONE   [{base[k].get(chr(34)+\"severity\"+chr(34),\"?\")[:4]:<4}] {base[k].get(\"message\",\"\")}')
-print(f'  baseline=$(date -u -d "$n days ago" +%Y-%m-%d).json today=$(date -u +%Y-%m-%d).json  (+{len(added)} -{len(removed)})')
-"
-}
-
 # Write today's snapshot + enforce retention. The single mechanism for
 # bounding /var/log/box-audit/: latest.json and .latest-counts.json are
 # overwritten in place every run (no growth), so the only unbounded
@@ -1080,8 +1148,12 @@ history_write() {
     local json_text="$1"
     /usr/bin/mkdir -p "$HISTORY_DIR" 2>/dev/null || return 0
     [[ -d "$HISTORY_DIR" ]] || return 0
-    /usr/bin/printf '%s\n' "$json_text" \
-        > "$HISTORY_DIR/$(/usr/bin/date -u +%Y-%m-%d).json" 2>/dev/null || return 0
+    # Write under a 077 umask: snapshots carry host info, findings and IP
+    # samples — 0600 like the integrity baseline, regardless of the process
+    # umask (0644 under the root unit). Subshell keeps the rest of the run
+    # unaffected.
+    ( umask 077; /usr/bin/printf '%s\n' "$json_text" \
+        > "$HISTORY_DIR/$(/usr/bin/date -u +%Y-%m-%d).json" ) 2>/dev/null || return 0
     # Retention: delete snapshots older than the window. -mtime +30 =
     # strictly older than 30 days, so 31 calendar files remain.
     /usr/bin/find "$HISTORY_DIR" -maxdepth 1 -type f -name '????-??-??.json' \
@@ -1134,8 +1206,6 @@ integrity_snapshot() {
 # write the current snapshot as the baseline and emit nothing — the user
 # shouldn't see "all crown jewels changed" on day one.
 report_integrity() {
-    local out=""
-
     # Non-root runs can't read /etc/shadow, /etc/gshadow, /etc/sudoers, or
     # /root/.ssh/authorized_keys. integrity_hash_path returns empty for
     # those, which drops them from the snapshot — the diff then reports
@@ -1144,14 +1214,12 @@ report_integrity() {
     # check instead of corrupting it.
     if [[ $EUID -ne 0 ]]; then
         flag_degraded "not running as root — file-integrity check skipped (it would poison the baseline with false removals)"
-        echo ""
         return
     fi
 
     if [[ ! -d "$INTEGRITY_BASELINE_DIR" ]]; then
         /usr/bin/mkdir -p "$INTEGRITY_BASELINE_DIR" 2>/dev/null || {
             flag_degraded "could not create $INTEGRITY_BASELINE_DIR — integrity check skipped"
-            echo ""
             return
         }
         /usr/bin/chmod 0700 "$INTEGRITY_BASELINE_DIR"
@@ -1168,7 +1236,6 @@ report_integrity() {
         umask 077
         /usr/bin/printf '%s' "$current" > "$INTEGRITY_BASELINE_FILE" 2>/dev/null \
             || flag_degraded "could not write integrity baseline"
-        echo ""
         return
     fi
 
@@ -1210,9 +1277,9 @@ for kind, path in changes:
         while IFS=$'\t' read -r kind path; do
             [[ -z "$kind" ]] && continue
             case "$kind" in
-                added)   out="$out\n🔒 INTEGRITY: added $path" ;;
-                removed) out="$out\n🔒 INTEGRITY: removed $path" ;;
-                changed) out="$out\n🔒 INTEGRITY: changed $path" ;;
+                added)   json_push warn integrity.change integrity "added $path" ;;
+                removed) json_push warn integrity.change integrity "removed $path" ;;
+                changed) json_push warn integrity.change integrity "changed $path" ;;
             esac
             n=$((n + 1))
         done <<< "$diff"
@@ -1224,132 +1291,129 @@ for kind, path in changes:
         /usr/bin/printf '%s' "$current" > "$INTEGRITY_BASELINE_FILE" 2>/dev/null
         /usr/bin/chmod 0600 "$INTEGRITY_BASELINE_FILE" 2>/dev/null
         if [[ $n -gt 1 ]]; then
-            out="$out\n🔒 INTEGRITY: $n crown-jewel change(s) total (baseline updated)"
+            json_push info integrity.change integrity "$n crown-jewel change(s) total (baseline updated)"
         fi
     fi
-
-    echo "$out"
 }
 
 main() {
-    # Temp file for degraded findings — see the comment at flag_degraded().
-    # Left empty if mktemp fails; flag_degraded's append then no-ops and
-    # the run proceeds without degraded reporting (same as before).
-    DEGRADED_FILE=$(/usr/bin/mktemp 2>/dev/null) || true
+    # File-backed findings collector — see the comment above json_push().
+    # Left empty if mktemp fails; json_push then no-ops and the run
+    # proceeds without findings (same graceful-degradation pattern as the
+    # old DEGRADED_FILE). Every report_* call appends structured findings
+    # here; the text report AND the --json document are both renderings
+    # of this one list.
+    FINDINGS_FILE=$(/usr/bin/mktemp 2>/dev/null) || FINDINGS_FILE=""
 
     check_deps
 
-    local resources security system updates maintenance integrity exit_code=0
-    resources=$(report_resources)
-    security=$(report_security)
-    system=$(report_system)
-    updates=$(report_updates)
-    maintenance=$(report_maintenance)
-    integrity=$(report_integrity)
+    # Call the report functions plainly: they no longer echo a text
+    # report, they push findings into $FINDINGS_FILE (which survives
+    # their internal command substitutions, unlike a variable would).
+    report_resources
+    report_security
+    report_system
+    report_updates
+    report_maintenance
+    report_integrity
 
-    # Assemble degraded findings from the temp file (survived subshells)
-    if [[ -n "$DEGRADED_FILE" ]] && [[ -s "$DEGRADED_FILE" ]]; then
-        while IFS= read -r degraded_line; do
-            [[ -z "$degraded_line" ]] && continue
-            DEGRADED="$DEGRADED\n❓ DEGRADED: $degraded_line"
-        done < "$DEGRADED_FILE"
-        /usr/bin/rm -f "$DEGRADED_FILE"
-    fi
-    DEGRADED_FILE=""
+    local findings_count=0
+    [[ -n "$FINDINGS_FILE" && -s "$FINDINGS_FILE" ]] && findings_count=$(wc -l < "$FINDINGS_FILE" | tr -d ' ')
+    local status="ok"
+    [[ "$findings_count" -gt 0 ]] && status="findings"
 
-    local full_report="${resources}${security}${system}${updates}${maintenance}${integrity}${DEGRADED}"
+    # --- Render text from findings (text mode AND raw_output use this) ---
+    # One mapping: check_id -> emoji + label, in the fixed section order.
+    # Today's per-check label text is preserved verbatim (including the
+    # lowercase `fail2ban:`); findings carry label-free messages, so the
+    # label is prefixed exactly once here.
+    # The whole render is ONE python pass over the findings file. A
+    # bash loop that spawns python3 per line costs ~200ms per finding
+    # (~10s per run on a chatty box); one interpreter keeps the
+    # audit's ~2s budget.
+    render_text_report() {
+        if [[ "$findings_count" -eq 0 ]]; then
+            printf '\n=== SYSTEM HEALTH - %s ===\n' "$(date '+%Y-%m-%d %H:%M')"
+            echo "✅ All clear — no issues detected"
+            return 0
+        fi
+        printf '\n=== SYSTEM HEALTH REPORT - %s ===\n' "$(date '+%Y-%m-%d %H:%M')"
+        FINDINGS_FILE="$FINDINGS_FILE" /usr/bin/python3 -c '
+import json, os
+
+EMOJI_LABEL = {
+    "resources.disk_high":             ("⚠️", "DISK"),
+    "resources.swap_high":             ("⚠️", "SWAP"),
+    "resources.load_high":             ("⚠️", "LOAD"),
+    "security.fail2ban_banned":        ("🚨", "fail2ban"),
+    "security.ssh_fails":              ("⚠️", "SSH"),
+    "security.sudo_fails":             ("⚠️", "sudo"),
+    "security.new_port":               ("🆕", "PORT"),
+    "security.outbound_remote_count":  ("🌐", "OUTBOUND"),
+    "security.outbound_delta":         ("🌐", "OUTBOUND-DELTA"),
+    "security.suid_count":             ("🔓", "SUID"),
+    "security.suid_delta":             ("🔓", "SUID-DELTA"),
+    "system.failed_units":             ("🔴", "SYSTEMD"),
+    "system.custom_timers":            ("⏰", "CUSTOM-TIMERS"),
+    "system.user_cron":                ("📅", "USER-CRON"),
+    "system.cron_d_dropins":           ("📅", "/etc/cron.d/"),
+    "system.docker_unhealthy":         ("🔴", "DOCKER"),
+    "system.crash_dumps":              ("💥", "CORES"),
+    "system.kernel_errors":            ("🔴", "KERNEL"),
+    "updates.upgradable":              ("📦", "UPDATES"),
+    "updates.security_pending":        ("🔒", "SECURITY"),
+    "updates.security_delta":          ("🔒", "SECURITY-DELTA"),
+    "updates.kernel_cve":              ("🛡️", "KERNEL-CVE"),
+    "maintenance.reboot_required":     ("🔁", "REBOOT"),
+    "maintenance.apt_cache_stale":     ("⏳", "APT-CACHE"),
+    "maintenance.timer_drift":         ("⏰", "TIMER"),
+    "maintenance.unattended_upgrades": ("⏰", "UNATTENDED-UPGRADES"),
+    "maintenance.kernel_restart":      ("🛡️", "KERNEL-RESTART"),
+    "maintenance.services_restart":    ("🔄", "SERVICES-RESTART"),
+    "maintenance.needrestart_warn":    ("⚠️", "NEEDRESTART-WARN"),
+    "integrity.change":                ("🔒", "INTEGRITY"),
+    "degraded.check":                  ("❓", "DEGRADED"),
+}
+SECTION_ORDER = ["resources", "security", "system", "updates", "maintenance", "integrity"]
+SECTION_RANK = {s: i for i, s in enumerate(SECTION_ORDER)}
+
+findings = []
+with open(os.environ["FINDINGS_FILE"]) as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            findings.append(json.loads(line))
+        except Exception:
+            continue
+
+# Section order first, then insertion order within a section.
+findings.sort(key=lambda f: SECTION_RANK.get(f.get("section", ""), len(SECTION_ORDER)))
+for f in findings:
+    emoji, label = EMOJI_LABEL.get(f.get("check_id", ""), (None, None))
+    if emoji is None:
+        continue
+    msg = f.get("message", "")
+    print(f"{emoji} {label}: {msg}")
+' 2>/dev/null
+    }
 
     if [[ "$OUTPUT_MODE" == "json" ]]; then
-        # Build JSON. Walk the assembled text report line-by-line; for each
-        # non-empty line, parse the leading emoji as severity and emit a
-        # structured finding. Lines without an emoji (e.g. blank lines or
-        # the SYSTEM HEALTH header) are skipped. The original text is also
-        # kept in raw_output for downstream consumers that prefer it.
-        local safe_report="${full_report}"
-        # report_* functions emit echo $out which preserves \n as escapes
-        # (no actual newlines). Convert them so we can iterate per finding.
-        local report_for_parsing="${safe_report//\\n/$'\n'}"
-        local findings_count=0
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            # DEGRADED entries get their own severity instead of the
-            # generic emoji classification — they mean "a check could
-            # not run", which is more actionable than info/warn.
-            if [[ "$line" == *"❓ DEGRADED:"* ]]; then
-                local degraded_msg="${line#*❓ DEGRADED: }"
-                json_push "degraded" "degraded.check" "$degraded_msg"
-                findings_count=$((findings_count + 1))
-                continue
-            fi
-            # Strip leading emoji + space; everything after is the message
-            local msg="${line}"
-            local id_prefix="info"
-            case "$msg" in
-                "🚨"*) id_prefix="alert" ;;
-                "🔒"*|"🛡️"*|"🔴"*|"💥"*|"🌐"*|"🔓"*|"⏰"*) id_prefix="warn" ;;
-                "⚠️"*) id_prefix="warn" ;;
-                "📅"*|"📦"*|"🆕"*|"🔄"*|"🔁"*) id_prefix="info" ;;
-            esac
-            # Stable check_id from emoji (new in v0.5.0). Downstream tools
-            # can branch on this without parsing the human message text.
-            # The "DELTA" suffix on outbound/suid/security distinguishes
-            # history-driven findings from absolute-threshold ones.
-            local check_id=""
-            case "$msg" in
-                "🚨"*) check_id="security.fail2ban_banned" ;;
-                "⚠️ SSH:"*) check_id="security.ssh_fails" ;;
-                "⚠️ sudo:"*) check_id="security.sudo_fails" ;;
-                "🆕 PORT:"*) check_id="security.new_port" ;;
-                "🌐 OUTBOUND-DELTA:"*) check_id="security.outbound_delta" ;;
-                "🌐"*) check_id="security.outbound_remote_count" ;;
-                "🔓 SUID-DELTA:"*) check_id="security.suid_delta" ;;
-                "🔓"*) check_id="security.suid_count" ;;
-                "🔴 SYSTEMD:"*) check_id="system.failed_units" ;;
-                "⏰ CUSTOM-TIMERS:"*) check_id="system.custom_timers" ;;
-                "📅 USER-CRON:"*) check_id="system.user_cron" ;;
-                "📅 /etc/cron.d/:"*) check_id="system.cron_d_dropins" ;;
-                "🔴 DOCKER:"*) check_id="system.docker_unhealthy" ;;
-                "💥"*) check_id="system.crash_dumps" ;;
-                "🔴 KERNEL:"*) check_id="system.kernel_errors" ;;
-                "📦"*) check_id="updates.upgradable" ;;
-                "🔒 SECURITY-DELTA:"*) check_id="updates.security_delta" ;;
-                "🔒 SECURITY:"*) check_id="updates.security_pending" ;;
-                "🛡️ KERNEL-CVE:"*) check_id="updates.kernel_cve" ;;
-                "🔁"*) check_id="maintenance.reboot_required" ;;
-                "⏳"*) check_id="maintenance.apt_cache_stale" ;;
-                "⏰ TIMER:"*) check_id="maintenance.timer_drift" ;;
-                "⏰ UNATTENDED-UPGRADES:"*) check_id="maintenance.unattended_upgrades" ;;
-                "🛡️ KERNEL-RESTART:"*) check_id="maintenance.kernel_restart" ;;
-                "🔄"*) check_id="maintenance.services_restart" ;;
-                "⚠️ NEEDRESTART-WARN:"*) check_id="maintenance.needrestart_warn" ;;
-                "🔒 INTEGRITY:"*) check_id="integrity.change" ;;
-                "⚠️ DISK:"*) check_id="resources.disk_high" ;;
-                "⚠️ SWAP:"*) check_id="resources.swap_high" ;;
-                "⚠️ LOAD:"*) check_id="resources.load_high" ;;
-            esac
-            msg=$(echo "$msg" | /usr/bin/sed -E 's/^[^ ]+ //')
-            # Generate a stable-ish id from the first few words of the message
-            local id
-            id=$(echo "$msg" | /usr/bin/awk '{for(i=1;i<=3 && i<=NF;i++) printf "%s_", tolower($i); print ""}' | /usr/bin/sed 's/_$//' | /usr/bin/tr -d ',' | /usr/bin/cut -c1-50)
-            json_push "$id_prefix" "${check_id:-$id}" "$msg"
-            findings_count=$((findings_count + 1))
-        done <<< "$report_for_parsing"
-
-        local safe_report_json
-        # Convert the \n escapes to real newlines BEFORE json.dumps — the
-        # escaped two-char sequences would otherwise survive into the JSON
-        # string as literal backslash-n garbage for downstream formatters.
-        local report_real_newlines="${safe_report//\\n/$'\n'}"
-        safe_report_json=$(/usr/bin/printf '%s' "$report_real_newlines" | /usr/bin/python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-        local status="ok"
-        [[ "$findings_count" -gt 0 ]] && status="findings"
-        local full_json
+        # Both JSON fields come from the same findings file: findings is
+        # the raw JSON lines joined with commas; raw_output is the
+        # rendered text (identical to what text mode prints).
+        local rendered_text findings_array_json raw_output_json full_json
+        rendered_text=$(render_text_report)
+        findings_array_json=""
+        [[ -n "$FINDINGS_FILE" && -s "$FINDINGS_FILE" ]] && findings_array_json=$(paste -sd, "$FINDINGS_FILE")
+        raw_output_json=$(/usr/bin/printf '%s' "$rendered_text" | /usr/bin/python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
         full_json=$(/usr/bin/printf '{"status":"%s","timestamp":"%s","host":"%s","findings":[%s],"raw_output":%s}\n' \
             "$status" \
             "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" \
             "$(/usr/bin/hostname)" \
-            "$JSON_FINDINGS" \
-            "$safe_report_json")
+            "$findings_array_json" \
+            "$raw_output_json")
         /usr/bin/printf '%s' "$full_json"
         # History write: copy the day's snapshot to history/YYYY-MM-DD.json
         # so --tail/--diff and tomorrow's delta mode have something to read.
@@ -1362,18 +1426,12 @@ main() {
         # the exit code. This matters because pipefail in shells / systemd
         # units would otherwise treat exit-1 (findings) as a failure even
         # though the JSON was produced correctly.
-        exit_code=0
-    else
-        if [[ -z "$full_report" ]]; then
-            printf '\n=== SYSTEM HEALTH - %s ===\n' "$(date '+%Y-%m-%d %H:%M')"
-            echo "✅ All clear — no issues detected"
-        else
-            report "$full_report"
-            exit_code=1
-        fi
+        return 0
     fi
 
-    return $exit_code
+    render_text_report
+    [[ "$findings_count" -gt 0 ]] && return 1
+    return 0
 }
 
 main

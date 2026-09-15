@@ -42,15 +42,21 @@ Lynis-style absolute scoring.
 ```json
 {
   "status": "findings",
-  "timestamp": "2026-09-14T14:29:33Z",
+  "timestamp": "2026-09-15T14:29:33Z",
   "host": "your-hostname",
   "findings": [
-    {"severity": "warn", "id": "security:_2_security", "message": "SECURITY: 2 security update(s) pending"},
-    {"severity": "warn", "id": "kernel-restart:_kernel:_7.0.0-31-generic", "message": "KERNEL-RESTART: ..."}
+    {"severity": "warn", "check_id": "updates.security_pending", "message": "2 security update(s) pending"},
+    {"severity": "warn", "check_id": "maintenance.kernel_restart", "message": "Kernel: 7.0.0-31-generic (newer kernel on disk, current kernel still running)"}
   ],
   "raw_output": "..."
 }
 ```
+
+Each finding carries a stable `check_id` (see `box-audit --print-schema`
+for the full table), so downstream tools can branch without parsing the
+message text. Count-carrying checks (`security.outbound_remote_count`,
+`security.suid_count`, `updates.security_pending`) also carry a numeric
+`count` field.
 
 Exit codes: `0` = all clear, `1` = findings present, `2` = bad CLI flag.
 In `--json` mode the exit code is always `0`; the JSON body's `status`
@@ -76,6 +82,21 @@ Dependencies: `sudo apt install -y needrestart fail2ban python3`
 (docker only if you run containers and want the health check). Install
 them before or after — the audit degrades those checks gracefully and
 names what's missing.
+
+### Removing box-audit
+
+```bash
+sudo systemctl disable --now box-audit.timer
+sudo rm /etc/systemd/system/box-audit.service /etc/systemd/system/box-audit.timer
+sudo rm -f /usr/local/bin/box-audit /usr/local/bin/notify-webhook.sh
+sudo rm -rf /usr/local/share/box-audit /var/lib/box-audit /var/log/box-audit
+sudo systemctl daemon-reload
+```
+
+`/var/lib/box-audit/` holds the per-box allowlists and the file-integrity
+baseline; `/var/log/box-audit/` holds the snapshots and delta history.
+Deleting them resets everything the tool has learned about your box —
+the next run re-seeds from scratch.
 
 ### Manual install (fallback)
 
