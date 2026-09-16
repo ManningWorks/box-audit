@@ -22,8 +22,9 @@ Not installed yet, or upgrading? That's one command — `sudo ./install.sh`
 from a repo checkout. Prerequisites, the verify gate, and pitfalls are in
 `references/install.md`. Everything below assumes the daily timer exists.
 
-CLI flags are summarized in § 5 below and detailed in
-`references/cli.md` (manage flags live there).
+CLI flags are summarized in `references/cli.md` (manage flags live
+there); for programmatic consumption, `box-audit --print-schema` emits
+the severity + `check_id` mapping as JSON.
 
 ## 1. Run or read
 
@@ -147,6 +148,9 @@ Match the report to the question asked:
 Never report "all clear" from a run with `degraded` findings without
 saying what was skipped. A blind pass is not a clean pass.
 
+> Push delivery (webhook/cron) is optional and documented in the README's
+> "Getting the report off the box" section.
+
 ## Repair branch: timer or baseline
 
 Symptoms that the daily machinery broke: `latest.json` timestamp older
@@ -169,77 +173,10 @@ last-resort), `sudo rm /var/lib/box-audit/integrity-baseline.json` and the
 next run silently rebuilds it. That erases all remembered history: after
 this, drift from before the reset is invisible. Say so when doing it.
 
-## Delivery
+## Developing box-audit
 
-Default is pull: findings land in `/var/log/box-audit/latest.json` and the
-user (or you) reads them when asked — a daily audit that pings "all
-clear!" trains the user to ignore it; silence means nothing changed.
-Optional push (webhook) and a Hermes cron recipe are in the README's
-"Getting the report off the box" section; format pushed messages using
-the severity table in section 2.
+The repo checkout is the source of truth for development: the three-tier
+test model and how to run it are in the repo README ("Testing" section),
+entry point `bash test/all.sh`. Nothing in this skill is needed to develop
+the tool.
 
-## 5. CLI summary
-
-Full reference in `references/cli.md`. Quick:
-
-| Flag | Purpose |
-|---|---|
-| `--json` | Machine-readable JSON to stdout. Always exits 0. |
-| `--version` | Print box-audit version. |
-| `--init` | (root) Snapshot the box into the per-box allowlists. |
-| `--accept-port N` | (root) Append port N to `ports-allowlist.txt`. |
-| `--accept-timer NAME` | (root) Append NAME.timer to `timers-baseline.txt`. |
-| `--outbound-threshold N` | (root) Write the OUTBOUND threshold. |
-| `--tail [N]` | Read-only summary of the last N daily snapshots (default 7). |
-| `--diff [N]` | Read-only diff of today's findings vs N days back (default 1). |
-| `--print-schema` | Emit severity + check_id mapping as JSON (don't parse text). |
-
-For programmatic consumption, the JSON output now carries stable
-`check_id` strings (`security.outbound_remote_count`,
-`updates.security_pending`, `integrity.change`, etc.) — see
-`box-audit --print-schema` for the full table.
-
-## 6. Test the install
-
-The repo ships a three-tier test model (issue #14). Three scripts,
-each catching a different class of regression. The smoke suite (§ 6a)
-is local-only; the install drivers (§ 6b, § 6c) boot a privileged
-container because systemd, fail2ban, journald, and the integrity
-baseline only behave on a real `/etc`.
-
-### 6a. Tier 1: smoke + install
-
-Cheapest gate. `bash test/smoke.sh` covers the audit's degraded-path
-surface on a bare non-root runner (no container, no install). It
-also asserts `box-audit --version` reports the `+replay` suffix (the
-invariant that tier 3 re-checks on the installed binary) and that
-`test/properties/run.sh` completes in under 5 seconds. Tier 1 also
-runs `install.sh --ci` inside a privileged container via
-`.github/workflows/install.yml` on every PR.
-
-### 6b. Tier 2: integration-seeded
-
-`bash test/install-seeded.sh` boots a seeded container with
-fail2ban, docker, cron, journald, sudo, and iproute2 installed, then
-seeds eight specific conditions (a banned SSH IP, a stale apt
-stamp, a non-allowlisted listening port, etc.). After `install.sh
---ci` lands on the running system, the driver runs `box-audit --json`
-and pipes it through `test/install-seeded/assert-json.py`, which
-asserts the expected eight `check_id`s appear with the expected
-severities. Required check on every PR via
-`.github/workflows/integration-seeded.yml`. Catches regressions tier 1
-cannot — the bare runner has no filesystem state to exercise.
-
-### 6c. Tier 3: local pre-merge
-
-`bash test/local-integration.sh` is the author's local pre-merge net.
-It mirrors tier 1 (privileged systemd container, install, audit) but
-asserts only the JSON contract (four top-level keys:
-`status`, `timestamp`, `host`, `findings`) plus the `+replay` version
-suffix on the *installed* binary — not per-check severities (that's
-tier 2). Hard budget: 60 seconds; observed ~8s on a 2026-era x86 host.
-The script skips itself cleanly with `skipped: requires privileged
-Docker` and exits 0 when run on a host that can't grant `--privileged`
-(common CI-runner case). Single local entry point for all three tiers:
-`bash test/all.sh` runs them in sequence; tier 3's skip appears as
-`all: 3 passed, 1 skipped` in the summary.
