@@ -68,21 +68,24 @@ enabled = true
 bantime.incremental = false
 JAIL
 
-# 6. python3 http.server on 127.0.0.1:9999. The script's
-#    security.new_port check parses `ss -tlnH` and flags any port
-#    not in ports-allowlist.txt; install.sh seeds the allowlist with
-#    22/53/80/443/631, so 9999 is unexpected. The driver starts
-#    this listener AFTER systemd is PID 1 (build-time nohup'd
-#    processes don't survive the RUN — they get reparented to the
-#    bash that owns it, and die when it exits).
-
-# 7. ssh_fails seeding is done by the driver, not here: journald in
-#    jrei/systemd-ubuntu is volatile (/var/log/journal is missing),
-#    so `logger` entries written at build time are gone after the
-#    container's first boot. The driver writes them after systemd is
-#    up.
-
-# Done. The driver handles post-boot mutations (fail2ban ban,
-# starting the failed unit, /etc/passwd tweak, ready polls, the
-# sudo grant for fail2ban-client, and the 16 ssh_fails journal
-# entries that drive security.ssh_fails).
+# 6. Two seeded-state mutations are intentionally NOT here — they
+#    need a running systemd and are done by the driver
+#    (test/install-seeded.sh) post-boot:
+#
+#      - python3 -m http.server 9999: the security.new_port check
+#        reads `ss -tlnH` and flags any port not in
+#        ports-allowlist.txt (allowlist is 22/53/80/443/631).
+#        Build-time nohup'd processes don't survive the RUN.
+#
+#      - 16 `logger -p auth.err -t sshd "Failed password ..."` lines:
+#        the security.ssh_fails check counts 24h auth-fails. But
+#        journald in jrei/systemd-ubuntu is volatile
+#        (/var/log/journal is missing), so anything written at build
+#        time is gone after the first boot. Driver seeds them after
+#        systemd is PID 1.
+#
+# The driver also starts the failed unit (ExecStart=/bin/false is
+# enough; `systemctl start` here would fail because systemd isn't
+# running yet during build), grants sudoers for fail2ban-client,
+# mutates /etc/passwd, and waits for fail2ban + the http.server to
+# become ready before capturing --json.

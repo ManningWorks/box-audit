@@ -29,15 +29,6 @@ BASE_TAG="box-audit-base:test"
 # 1. Throwaway copy of the repo (plus optional mutation) as the
 #    build context.
 WORK="$(mktemp -d)"
-# SC2015 — A && B || C is intentional: docker rm -f may legitimately
-# return non-zero when the container is already gone, and we don't
-# want the cleanup to fail the run. Same pattern as test/install.sh.
-# shellcheck disable=SC2015
-cleanup() {
-    [[ -n "${CID:-}" ]] && docker rm -f "$CID" >/dev/null 2>&1 || true
-    rm -rf "$WORK"
-}
-trap cleanup EXIT
 cp -R "$REPO/." "$WORK/"
 
 if [[ -n "$MUTATION" ]]; then
@@ -143,13 +134,13 @@ if [[ -z "$HTTP_READY" ]]; then
     exit 1
 fi
 
-# 8. Mutate /etc/passwd AFTER the install-time integrity baseline was
+# 6. Mutate /etc/passwd AFTER the install-time integrity baseline was
 #    written. The check hashes /etc/passwd on every run and diffs
 #    against /var/lib/box-audit/integrity-baseline.json; this
 #    mutation is what makes integrity.change fire.
 docker exec "$CID" /bin/bash -c 'echo "# seeded-mutation $(date +%s)" >> /etc/passwd' >/dev/null
 
-# 9. Seed 16 ssh_fails journald entries. Threshold is 15
+# 7. Seed 16 ssh_fails journald entries. Threshold is 15
 #    (SSH_FAIL_THRESHOLD), so 16 trips the warn. `logger -p auth.err
 #    -t sshd` writes to journald with the auth facility — same lens
 #    the check reads. Build-time logger calls were discarded:
@@ -162,7 +153,7 @@ for _ in $(seq 1 16); do
         "Failed password for invalid user admin from 192.0.2.1 port 22 ssh2"
 done
 
-# 10. Kill containerd if it's listening — it ships with the
+# 8. Kill containerd if it's listening — it ships with the
 #     jrei/systemd-ubuntu image and binds a high port inside the
 #     container. The security.new_port check fires for *any* port
 #     not in the baseline; we want exactly one finding (the seeded
@@ -171,9 +162,12 @@ done
 docker exec "$CID" /bin/bash -c \
     'pkill -f containerd || true; sleep 1' >/dev/null 2>&1 || true
 
-# 11. Capture --json output and run the assertion script.
+# Capture --json output and run the assertion script.
 BA_JSON="$(mktemp)"
 BA_ERR="$(mktemp)"
+# Best-effort cleanup: docker rm -f may legitimately return non-zero
+# when the container is already gone. The `|| true` keeps the trap
+# itself from failing the run under `set -e`.
 trap 'docker rm -f "$CID" >/dev/null 2>&1 || true; rm -rf "$WORK" "$BA_JSON" "$BA_ERR"' EXIT
 
 docker exec "$CID" /usr/local/bin/box-audit --json > "$BA_JSON" 2>"$BA_ERR" || true
