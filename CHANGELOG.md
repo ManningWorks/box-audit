@@ -70,6 +70,23 @@ whether to upgrade.
   drivers (`test/install.sh`, `test/install-seeded.sh`); the matching
   `SC2015 disable=…` comment is added to `test/install.sh`'s cleanup
   trap to match the one already in the seeded driver.
+- **Tier 3 local pre-merge script** (`test/local-integration.sh`,
+  issue #18 — closes #18, third vertical slice of the #14 three-tier
+  test model). Author's local pre-merge net: privileged systemd
+  container, `install.sh --ci`, then `box-audit --json` and the
+  four-key contract assertion plus the `+replay` version-suffix
+  invariant on the installed binary. Hard budget: 60 seconds;
+  observed ~8s on a 2026-era x86 host. Skips itself with
+  `skipped: requires privileged Docker` and exits 0 on hosts that
+  can't grant `--privileged`, so `test/all.sh` records a skip rather
+  than a failure when the gate can't run.
+- **Single local entry point** (`test/all.sh`, issue #18). Runs the
+  four tiers in sequence — smoke, install (positive), install-seeded,
+  local-integration — fail-fast on the cheapest first. Each tier owns
+  its own skip logic; the orchestrator is dumb. Final summary line
+  reads `all: 4 passed` (tier 3 ran and passed) or
+  `all: 3 passed, 1 skipped` (tier 3 skipped). Aggregate exit 0 only
+  if every tier that ran passed.
 
 ### Changed
 

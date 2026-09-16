@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# Driver for the tier-3 local pre-merge script (issue #18).
+# Third vertical slice of the #14 three-tier test model.
+#
+#   bash test/local-integration.sh
+#
+# Mirrors test/install.sh structurally (privileged systemd container,
+# install.sh --ci, then capture --json) without the seeded-state setup
+# T03 needs. Tier 3's contract is narrower than tier 2's:
+#
+#   1. install.sh --ci exits 0 inside the container.
+#   2. box-audit --json exits 0.
+#   3. The emitted JSON parses with python3 -m json.tool and contains
+#      the four top-level keys: status, timestamp, host, findings.
+#   4. /usr/local/bin/box-audit --version reports a string containing
+#      +replay (the version-suffix invariant shipped in 0.6.0).
+#
+# Per-check severities are tier 2's job (assert-json.py); tier 3 asserts
+# the JSON *shape* and the version suffix, both of which are invariants
+# the schema and the smoke suite already cover.
+#
+# The hard budget is 60 seconds end-to-end. If the host can't run a
+# privileged container (the common CI-runner case), the script prints
+# "skipped: requires privileged Docker" and exits 0 — the orchestrator
+# test/all.sh counts that as a skip, not a failure.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+IMAGE_TAG="${1:-box-audit-local:positive}"
+BUDGET_MS=$((60 * 1000))
+
+# Skip detection: try `docker run --rm --privileged alpine true`. A
+# non-zero exit (or no docker on PATH) means the host can't satisfy the
+# tier-3 contract. Print the documented message and exit 0 so
+# test/all.sh can record this as a skip rather than a failure.
+if ! command -v docker >/dev/null 2>&1; then
+    echo "local-integration: skipped: requires privileged Docker (docker not on PATH)"
+    exit 0
+fi
+if ! docker run --rm --privileged alpine true >/dev/null 2>&1; then
+    echo "local-integration: skipped: requires privileged Docker (docker run --privileged failed)"
+    exit 0
+fi
+
+TOTAL_START_NS=$(date +%s%N)
+
+# phase <name> — start/ok-or-fail wrapper. Tracks per-phase elapsed
+# milliseconds and prints a single line on completion.
+phase_start() { echo "phase $1 start"; }
+
+phase_ok() {
+    local name="$1" start_ns="$2"
+    local elapsed_ms=$(( ($(date +%s%N) - start_ns) / 1000000 ))
+    echo "phase $name ok in ${elapsed_ms}ms"
+}
+
+phase_fail() {
+    local name="$1" start_ns="$2" reason="$3"
+    local elapsed_ms=$(( ($(date +%s%N) - start_ns) / 1000000 ))
+    echo "phase $name FAIL after ${elapsed_ms}ms — $reason" >&2
+    exit 1
+}
+
+# Throwaway build context so a leftover mutation in WORK can't poison
+# the working tree. Same pattern test/install.sh uses.
+WORK="$(mktemp -d)"
+CID=""
+BA_JSON="$(mktemp)"
+BA_ERR="$(mktemp)"
+SCHEMA_PROBE="$(mktemp)"
+PROBE_SCRIPT="$(mktemp)"
+# SC2015 — A && B || C is intentional: docker rm -f may legitimately
+# return non-zero when the container is already gone, and we don't
+# want the cleanup to fail the run. Same disable as test/install.sh.
+# shellcheck disable=SC2015
+cleanup() {
+    [[ -n "$CID" ]] && docker rm -f "$CID" >/dev/null 2>&1 || true
+    rm -rf "$WORK" "$BA_JSON" "$BA_ERR" "$SCHEMA_PROBE" "$PROBE_SCRIPT"
+}
+trap cleanup EXIT
+
+cp -R "$REPO/." "$WORK/"
+
+# Inline JSON-contract probe. Reads the JSON path from argv[1] so the
+# script is decoupled from stdin/stdout of the outer pipeline. Exit
+# 0 on success; 1 on missing keys; 2 on bad shape; non-zero on parse
+# failure (caught by the caller).
+cat > "$PROBE_SCRIPT" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    doc = json.load(f)
+missing = [k for k in ("status", "timestamp", "host", "findings") if k not in doc]
+if missing:
+    sys.stderr.write("missing top-level keys: " + ",".join(missing) + "\n")
+    sys.exit(1)
+findings = doc.get("findings")
+if not isinstance(findings, list):
+    sys.stderr.write("'findings' is not a list\n")
+    sys.exit(2)
+PY
+
+# --- phase: build ----------------------------------------------------------
+BUILD_START=$(date +%s%N)
+phase_start build
+if ! docker build -t "$IMAGE_TAG" -f "$REPO/test/install-docker/Dockerfile" "$WORK" >/dev/null 2>"$BA_ERR"; then
+    phase_fail "build" "$BUILD_START" "docker build failed (see $BA_ERR)"
+fi
+phase_ok "build" "$BUILD_START"
+
+# --- phase: boot -----------------------------------------------------------
+BOOT_START=$(date +%s%N)
+phase_start boot
+CID="$(docker run -d --privileged \
+    --cgroupns=host \
+    --tmpfs /run \
+    --tmpfs /var/log \
+    -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+    -v "$WORK":/work \
+    -e container=docker \
+    "$IMAGE_TAG")"
+
+STATE=""
+for _ in $(seq 1 30); do
+    STATE="$(docker exec "$CID" systemctl is-system-running 2>/dev/null || true)"
+    case "$STATE" in
+        running|degraded) break ;;
+    esac
+    sleep 1
+done
+if [[ "$STATE" != "running" && "$STATE" != "degraded" ]]; then
+    phase_fail "boot" "$BOOT_START" "systemd did not become ready (last state: '${STATE:-none}')"
+fi
+phase_ok "boot" "$BOOT_START"
+
+# --- phase: install --------------------------------------------------------
+INSTALL_START=$(date +%s%N)
+phase_start install
+if ! docker exec "$CID" /bin/bash -c 'cd /work && bash install.sh --ci' >/dev/null 2>"$BA_ERR"; then
+    phase_fail "install" "$INSTALL_START" "install.sh --ci exited non-zero (see $BA_ERR)"
+fi
+phase_ok "install" "$INSTALL_START"
+
+# --- phase: audit ----------------------------------------------------------
+AUDIT_START=$(date +%s%N)
+phase_start audit
+# Hit the *installed* binary (/usr/local/bin/box-audit) so the +replay
+# suffix and the JSON contract are exercised against the same surface
+# the daily timer runs, not the repo copy.
+if ! docker exec "$CID" /usr/local/bin/box-audit --json > "$BA_JSON" 2>"$BA_ERR"; then
+    phase_fail "audit" "$AUDIT_START" "/usr/local/bin/box-audit --json exited non-zero (see $BA_ERR)"
+fi
+# Tier-3 contract 1: emitted JSON parses.
+if ! python3 -m json.tool < "$BA_JSON" > "$SCHEMA_PROBE" 2>>"$BA_ERR"; then
+    phase_fail "audit" "$AUDIT_START" "box-audit --json output is not valid JSON"
+fi
+# Tier-3 contract 2: four top-level keys present. Probe the *original*
+# raw emission, not the pretty-printed copy, so the assertion fails
+# the same way for both the production and a future variant.
+if ! python3 "$PROBE_SCRIPT" "$BA_JSON" 2>>"$BA_ERR"; then
+    phase_fail "audit" "$AUDIT_START" "JSON contract assertion failed (status/timestamp/host/findings)"
+fi
+# Tier-3 contract 3: --version carries +replay on the installed binary.
+VERSION_OUT="$(docker exec "$CID" /usr/local/bin/box-audit --version 2>/dev/null || true)"
+if [[ "$VERSION_OUT" != *"+replay"* ]]; then
+    phase_fail "audit" "$AUDIT_START" "--version missing +replay suffix (got: $VERSION_OUT)"
+fi
+phase_ok "audit" "$AUDIT_START"
+
+# --- budget assertion ------------------------------------------------------
+TOTAL_MS=$(( ($(date +%s%N) - TOTAL_START_NS) / 1000000 ))
+if [[ $TOTAL_MS -gt $BUDGET_MS ]]; then
+    echo "local-integration: FAIL — over 60s budget (total ${TOTAL_MS}ms)" >&2
+    exit 1
+fi
+echo "local-integration: under 60s budget (total ${TOTAL_MS}ms)"
+echo "local-integration: PASS"
