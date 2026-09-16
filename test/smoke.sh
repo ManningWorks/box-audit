@@ -188,8 +188,8 @@ fi
 
 # --- shellcheck across the shipped shell surface ----------------------------
 if command -v shellcheck >/dev/null 2>&1; then
-    if (cd "$REPO" && shellcheck scripts/box-audit.sh scripts/notify-webhook.sh install.sh test/properties/*.sh test/properties/live/*.sh); then
-        ok "shellcheck passes on box-audit.sh, notify-webhook.sh, install.sh, property suite"
+    if (cd "$REPO" && shellcheck scripts/box-audit.sh scripts/notify-webhook.sh install.sh test/install.sh test/install-seeded.sh test/properties/*.sh test/properties/live/*.sh); then
+        ok "shellcheck passes on box-audit.sh, notify-webhook.sh, install.sh, install drivers, property suite"
     else
         fail "shellcheck reported issues"
     fi

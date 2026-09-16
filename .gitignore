@@ -1,2 +1,7 @@
 # Python bytecode cache from test/fixtures/snapshot-fixtures.py
 __pycache__/
+
+# Hermes / opencode tooling state — plans, session logs, runtime caches.
+# Not part of the shipped product; safe to regenerate locally.
+/.hermes/
+/.opencode/
