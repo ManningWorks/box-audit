@@ -38,27 +38,35 @@ from __future__ import annotations
 import json
 import re
 import sys
+from typing import NamedTuple
 
-EXPECTED: list[tuple[str, str, str | None]] = [
-    # (check_id, severity, message_regex_or_None)
-    # NOTE on integrity.change: report_integrity emits one finding per
-    # changed crown-jewel path AND an aggregate `info` summary when
-    # >=2 paths changed. Asserting count==1 here would over-constrain
-    # the audit. We check that at least one finding matches the
-    # message we seeded and ignore the per-check_id strict count.
-    ("security.new_port", "warn", r"9999"),
-    ("security.fail2ban_banned", "alert", r"banned on sshd"),
-    ("security.ssh_fails", "warn", r"failed auth attempts"),
-    ("system.cron_d_dropins", "warn", r"0box-audit-test"),
-    ("system.user_cron", "warn", r"root's crontab"),
-    ("system.failed_units", "warn", r"box-audit-fail"),
-    ("maintenance.apt_cache_stale", "warn", r"stale"),
-    ("integrity.change", "warn", r"changed /etc/passwd"),
+
+class Expected(NamedTuple):
+    check_id: str
+    severity: str
+    # Matched against f["message"]; None skips the check.
+    message_regex: str | None
+    # True when the audit legitimately emits >1 finding for this
+    # check_id (e.g. integrity.change emits one warn per changed path
+    # plus an aggregate info summary). Strict-count check is skipped
+    # for these; we assert the message regex on the first matching
+    # finding.
+    multi_finding: bool = False
+
+
+EXPECTED: list[Expected] = [
+    Expected("security.new_port",          "warn",  r"9999"),
+    Expected("security.fail2ban_banned",   "alert", r"banned on sshd"),
+    Expected("security.ssh_fails",         "warn",  r"failed auth attempts"),
+    Expected("system.cron_d_dropins",      "warn",  r"0box-audit-test"),
+    Expected("system.user_cron",           "warn",  r"root's crontab"),
+    Expected("system.failed_units",        "warn",  r"box-audit-fail"),
+    Expected("maintenance.apt_cache_stale","warn",  r"stale"),
+    # report_integrity emits one finding per changed crown-jewel path
+    # AND an aggregate info summary when >=2 paths changed.
+    Expected("integrity.change",          "warn",  r"changed /etc/passwd",
+              multi_finding=True),
 ]
-# check_ids where the audit legitimately emits more than one finding
-# per run (one per changed path + an aggregate summary). Skip the
-# strict-count check for these — see EXPECTED comment above.
-MULTI_FINDING_IDS: set[str] = {"integrity.change"}
 
 
 def main() -> int:
@@ -94,42 +102,41 @@ def main() -> int:
         by_id.setdefault(cid, []).append(f)
 
     failures = 0
-    for check_id, expected_sev, msg_re in EXPECTED:
+    for spec in EXPECTED:
+        check_id = spec.check_id
+        expected_sev = spec.severity
+        msg_re = spec.message_regex
         matches = by_id.get(check_id, [])
         if not matches:
             print(f"FAIL: missing check_id {check_id}", file=sys.stderr)
             failures += 1
             continue
-        if check_id not in MULTI_FINDING_IDS and len(matches) > 1:
+        if not spec.multi_finding and len(matches) > 1:
             print(f"FAIL: {check_id} appears {len(matches)} times "
                   f"(expected 1): {matches}", file=sys.stderr)
             failures += 1
             continue
         # For multi-finding IDs, assert severity on AT LEAST ONE match.
         # For single-finding IDs, matches[0] is the only one.
-        sev_ok = False
-        sev_match = None
-        for m in matches:
-            if m.get("severity") == expected_sev:
-                sev_ok = True
-                sev_match = m
-                break
-        if not sev_ok:
+        sev_match = next(
+            (m for m in matches if m.get("severity") == expected_sev),
+            None,
+        )
+        if sev_match is None:
             print(f"FAIL: {check_id} no finding has severity={expected_sev!r} "
                   f"(got: {[m.get('severity') for m in matches]})",
                   file=sys.stderr)
             failures += 1
             continue
-        f = sev_match if sev_match is not None else matches[0]
         if msg_re is not None:
-            msg = f.get("message", "")
+            msg = sev_match.get("message", "")
             if not re.search(msg_re, msg):
                 print(f"FAIL: {check_id} message={msg!r} "
                       f"does not match /{msg_re}/", file=sys.stderr)
                 failures += 1
                 continue
-        print(f"PASS: {check_id} severity={f.get('severity')} "
-              f"message={f.get('message', '')!r}")
+        print(f"PASS: {check_id} severity={sev_match.get('severity')} "
+              f"message={sev_match.get('message', '')!r}")
 
     if failures:
         print(f"\nseeded: {len(EXPECTED) - failures}/{len(EXPECTED)} "

@@ -58,8 +58,11 @@ whether to upgrade.
   container, runs `install.sh --ci`, then captures `box-audit --json`
   and pipes it through `test/install-seeded/assert-json.py` which
   asserts the expected `check_id`s appear with the expected severities.
-  A second workflow job, `integration-seeded-regression`, sed-mutates
-  one seeded condition in a throwaway build context and inverts the
+  `integrity.change` is allowed to appear more than once because the
+  audit legitimately emits one finding per changed crown-jewel path
+  plus an aggregate `info` summary when ≥2 paths changed. A second
+  workflow job, `integration-seeded-regression`, sed-mutates one
+  seeded condition in a throwaway build context and inverts the
   resulting driver failure into a pass — proving the gate has teeth.
   Catches regressions that tier 1 cannot (no filesystem state to
   exercise on ephemeral runners).
