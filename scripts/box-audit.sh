@@ -314,11 +314,11 @@ EOF
                         | /usr/bin/sort -un > "$PORTS_FILE"
                     /usr/bin/systemctl list-timers --all --no-pager --no-legend --output json 2>/dev/null \
                         | /usr/bin/python3 -c '
-        import sys, json
-        for row in json.load(sys.stdin):
-            u = row.get("unit", "")
-            if u.endswith(".timer"):
-                print(u)' > "$TIMERS_FILE"
+import sys, json
+for row in json.load(sys.stdin):
+    u = row.get("unit", "")
+    if u.endswith(".timer"):
+        print(u)' > "$TIMERS_FILE"
                     /usr/bin/printf '25\n' > "$OUTBOUND_FILE"
                     # cron.d allowlist: learn the box's actual current
                     # /etc/cron.d/ contents, but make sure the four standard
