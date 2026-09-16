@@ -16,6 +16,10 @@ MUTATION="${2:-}"   # sed expression applied to install.sh in the build context
 # 1. Throwaway copy of the repo (plus optional mutation) as the build
 #    context. Same directory is mounted at /work in the container below.
 WORK="$(mktemp -d)"
+# SC2015 — A && B || C is intentional: docker rm -f may legitimately
+# return non-zero when the container is already gone, and we don't
+# want the cleanup to fail the run.
+# shellcheck disable=SC2015
 cleanup() {
     [[ -n "${CID:-}" ]] && docker rm -f "$CID" >/dev/null 2>&1 || true
     rm -rf "$WORK"

@@ -1,0 +1,45 @@
+name: integration-seeded
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  # Positive variant: a privileged seeded container with the eight
+  # conditions described in test/install-docker/seeded/seed.sh must
+  # produce all eight expected check_ids in the audit's JSON output.
+  # Required check on master once branch protection is updated.
+  integration-seeded:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run seeded integration (positive)
+        run: bash test/install-seeded.sh
+
+  # Negative variant: a sed-mutation removes the cron-d drop step
+  # from seed.sh in the throwaway build context, so
+  # system.cron_d_dropins is absent from the audit's findings. The
+  # assertion script must catch that, exit non-zero, and we invert
+  # that failure into a pass. If the assertion script ever silently
+  # exits 0 in the mutated run, the gate has lost its teeth and we
+  # fail loudly instead.
+  integration-seeded-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install + verify with sentinel mutation
+        run: |
+          set +e
+          bash test/install-seeded.sh box-audit-install:seeded-negative \
+            '/^printf .fake-cron-line/d'
+          RC=$?
+          set -e
+          if [[ $RC -ne 0 ]]; then
+            echo "gate caught the regression (driver exit $RC) — integration-seeded-regression passes"
+            exit 0
+          fi
+          echo "FAIL: seeded-driver exited 0 even with the cron drop-in removed — assertion gate has no teeth" >&2
+          exit 1
