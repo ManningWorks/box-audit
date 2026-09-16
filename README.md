@@ -264,28 +264,56 @@ also the contract the cron should follow.
 - **Won't work on**: macOS, Windows, Alpine (uses systemd, apt, journalctl,
   fail2ban-client — Ubuntu/Debian idioms)
 
-## CI
+## Testing
 
-Three GitHub Actions workflows, one per tier of the #14 three-tier test
-model — each catches a different class of regression:
+Three tiers of tests, one per class of regression — plus a single
+local entry point that runs them in sequence.
 
-- **`smoke`** (`ci.yml`) — runs `test/smoke.sh` on a bare non-root
-  runner. Covers the audit's degraded-path surface (empty history,
-  unparseable JSON, missing binaries) and shellcheck across the shipped
-  shell surface. Cheap; runs on every push and PR.
-- **`install-ci`** (`install.yml`) — runs `install.sh --ci` inside a
-  privileged `jrei/systemd-ubuntu:24.04` container plus a negative
-  variant that mutates `ExecStart=` to confirm the verify gate fails
-  loudly. Exercises the full install path on a real systemd.
-- **`integration-seeded`** (`integration-seeded.yml`, issue #17) —
-  boots a seeded container that produces a known mix of findings, then
-  asserts via `test/install-seeded/assert-json.py` that the expected
-  eight `check_id`s appear with the expected severities. Negative
-  variant sed-mutates one seeded condition in a throwaway build
-  context and inverts the resulting driver failure into a pass — the
-  proof that the gate has teeth. Catches regressions the other two
-  tiers cannot, because ephemeral runners have no filesystem state
-  to exercise.
+Single local entry point: `bash test/all.sh` runs all three tiers in
+sequence. Tier 3 skips itself on non-privileged hosts; the summary
+line reads `all: 4 passed` or `all: 3 passed, 1 skipped`.
+
+### Tier 1: smoke + install
+
+`test/smoke.sh` — runs on a bare non-root runner (no container, no
+install). Covers the audit's degraded-path surface (empty history,
+unparseable JSON, missing binaries) and shellcheck across the shipped
+shell surface. Also runs `test/properties/run.sh` with a 5-second
+budget. Cheap; runs on every push and PR. Required check on every PR
+via `.github/workflows/ci.yml`.
+
+`install.sh --ci` inside a privileged `jrei/systemd-ubuntu:26.04`
+container plus a negative variant that mutates `ExecStart=` to confirm
+the verify gate fails loudly. Exercises the full install path on a
+real systemd. Required check on every PR via
+`.github/workflows/install.yml`.
+
+### Tier 2: integration-seeded
+
+`.github/workflows/integration-seeded.yml` (issue #17) runs
+`test/install-seeded.sh`, which boots a seeded container that
+produces a known mix of findings, then asserts via
+`test/install-seeded/assert-json.py` that the expected eight
+`check_id`s appear with the expected severities. Negative variant
+sed-mutates one seeded condition in a throwaway build context and
+inverts the resulting driver failure into a pass — the proof that
+the gate has teeth. Required check on every PR. Catches regressions
+the other two tiers cannot, because ephemeral runners have no
+filesystem state to exercise.
+
+### Tier 3: local pre-merge
+
+`bash test/local-integration.sh` — the author's local pre-merge net.
+Mirrors tier 1 (privileged systemd container, install, audit) but
+asserts only the JSON contract (four top-level keys:
+`status`, `timestamp`, `host`, `findings`) plus the `+replay`
+version-suffix invariant on the *installed* binary — not per-check
+severities (that's tier 2). Hard budget: 60 seconds. Skips itself
+with `skipped: requires privileged Docker` and exits 0 when the host
+can't grant `--privileged`. Documented step, not a GitHub Actions
+gate: the `integration-seeded` status check on the PR is what catches
+regressions for external contributors; tier 3 is the author's
+pre-merge net.
 
 Dependabot bumps the base image weekly.
 
