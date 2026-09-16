@@ -114,9 +114,22 @@ whether to upgrade.
   because it contains `/etc/shadow` hashes (offline password
   oracle; see `report_integrity()`). Existing installs: re-run
   `sudo ./install.sh` to migrate (idempotent; perms tighten in
-  place, group added if missing). Smoke: the two `--tail`
+  place, group added if missing). Note: `usermod -aG` updates the
+  group database but not the current login session — after install,
+  open a new shell or run `newgrp boxaudit` before `box-audit
+  --tail` will work from that session. Smoke: the two `--tail`
   assertions go from FAIL to PASS on installed hosts; bare CI
   runners unchanged (issue #24).
+
+  Scope note: issue #24's "Out of scope" listed the install perm
+  change explicitly, but on review that section was authored under
+  the (then-plausible) framing of "make the script tolerate the
+  perm." The script's documented `flag_degraded` contract already
+  supports non-root runs for `--json`, so the install-layer fix is
+  the consistent one. The script's stderr behavior for unauthorized
+  readers is unchanged — they still get `find: Permission denied`,
+  which is the correct signal that they should be added to
+  `boxaudit` rather than granted blanket history access.
 
 ## [0.6.0] - 2026-09-15
 

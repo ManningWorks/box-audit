@@ -89,21 +89,24 @@ WantedBy=timers.target
 say() { printf '%s\n' "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
-# ensure_boxaudit_group — idempotent. Creates the BOXAUDIT_GROUP if it
-# doesn't exist (--system, so it's not in /etc/gshadow but does show up
-# in getent). Adds the invoking user ($SUDO_USER) so they can read
+# Description: ensure_boxaudit_group
+#
+# Idempotent. Creates the BOXAUDIT_GROUP if it doesn't exist
+# (--system, so it's not in /etc/gshadow but does show up in
+# getent). Adds the invoking user ($SUDO_USER) so they can read
 # history without sudo. Silent skip when:
 #   - group already exists and SUDO_USER is already a member (re-run);
 #   - $SUDO_USER is unset (running directly as root, no invoking user
 #     to add — e.g. the CI image build path).
-# Containerized installs without shadow-utils are warned but don't
-# fail: the install's primary job is the timer, and history reads
-# via sudo still work.
+#
+# Hard-fail (die) when groupadd fails: the systemd unit references
+# Group=boxaudit, so a missing group would make the verify gate fail
+# with a misleading systemctl error. Better to surface the real cause
+# here.
 ensure_boxaudit_group() {
     if ! getent group "$BOXAUDIT_GROUP" >/dev/null; then
         if ! groupadd --system "$BOXAUDIT_GROUP" 2>/dev/null; then
-            say "  WARN: could not create $BOXAUDIT_GROUP group (shadow-utils missing?) — history reads will require sudo"
-            return 0
+            die "could not create $BOXAUDIT_GROUP group (shadow-utils missing or insufficient privileges). Install requires groupadd to provision the read-access group; the systemd unit references Group=$BOXAUDIT_GROUP and will not start without it."
         fi
         say "  created:  $BOXAUDIT_GROUP group"
     fi
@@ -113,22 +116,30 @@ ensure_boxaudit_group() {
         else
             if usermod -aG "$BOXAUDIT_GROUP" "$SUDO_USER" 2>/dev/null; then
                 say "  added:    $SUDO_USER to $BOXAUDIT_GROUP"
+                say "            (log out and back in, or run \`newgrp $BOXAUDIT_GROUP\`, before using --tail/--diff from this session)"
             else
-                say "  WARN: could not add $SUDO_USER to $BOXAUDIT_GROUP — run 'sudo usermod -aG $BOXAUDIT_GROUP $SUDO_USER' manually"
+                die "could not add $SUDO_USER to $BOXAUDIT_GROUP. Run 'sudo usermod -aG $BOXAUDIT_GROUP $SUDO_USER' manually, then re-run install.sh."
             fi
         fi
     fi
 }
 
-# grant_boxaudit_read_perms — idempotent. Sets /var/log/box-audit/ and
-# /var/log/box-audit/history/ to root:$BOXAUDIT_GROUP 0750 and tightens
-# existing files (snapshots, latest.json, install.log, sidecar) to 0640
-# root:$BOXAUDIT_GROUP. Safe to re-run: chown + chmod are no-ops when
-# perms already match.
+# Description: grant_boxaudit_read_perms
+#
+# Idempotent. Sets /var/log/box-audit/ and /var/log/box-audit/history/
+# to root:$BOXAUDIT_GROUP 0750 and tightens existing files (snapshots,
+# latest.json, install.log, sidecar) to 0640 root:$BOXAUDIT_GROUP.
+# Safe to re-run: chown + chmod are no-ops when perms already match.
+#
+# LOG_DIR mode 0750 is set explicitly because mkdir -p inherits the
+# process umask (typically 0022 → 0755), which leaves the boxaudit
+# group as 'other' (r-x) but doesn't establish the dir as
+# intentionally group-gated. 0750 makes the contract visible: only
+# root and the boxaudit group can traverse.
 grant_boxaudit_read_perms() {
     [[ -d "$LOG_DIR" ]] || return 0
     chown "root:$BOXAUDIT_GROUP" "$LOG_DIR" "$LOG_DIR/history" 2>/dev/null || true
-    chmod 0750 "$LOG_DIR/history" 2>/dev/null || true
+    chmod 0750 "$LOG_DIR" "$LOG_DIR/history" 2>/dev/null || true
     # Tighten any existing artifacts to 0640 root:$BOXAUDIT_GROUP. The
     # list is small and explicit — expanding it for every new file
     # type keeps the perm model auditable from one place. Files
