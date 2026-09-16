@@ -32,7 +32,9 @@ BUDGET_MS=$((60 * 1000))
 # Skip detection: try `docker run --rm --privileged alpine true`. A
 # non-zero exit (or no docker on PATH) means the host can't satisfy the
 # tier-3 contract. Print the documented message and exit 0 so
-# test/all.sh can record this as a skip rather than a failure.
+# test/all.sh can record this as a skip rather than a failure. Per
+# issue #25 Q4, skip-detection stays in the driver (the library
+# shouldn't grow knowledge of which drivers want to skip).
 if ! command -v docker >/dev/null 2>&1; then
     echo "local-integration: skipped: requires privileged Docker (docker not on PATH)"
     exit 0
@@ -61,25 +63,19 @@ phase_fail() {
     exit 1
 }
 
-# Throwaway build context so a leftover mutation in WORK can't poison
-# the working tree. Same pattern test/install.sh uses.
-WORK="$(mktemp -d)"
-CID=""
+# shellcheck source=./install-lib.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/install-lib.sh"
+
+# Tier 3 allocates extra mktemps (capture files + the inline JSON probe
+# script) that the library's trap should clean up. Drivers append to
+# LIB_CLEANUP_PATHS BEFORE the first privileged_* call so the trap
+# registration in privileged_prep sees them.
 BA_JSON="$(mktemp)"
 BA_ERR="$(mktemp)"
 SCHEMA_PROBE="$(mktemp)"
 PROBE_SCRIPT="$(mktemp)"
-# SC2015 — A && B || C is intentional: docker rm -f may legitimately
-# return non-zero when the container is already gone, and we don't
-# want the cleanup to fail the run. Same disable as test/install.sh.
-# shellcheck disable=SC2015
-cleanup() {
-    [[ -n "$CID" ]] && docker rm -f "$CID" >/dev/null 2>&1 || true
-    rm -rf "$WORK" "$BA_JSON" "$BA_ERR" "$SCHEMA_PROBE" "$PROBE_SCRIPT"
-}
-trap cleanup EXIT
-
-cp -R "$REPO/." "$WORK/"
+LIB_CLEANUP_PATHS+=("$BA_JSON" "$BA_ERR" "$SCHEMA_PROBE" "$PROBE_SCRIPT")
 
 # Inline JSON-contract probe. Reads the JSON path from argv[1] so the
 # script is decoupled from stdin/stdout of the outer pipeline. Exit
@@ -103,7 +99,7 @@ PY
 # --- phase: build ----------------------------------------------------------
 BUILD_START=$(date +%s%N)
 phase_start build
-if ! docker build -t "$IMAGE_TAG" -f "$REPO/test/install-docker/Dockerfile" "$WORK" >/dev/null 2>"$BA_ERR"; then
+if ! privileged_build "$REPO/test/install-docker/Dockerfile" "$IMAGE_TAG" 2>"$BA_ERR"; then
     phase_fail "build" "$BUILD_START" "docker build failed (see $BA_ERR)"
 fi
 phase_ok "build" "$BUILD_START"
@@ -111,32 +107,13 @@ phase_ok "build" "$BUILD_START"
 # --- phase: boot -----------------------------------------------------------
 BOOT_START=$(date +%s%N)
 phase_start boot
-CID="$(docker run -d --privileged \
-    --cgroupns=host \
-    --tmpfs /run \
-    --tmpfs /var/log \
-    -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-    -v "$WORK":/work \
-    -e container=docker \
-    "$IMAGE_TAG")"
-
-STATE=""
-for _ in $(seq 1 30); do
-    STATE="$(docker exec "$CID" systemctl is-system-running 2>/dev/null || true)"
-    case "$STATE" in
-        running|degraded) break ;;
-    esac
-    sleep 1
-done
-if [[ "$STATE" != "running" && "$STATE" != "degraded" ]]; then
-    phase_fail "boot" "$BOOT_START" "systemd did not become ready (last state: '${STATE:-none}')"
-fi
+privileged_prep "$IMAGE_TAG"
 phase_ok "boot" "$BOOT_START"
 
 # --- phase: install --------------------------------------------------------
 INSTALL_START=$(date +%s%N)
 phase_start install
-if ! docker exec "$CID" /bin/bash -c 'cd /work && bash install.sh --ci' >/dev/null 2>"$BA_ERR"; then
+if ! privileged_exec /bin/bash -c 'cd /work && bash install.sh --ci' >/dev/null 2>"$BA_ERR"; then
     phase_fail "install" "$INSTALL_START" "install.sh --ci exited non-zero (see $BA_ERR)"
 fi
 phase_ok "install" "$INSTALL_START"
@@ -147,7 +124,7 @@ phase_start audit
 # Hit the *installed* binary (/usr/local/bin/box-audit) so the +replay
 # suffix and the JSON contract are exercised against the same surface
 # the daily timer runs, not the repo copy.
-if ! docker exec "$CID" /usr/local/bin/box-audit --json > "$BA_JSON" 2>"$BA_ERR"; then
+if ! privileged_exec /usr/local/bin/box-audit --json > "$BA_JSON" 2>"$BA_ERR"; then
     phase_fail "audit" "$AUDIT_START" "/usr/local/bin/box-audit --json exited non-zero (see $BA_ERR)"
 fi
 # Tier-3 contract 1: emitted JSON parses.
@@ -161,7 +138,7 @@ if ! python3 "$PROBE_SCRIPT" "$BA_JSON" 2>>"$BA_ERR"; then
     phase_fail "audit" "$AUDIT_START" "JSON contract assertion failed (status/timestamp/host/findings)"
 fi
 # Tier-3 contract 3: --version carries +replay on the installed binary.
-VERSION_OUT="$(docker exec "$CID" /usr/local/bin/box-audit --version 2>/dev/null || true)"
+VERSION_OUT="$(privileged_exec /usr/local/bin/box-audit --version 2>/dev/null || true)"
 if [[ "$VERSION_OUT" != *"+replay"* ]]; then
     phase_fail "audit" "$AUDIT_START" "--version missing +replay suffix (got: $VERSION_OUT)"
 fi
