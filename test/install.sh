@@ -4,7 +4,7 @@
 #
 #   bash test/install.sh <image-tag> [sed-mutation]
 #
-# With a mutation, it is applied to install.sh inside a throwaway build
+# With a mutation, it is applied to install.sh inside the throwaway build
 # context first, so the negative variant can prove the verify gate has
 # teeth without touching the working tree.
 set -euo pipefail
@@ -13,57 +13,19 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE_TAG="${1:-box-audit-install:positive}"
 MUTATION="${2:-}"   # sed expression applied to install.sh in the build context
 
-# 1. Throwaway copy of the repo (plus optional mutation) as the build
-#    context. Same directory is mounted at /work in the container below.
-WORK="$(mktemp -d)"
-# SC2015 — A && B || C is intentional: docker rm -f may legitimately
-# return non-zero when the container is already gone, and we don't
-# want the cleanup to fail the run.
-# shellcheck disable=SC2015
-cleanup() {
-    [[ -n "${CID:-}" ]] && docker rm -f "$CID" >/dev/null 2>&1 || true
-    rm -rf "$WORK"
-}
-trap cleanup EXIT
-cp -R "$REPO/." "$WORK/"
+# shellcheck source=./install-lib.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/install-lib.sh"
+
+privileged_build "$REPO/test/install-docker/Dockerfile" "$IMAGE_TAG"
 
 if [[ -n "$MUTATION" ]]; then
     sed -i "$MUTATION" "$WORK/install.sh"
 fi
 
-# 2. Build the image (python3 for the verify gate's JSON parse lives here).
-docker build -t "$IMAGE_TAG" -f "$REPO/test/install-docker/Dockerfile" "$WORK" >/dev/null
+privileged_prep "$IMAGE_TAG"
 
-# 3. Boot the container with its default CMD (/sbin/init) detached, then
-#    exec install.sh into the running system. Running `docker run image
-#    bash -c ...` would replace systemd as PID 1 and systemctl would have
-#    no daemon to talk to; docker exec propagates install.sh's exit code.
-#    Privileged + rw cgroup mount with --cgroupns=host so systemd gets a
-#    working cgroup view (the jrei/systemd-ubuntu README's recipe); tmpfs
-#    on /run and /var/log so each run starts clean (and the --ci tee
-#    target exists in a fresh log dir).
-CID="$(docker run -d --privileged \
-    --cgroupns=host \
-    --tmpfs /run \
-    --tmpfs /var/log \
-    -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-    -v "$WORK":/work \
-    -e container=docker \
-    "$IMAGE_TAG")"
-
-# Wait for systemd to accept commands. "degraded" means booted with some
-# unit failed — fine for our purposes; the gate only judges box-audit.
-STATE=""
-for _ in $(seq 1 30); do
-    STATE="$(docker exec "$CID" systemctl is-system-running 2>/dev/null || true)"
-    case "$STATE" in
-        running|degraded) break ;;
-    esac
-    sleep 1
-done
-if [[ "$STATE" != "running" && "$STATE" != "degraded" ]]; then
-    echo "test/install.sh: systemd did not become ready (last state: '${STATE:-none}')" >&2
-    exit 1
-fi
-
-docker exec "$CID" /bin/bash -c 'cd /work && bash install.sh --ci'
+# Run `docker run image bash -c ...` would replace systemd as PID 1 and
+# systemctl would have no daemon to talk to; docker exec propagates
+# install.sh's exit code into this shell under `set -e`.
+privileged_exec /bin/bash -c 'cd /work && bash install.sh --ci'
