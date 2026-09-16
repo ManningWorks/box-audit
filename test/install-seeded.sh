@@ -181,4 +181,41 @@ if ! python3 "$REPO/test/install-seeded/assert-json.py" < "$BA_JSON"; then
     exit 1
 fi
 
+# 9. Regression: box-audit --init must populate timers-baseline.txt
+# with the actual .timer units from `systemctl list-timers --all`.
+# Before issue #12 was fixed, --init silently wrote 0 bytes (python
+# IndentationError in the init block's python3 -c heredoc); the seeded
+# install.sh filled the file with 21 lines from its own seed, so the
+# regression stayed invisible until someone ran --init manually on a
+# seeded box. The assertion below runs --init against a wiped file
+# and compares against a fresh filter of `systemctl list-timers` so
+# any future regression of this class fails the tier-2 gate.
+docker exec "$CID" /bin/bash -c '
+    set -e
+    : > /var/lib/box-audit/timers-baseline.txt
+    /usr/local/bin/box-audit --init >/dev/null
+' || { echo "test/install-seeded.sh: box-audit --init failed post-wipe" >&2; exit 1; }
+
+INIT_LINES="$(docker exec "$CID" /bin/bash -c '/usr/bin/wc -l < /var/lib/box-audit/timers-baseline.txt')"
+if [[ "${INIT_LINES:-0}" -eq 0 ]]; then
+    echo "test/install-seeded.sh: timers-baseline.txt is empty after --init (regression of issue #12)" >&2
+    exit 1
+fi
+
+EXPECTED="$(docker exec "$CID" /bin/bash -c '
+    /usr/bin/systemctl list-timers --all --no-pager --no-legend --output json 2>/dev/null \
+        | /usr/bin/python3 -c "import sys,json
+for r in json.load(sys.stdin):
+    u=r.get(\"unit\",\"\")
+    if u.endswith(\".timer\"): print(u)"' | /usr/bin/sort -u)"
+ACTUAL="$(docker exec "$CID" /bin/bash -c '/usr/bin/sort -u /var/lib/box-audit/timers-baseline.txt')"
+if [[ "$EXPECTED" != "$ACTUAL" ]]; then
+    echo "test/install-seeded.sh: --init output does not match 'systemctl list-timers --all | .timer filter'" >&2
+    echo "--- expected ---" >&2
+    echo "$EXPECTED" >&2
+    echo "--- actual ---" >&2
+    echo "$ACTUAL" >&2
+    exit 1
+fi
+
 echo "test/install-seeded.sh: seeded-container integration PASSED"
