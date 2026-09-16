@@ -1,0 +1,27 @@
+name: release-check
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  tag-current:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history so the local git tag lookup below sees
+          # every pushed tag, not just the ones reachable from the
+          # shallow clone.
+          fetch-depth: 0
+
+      - name: VERSION must have a matching tag on origin
+        run: |
+          VERSION=$(cat VERSION)
+          if ! git ls-remote --tags origin "v${VERSION}" | grep -q .; then
+            echo "::error::VERSION=${VERSION} but tag v${VERSION} is not on origin"
+            echo "::error::bump VERSION and tag in the same release:"
+            echo "::error::  git tag -a v${VERSION} <bump-commit>"
+            echo "::error::  git push origin --tags"
+            exit 1
+          fi

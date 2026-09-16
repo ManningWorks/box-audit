@@ -313,5 +313,7 @@ whether to upgrade.
 
 Earlier versions predate this changelog; see git history.
 
-[unreleased]: https://github.com/ManningWorks/box-audit/compare/v0.4.0...HEAD
+[unreleased]: https://github.com/ManningWorks/box-audit/compare/v0.6.0...HEAD
 [0.4.0]: https://github.com/ManningWorks/box-audit/releases/tag/v0.4.0
+[0.5.0]: https://github.com/ManningWorks/box-audit/releases/tag/v0.5.0
+[0.6.0]: https://github.com/ManningWorks/box-audit/releases/tag/v0.6.0
