@@ -1257,6 +1257,13 @@ try:
 except Exception:
     pass
 ' "$json_text" 2>/dev/null
+    # Tighten perms to 0640 root:boxaudit: python's open() inherits
+    # the parent umask (typically 0022 under the root systemd unit),
+    # so the file would otherwise end up 0644 world-readable. Chmod
+    # handles mode; chown handles group ownership for the non-systemd
+    # path where the effective GID isn't boxaudit.
+    /usr/bin/chmod 0640 "$HISTORY_DIR/.latest-counts.json" 2>/dev/null || true
+    /usr/bin/chown :"$BOXAUDIT_GROUP" "$HISTORY_DIR/.latest-counts.json" 2>/dev/null || true
     return 0
 }
 
@@ -1269,19 +1276,29 @@ except Exception:
 # filename. Retention window: 30 days of history, which covers any
 # --diff [N] a human will realistically ask for.
 #
+# Perm shape: 0640 root:boxaudit — readable by the boxaudit group so
+# non-root users can run `box-audit --tail` / `--diff` without sudo.
+# The systemd unit sets Group=boxaudit + UMask=0037 so its writes
+# land at this perm naturally; the explicit chown below covers the
+# non-systemd path (`sudo box-audit --json` from a shell, where
+# root's effective GID is root, not boxaudit).
+#
 # Args: $1 = full JSON document (as printed by --json)
 # Best-effort like every history operation: failures are silent.
 HISTORY_RETENTION_DAYS=30
+BOXAUDIT_GROUP="boxaudit"
 history_write() {
     local json_text="$1"
     /usr/bin/mkdir -p "$HISTORY_DIR" 2>/dev/null || return 0
     [[ -d "$HISTORY_DIR" ]] || return 0
-    # Write under a 077 umask: snapshots carry host info, findings and IP
-    # samples — 0600 like the integrity baseline, regardless of the process
-    # umask (0644 under the root unit). Subshell keeps the rest of the run
-    # unaffected.
-    ( umask 077; /usr/bin/printf '%s\n' "$json_text" \
+    # Write under a 037 umask: 0640 mode regardless of the caller's
+    # umask. The integrity baseline is the documented exception —
+    # 0600 because it contains /etc/shadow hashes. Subshell keeps the
+    # rest of the run unaffected.
+    ( umask 037; /usr/bin/printf '%s\n' "$json_text" \
         > "$HISTORY_DIR/$(/usr/bin/date -u +%Y-%m-%d).json" ) 2>/dev/null || return 0
+    /usr/bin/chown :"$BOXAUDIT_GROUP" \
+        "$HISTORY_DIR/$(/usr/bin/date -u +%Y-%m-%d).json" 2>/dev/null || true
     # Retention: delete snapshots older than the window. -mtime +30 =
     # strictly older than 30 days, so 31 calendar files remain.
     /usr/bin/find "$HISTORY_DIR" -maxdepth 1 -type f -name '????-??-??.json' \

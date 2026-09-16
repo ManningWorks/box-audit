@@ -97,6 +97,40 @@ whether to upgrade.
   replay deltas) and document the gaps for T03 rather than patching
   around them.
 
+### Fixed
+
+- `--tail` / `--diff` worked under sudo but failed for the operator
+  who installed the tool: history snapshots landed as
+  `drwxr-x--- root:root` 0600, so a non-root user running `--tail`
+  saw `find: Permission denied` on stderr even though the script's
+  documented `flag_degraded` machinery already supports non-root
+  runs for `--json`. Install now creates a `boxaudit` system group,
+  adds the invoking `$SUDO_USER` to it, and lands every audit
+  artifact (`/var/log/box-audit/latest.json`, history snapshots,
+  the sidecar, install.log) as `root:boxaudit 0640` so non-root
+  operators can read history without sudo. The systemd unit picks
+  up `Group=boxaudit UMask=0037` for future runs. The integrity
+  baseline is the documented exception — it stays root-only 0600
+  because it contains `/etc/shadow` hashes (offline password
+  oracle; see `report_integrity()`). Existing installs: re-run
+  `sudo ./install.sh` to migrate (idempotent; perms tighten in
+  place, group added if missing). Note: `usermod -aG` updates the
+  group database but not the current login session — after install,
+  open a new shell or run `newgrp boxaudit` before `box-audit
+  --tail` will work from that session. Smoke: the two `--tail`
+  assertions go from FAIL to PASS on installed hosts; bare CI
+  runners unchanged (issue #24).
+
+  Scope note: issue #24's "Out of scope" listed the install perm
+  change explicitly, but on review that section was authored under
+  the (then-plausible) framing of "make the script tolerate the
+  perm." The script's documented `flag_degraded` contract already
+  supports non-root runs for `--json`, so the install-layer fix is
+  the consistent one. The script's stderr behavior for unauthorized
+  readers is unchanged — they still get `find: Permission denied`,
+  which is the correct signal that they should be added to
+  `boxaudit` rather than granted blanket history access.
+
 ## [0.6.0] - 2026-09-15
 
 ### Added
