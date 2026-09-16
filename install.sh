@@ -39,6 +39,12 @@ VERSION_MARKER="$VERSION_MARKER_DIR/version"
 SERVICE_UNIT="/etc/systemd/system/box-audit.service"
 TIMER_UNIT="/etc/systemd/system/box-audit.timer"
 LOG_DIR="/var/log/box-audit"
+# Purpose-built group for non-root users who need to read audit history
+# (`box-audit --tail`, `--diff`) without sudo. The box-audit service unit
+# runs as root and writes snapshots; the group grants the install-time
+# user read access. Integrity baseline stays root-only (0600/0700) because
+# it contains /etc/shadow hashes — see report_integrity().
+BOXAUDIT_GROUP="boxaudit"
 
 SERVICE_UNIT_CONTENT='[Unit]
 Description=box-audit daily system health + security check
@@ -48,6 +54,13 @@ After=network-online.target
 [Service]
 Type=oneshot
 User=root
+# Group=boxaudit + UMask=0037 make every file the service creates
+# (latest.json via StandardOutput, history snapshots, sidecar) land as
+# root:boxaudit 0640 — readable by the boxaudit group so non-root users
+# can run box-audit --tail / --diff without sudo. BOXAUDIT_GROUP and
+# scripts/box-audit.sh history_write() own the perms logic.
+Group=boxaudit
+UMask=0037
 # truncate:, not file: — file: never truncates, so a shorter JSON document
 # following a longer one leaves stale bytes glued to the end and the file
 # stops parsing. truncate: cuts on service start.
@@ -75,6 +88,63 @@ WantedBy=timers.target
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
+
+# ensure_boxaudit_group — idempotent. Creates the BOXAUDIT_GROUP if it
+# doesn't exist (--system, so it's not in /etc/gshadow but does show up
+# in getent). Adds the invoking user ($SUDO_USER) so they can read
+# history without sudo. Silent skip when:
+#   - group already exists and SUDO_USER is already a member (re-run);
+#   - $SUDO_USER is unset (running directly as root, no invoking user
+#     to add — e.g. the CI image build path).
+# Containerized installs without shadow-utils are warned but don't
+# fail: the install's primary job is the timer, and history reads
+# via sudo still work.
+ensure_boxaudit_group() {
+    if ! getent group "$BOXAUDIT_GROUP" >/dev/null; then
+        if ! groupadd --system "$BOXAUDIT_GROUP" 2>/dev/null; then
+            say "  WARN: could not create $BOXAUDIT_GROUP group (shadow-utils missing?) — history reads will require sudo"
+            return 0
+        fi
+        say "  created:  $BOXAUDIT_GROUP group"
+    fi
+    if [[ -n "${SUDO_USER:-}" ]] && id "$SUDO_USER" >/dev/null 2>&1; then
+        if id -nG "$SUDO_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$BOXAUDIT_GROUP"; then
+            say "  unchanged: $SUDO_USER is in $BOXAUDIT_GROUP"
+        else
+            if usermod -aG "$BOXAUDIT_GROUP" "$SUDO_USER" 2>/dev/null; then
+                say "  added:    $SUDO_USER to $BOXAUDIT_GROUP"
+            else
+                say "  WARN: could not add $SUDO_USER to $BOXAUDIT_GROUP — run 'sudo usermod -aG $BOXAUDIT_GROUP $SUDO_USER' manually"
+            fi
+        fi
+    fi
+}
+
+# grant_boxaudit_read_perms — idempotent. Sets /var/log/box-audit/ and
+# /var/log/box-audit/history/ to root:$BOXAUDIT_GROUP 0750 and tightens
+# existing files (snapshots, latest.json, install.log, sidecar) to 0640
+# root:$BOXAUDIT_GROUP. Safe to re-run: chown + chmod are no-ops when
+# perms already match.
+grant_boxaudit_read_perms() {
+    [[ -d "$LOG_DIR" ]] || return 0
+    chown "root:$BOXAUDIT_GROUP" "$LOG_DIR" "$LOG_DIR/history" 2>/dev/null || true
+    chmod 0750 "$LOG_DIR/history" 2>/dev/null || true
+    # Tighten any existing artifacts to 0640 root:$BOXAUDIT_GROUP. The
+    # list is small and explicit — expanding it for every new file
+    # type keeps the perm model auditable from one place. Files
+    # written after this function runs (e.g. latest.json from the
+    # verify-gate systemctl start) are handled by the systemd unit's
+    # Group=boxaudit + UMask=0037, which lands them at the right perm
+    # without any extra wiring.
+    local f
+    for f in "$LOG_DIR/latest.json" "$LOG_DIR/install.log" \
+             "$LOG_DIR/history"/*.json \
+             "$LOG_DIR/history"/.latest-counts.json; do
+        [[ -f "$f" ]] || continue
+        chown "root:$BOXAUDIT_GROUP" "$f" 2>/dev/null || true
+        chmod 0640 "$f" 2>/dev/null || true
+    done
+}
 
 # install_file <src|content-mode> ... — compare-then-write helper.
 # Skips the write (and the daemon-reload trigger) when the target is already
@@ -207,6 +277,16 @@ mkdir -p "$LOG_DIR"
 # sweep daily snapshots. The script writes here on every --json run.
 mkdir -p "$LOG_DIR/history"
 
+# 2b. Non-root read access for history snapshots. Create the
+# `boxaudit` group, add the installing user, and tighten perms on any
+# existing artifacts (upgrade path). This is what makes
+# `box-audit --tail` / `--diff` work without sudo for the operator
+# who installed the tool. The integrity baseline is root-only (0600)
+# — see report_integrity() for why.
+say "  group setup:"
+ensure_boxaudit_group
+grant_boxaudit_read_perms
+
 # 3. Units. On upgrades, preserve a customized OnCalendar rather than
 #    silently resetting the user's schedule.
 TIMER_CHANGED=0
@@ -265,3 +345,12 @@ if [[ $CI_MODE -eq 1 ]]; then
 else
     say "box-audit v$VERSION $([[ -f $SCRIPT_DST ]] && echo ready — report at $LOG_DIR/latest.json)"
 fi
+# Tighten install.log + latest.json perms to match the rest of the
+# artifact tree. Both files are written late in the install
+# (install.log via tee at the very end, latest.json via the verify
+# gate's systemctl start), so the earlier grant_boxaudit_read_perms
+# call hasn't seen them yet. The systemd unit's Group=boxaudit +
+# UMask=0037 handles future runs; these explicit chowns cover the
+# file produced by *this* install invocation.
+chown "root:$BOXAUDIT_GROUP" /var/log/box-audit/install.log /var/log/box-audit/latest.json 2>/dev/null || true
+chmod 0640 /var/log/box-audit/install.log /var/log/box-audit/latest.json 2>/dev/null || true
