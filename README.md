@@ -266,13 +266,28 @@ also the contract the cron should follow.
 
 ## CI
 
-Every push and PR runs two GitHub Actions workflows: `ci.yml` runs
-`test/smoke.sh` (shellcheck plus the degraded-path suite) on a bare
-non-root runner. The `install-ci` workflow additionally runs
-`install.sh --ci` inside a privileged
-systemd container (`jrei/systemd-ubuntu:24.04`) on every push and PR, plus a
-negative variant that mutates `ExecStart=` to confirm the verify gate fails
-loudly. Dependabot bumps the base image weekly.
+Three GitHub Actions workflows, one per tier of the #14 three-tier test
+model — each catches a different class of regression:
+
+- **`smoke`** (`ci.yml`) — runs `test/smoke.sh` on a bare non-root
+  runner. Covers the audit's degraded-path surface (empty history,
+  unparseable JSON, missing binaries) and shellcheck across the shipped
+  shell surface. Cheap; runs on every push and PR.
+- **`install-ci`** (`install.yml`) — runs `install.sh --ci` inside a
+  privileged `jrei/systemd-ubuntu:24.04` container plus a negative
+  variant that mutates `ExecStart=` to confirm the verify gate fails
+  loudly. Exercises the full install path on a real systemd.
+- **`integration-seeded`** (`integration-seeded.yml`, issue #17) —
+  boots a seeded container that produces a known mix of findings, then
+  asserts via `test/install-seeded/assert-json.py` that the expected
+  eight `check_id`s appear with the expected severities. Negative
+  variant sed-mutates one seeded condition in a throwaway build
+  context and inverts the resulting driver failure into a pass — the
+  proof that the gate has teeth. Catches regressions the other two
+  tiers cannot, because ephemeral runners have no filesystem state
+  to exercise.
+
+Dependabot bumps the base image weekly.
 
 ## What it does NOT do
 

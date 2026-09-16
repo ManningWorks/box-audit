@@ -46,6 +46,27 @@ whether to upgrade.
 - `test/smoke.sh` — one new assertion: the property suite runs green and
   under 5 seconds (33 total). The existing shellcheck assertion now also
   covers the property-suite files.
+- **Tier 2 seeded-container integration** (`.github/workflows/integration-seeded.yml`,
+  issue #17, third vertical slice of the #14 three-tier test model). A
+  privileged container on top of the existing
+  `test/install-docker/Dockerfile` base adds fail2ban + docker.io +
+  rsyslog + cron + sudo + iproute2 and seeds eight specific conditions:
+  stale apt cache stamp, unexpected cron drop-in, root crontab entry,
+  failed systemd unit, banned SSH IP, sixteen auth-fail journal entries,
+  non-allowlisted listening port, and a baseline-integrity diff.
+  `test/install-seeded.sh` (driver) builds the seeded image, boots the
+  container, runs `install.sh --ci`, then captures `box-audit --json`
+  and pipes it through `test/install-seeded/assert-json.py` which
+  asserts the expected `check_id`s appear with the expected severities.
+  A second workflow job, `integration-seeded-regression`, sed-mutates
+  one seeded condition in a throwaway build context and inverts the
+  resulting driver failure into a pass — proving the gate has teeth.
+  Catches regressions that tier 1 cannot (no filesystem state to
+  exercise on ephemeral runners).
+- `test/smoke.sh` — shellcheck glob extended to cover the two install
+  drivers (`test/install.sh`, `test/install-seeded.sh`); the matching
+  `SC2015 disable=…` comment is added to `test/install.sh`'s cleanup
+  trap to match the one already in the seeded driver.
 
 ### Changed
 
