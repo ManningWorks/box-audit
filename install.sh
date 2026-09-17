@@ -126,6 +126,7 @@ die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 # never fail the install.
 warn_stale_group_processes() {
     local user="$1" gid="$2"
+    [[ -n "$gid" ]] || return 0   # unresolvable gid → scan nothing rather than flag everything
     local min_age="${STALE_PROC_MIN_AGE:-3600}"
     command -v pgrep >/dev/null 2>&1 || return 0
     command -v stat   >/dev/null 2>&1 || return 0
