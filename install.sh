@@ -89,6 +89,99 @@ WantedBy=timers.target
 say() { printf '%s\n' "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
+# Description: warn_stale_group_processes <user> <gid>
+#
+# Best-effort, warn-only. Linux resolves a process's supplementary group
+# list at exec time, so every process <user> started BEFORE the usermod
+# keeps its old group list — missing <gid> — until it restarts. That
+# stale-group window caused the 2026-09-17 incident: a 9-day-old daemon
+# got Permission denied reading group-readable audit artifacts and the
+# installer output pointed nowhere. This scan closes that blind spot.
+#
+# For each pid owned by <user> (pgrep -u, so kernel threads and other
+# users are out by construction): if the process is older than
+# STALE_PROC_MIN_AGE seconds (default 3600; env-overridable like the
+# audit script's LOAD_THRESHOLD-style overrides, so the docker install
+# harness can exercise it without waiting an hour) AND its
+# /proc/<pid>/status "Groups:" line lacks the new gid, list it — pid,
+# age, command. Nothing matching → nothing printed (no empty header).
+#
+# The gid comparison splits the Groups: value on whitespace and compares
+# whole tokens. A regex like [[ "$groups" =~ $gid ]] would substring-
+# match gid 142 against 42 and false-positive.
+#
+# Reads /proc/<pid>/status (the main thread's status file); walking
+# task/*/status adds nothing — supplementary groups are per-process.
+#
+# systemd --user caveat: a process running under the user's user-manager
+# (systemd --user) inherits its supplementary groups from the
+# user-manager, which started at login. Restarting just the consumer
+# process may therefore NOT pick up the new group — a re-login, or
+# `systemctl --user daemon-reexec` first, may be needed. Comment-only
+# knowledge: the printed warning stays simple and suggests restart /
+# re-login.
+#
+# Best-effort contract: missing pgrep/stat, unreadable /proc entries,
+# vanished pids — all skipped silently. Always returns 0; the scan can
+# never fail the install.
+warn_stale_group_processes() {
+    local user="$1" gid="$2"
+    [[ -n "$gid" ]] || return 0   # unresolvable gid → scan nothing rather than flag everything
+    local min_age="${STALE_PROC_MIN_AGE:-3600}"
+    # Non-numeric override would trip set -u arithmetic and kill the
+    # install — sanitize back to the default instead.
+    [[ "$min_age" =~ ^[0-9]+$ ]] || min_age=3600
+    command -v pgrep >/dev/null 2>&1 || return 0
+    command -v stat   >/dev/null 2>&1 || return 0
+    [[ -d /proc ]] || return 0
+
+    local now pid groups_line groups g has_gid age_secs line
+    now="$(date +%s)"
+    local stale=()
+    for pid in $(pgrep -u "$user" 2>/dev/null); do
+        # Groups: line of the main thread's status file. Command failure
+        # (vanished pid, /proc race) → skip; a *missing* Groups: line is
+        # exotic-kernel territory → skip too. An EMPTY group list is NOT
+        # a skip: a process with no supplementary groups genuinely lacks
+        # the new gid (usermod -aG adds it as supplementary) and belongs
+        # in the warning — daemons commonly run this way (e.g. pid 1).
+        groups_line="$(awk '/^Groups:/{ print; exit }' "/proc/$pid/status" 2>/dev/null)" || continue
+        [[ -n "$groups_line" ]] || continue
+        groups="${groups_line#Groups:}"
+        has_gid=0
+        for g in $groups; do
+            [[ "$g" == "$gid" ]] && { has_gid=1; break; }
+        done
+        (( has_gid )) && continue
+        # Age from the mtime of /proc/<pid> (kernel pokes it at start).
+        age_secs=$(( now - $(stat -c %Y "/proc/$pid" 2>/dev/null || echo "$now") ))
+        (( age_secs < min_age )) && continue
+        # Command from the status file's Name: line — /proc/<pid>/cmdline
+        # is NUL-separated and awkward in pure bash, and Name: is what
+        # ps shows for kernels threads anyway.
+        line="$(awk '/^Name:/{ $1=""; sub(/^ /, ""); print; exit }' "/proc/$pid/status" 2>/dev/null)" || continue
+        stale+=("$(printf '   pid %s (%s) — %s' "$pid" "$(humanize_age "$age_secs")" "$line")")
+    done
+    (( ${#stale[@]} > 0 )) || return 0
+    say "⚠ ${#stale[@]} long-running process(es) owned by $user won't see the new group until restarted:"
+    local s
+    for s in "${stale[@]}"; do say "$s"; done
+    say "   (restart these, or log out and back in, before expecting $BOXAUDIT_GROUP group access)"
+    return 0
+}
+
+# humanize_age <seconds> — "9d", "5h", "3m" style for the warning lines.
+humanize_age() {
+    local secs="$1"
+    if (( secs >= 86400 )); then
+        printf '%dd' $(( secs / 86400 ))
+    elif (( secs >= 3600 )); then
+        printf '%dh' $(( secs / 3600 ))
+    else
+        printf '%dm' $(( secs / 60 ))
+    fi
+}
+
 # Description: ensure_boxaudit_group
 #
 # Idempotent. Creates the BOXAUDIT_GROUP if it doesn't exist
@@ -117,6 +210,9 @@ ensure_boxaudit_group() {
             if usermod -aG "$BOXAUDIT_GROUP" "$SUDO_USER" 2>/dev/null; then
                 say "  added:    $SUDO_USER to $BOXAUDIT_GROUP"
                 say "            (log out and back in, or run \`newgrp $BOXAUDIT_GROUP\`, before using --tail/--diff from this session)"
+                # Warn-only scan of the user's pre-usermod processes —
+                # see warn_stale_group_processes above for why and how.
+                warn_stale_group_processes "$SUDO_USER" "$(getent group "$BOXAUDIT_GROUP" | cut -d: -f3)"
             else
                 die "could not add $SUDO_USER to $BOXAUDIT_GROUP. Run 'sudo usermod -aG $BOXAUDIT_GROUP $SUDO_USER' manually, then re-run install.sh."
             fi
