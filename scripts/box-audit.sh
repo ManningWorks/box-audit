@@ -25,6 +25,16 @@ UPDATE_THRESHOLD=20
 APT_CACHE_STALE_SECS=172800   # 48h — flag if apt cache hasn't refreshed
 TIMER_DRIFT_SECS=104400       # 26h — flag if apt-daily.timer hasn't fired
 
+# Install group for the 0640 root:boxaudit audit-output layout (issue #32).
+# Env-overridable for the property suite, same shape as install.sh's
+# STALE_PROC_MIN_AGE override — the tests can't create real groups on a
+# bare CI runner, so they point this at the invoking user's own group.
+BOXAUDIT_GROUP="${BOXAUDIT_GROUP:-boxaudit}"
+# --check-groups: only report processes at least this old (seconds). Matches
+# install.sh's stale-scan default; env-overridable so the property suite can
+# plant an "old" process without waiting an hour.
+STALE_PROC_MIN_AGE="${STALE_PROC_MIN_AGE:-3600}"
+
 # How long any single external command is allowed to run before we give up
 # on it and report it as degraded, rather than let cron hang indefinitely.
 # --preserve-status means timeout returns the inner command's exit code
@@ -136,6 +146,11 @@ Usage: $(/usr/bin/basename "$0") [OPTIONS]
                                alone for a today-only run summary; with
                                --diff [N] for an N-positions-earlier diff.
   --print-schema               Emit the severity + check_id mapping as JSON.
+  --check-groups               Diagnose stale group membership (issue #32):
+                               does this process's group list contain the
+                               boxaudit gid, and which of the invoking
+                               user's own long-running processes lack it?
+                               Read-only; never restarts anything.
 
 Exit codes: 0 = all clear (or manage-op success), 1 = findings present,
              2 = bad CLI flag. (--json mode always exits 0; see status field.)
@@ -192,6 +207,12 @@ EOF
                     fi ;;
                                 --print-schema)
                                     PRINT_SCHEMA=1; shift ;;
+                --check-groups)
+                    # Issue #32: standalone stale-group-membership probe.
+                    # Read-only, self + own processes only, exits 0 either
+                    # way ("stale" is a finding, not a failure). One line in
+                    # the parser, one dispatch block near --tail/--diff.
+                    CHECK_GROUPS_MODE=1; shift ;;
                 *) /usr/bin/echo "Unknown arg: $1 (try --help)" >&2; exit 2 ;;
             esac
         done
@@ -511,6 +532,107 @@ except Exception:
         }
         if [[ -n "${REPLAY_DIR:-}" ]]; then
             run_replay "$REPLAY_DIR"
+            exit $?
+        fi
+
+        # --- Stale-group self-diagnosis (issue #32) ----------------------------
+        # The 2026-09-17 incident class: supplementary groups are resolved at
+        # exec time, so a long-running consumer started before `usermod -aG
+        # boxaudit` keeps failing with EACCES on the 0640 root:boxaudit
+        # outputs even though the group membership is correctly recorded in
+        # /etc/group. The fix is a restart (or, under systemd --user, a
+        # `daemon-reexec`/re-login — the user-manager passes its own group
+        # list down, so restarting the consumer alone doesn't help). This
+        # block makes the failure self-diagnosing; it never fixes anything
+        # itself (observe-never-remediate).
+        #
+        # gid_is_in_groups <gid> <groups-line> — token match, never substring.
+        # install.sh's warn_stale_group_processes carries the same care: a
+        # regex like [[ "$groups" =~ $gid ]] would match gid 42 inside 142.
+        gid_is_in_groups() {
+            local gid="$1" groups_line="$2" g
+            for g in $groups_line; do
+                [[ "$g" == "$gid" ]] && return 0
+            done
+            return 1
+        }
+
+        # check_stale_groups — standalone staleness probe, exposed as
+        # `--check-groups`. Two questions, read-only, both about the
+        # INVOKING user only (a whole-box scan is the installer's job at
+        # install time; scanning other users is out of scope):
+        #
+        #   1. Does this process's own group list (from /proc/self/status,
+        #      the same file the consumer-prompt recipe tells the agent to
+        #      read) contain the boxaudit gid?
+        #   2. Which of the user's own long-running processes still lack it?
+        #
+        # Prints a human-readable verdict and exits 0 either way — "you are
+        # stale" is a finding, not a failure. Best-effort: missing tools,
+        # unreadable /proc entries, vanished pids are skipped silently.
+        # Observe-never-remediate: no kills, no re-exec, no signaling.
+        check_stale_groups() {
+            local groups_line
+            groups_line="$(awk '/^Groups:/{ print $2; exit }' /proc/self/status 2>/dev/null)"
+            if [[ -z "$groups_line" ]]; then
+                echo "box-audit: cannot read own group list from /proc/self/status — cannot diagnose"
+                return 1
+            fi
+            # Resolve the group NAME to its numeric gid. Accepts a numeric
+            # override too (the property suite passes its own gid through
+            # BOXAUDIT_GROUP when no real boxaudit group exists).
+            local gid
+            gid="$(getent group "$BOXAUDIT_GROUP" 2>/dev/null | awk -F: '{print $3}')"
+            [[ -z "$gid" ]] && gid="$BOXAUDIT_GROUP"
+            if gid_is_in_groups "$gid" "$groups_line"; then
+                echo "box-audit: this process's groups include $BOXAUDIT_GROUP (gid $gid) — no stale-membership problem here"
+            else
+                echo "box-audit: STALE GROUP MEMBERSHIP — this process started before the $BOXAUDIT_GROUP group was added."
+                echo "  Restart the consumer (Hermes cron agent); if it runs under systemd --user, run"
+                echo "  'systemctl --user daemon-reexec' first, or log out and back in. Until then it cannot"
+                echo "  read the 0640 root:$BOXAUDIT_GROUP audit outputs no matter what /etc/group says."
+            fi
+            # Whole-box-of-own-processes scan: same loop shape as install.sh's
+            # warn_stale_group_processes, minus the warning formatting. An
+            # EMPTY group list is stale by definition (usermod -aG adds the
+            # group as supplementary) — daemons commonly run that way.
+            local now pid has_gid age_secs name
+            command -v pgrep >/dev/null 2>&1 || return 0
+            command -v stat  >/dev/null 2>&1 || return 0
+            [[ -d /proc ]] || return 0
+            now="$(date +%s)"
+            local stale_count=0
+            local me
+            me="$(id -un)"
+            for pid in $(pgrep -u "$me" 2>/dev/null); do
+                local pgroups
+                pgroups="$(awk '/^Groups:/{ $1=""; sub(/^ /, ""); print; exit }' "/proc/$pid/status" 2>/dev/null)" || continue
+                # Missing Groups: line (exotic kernel) → skip; empty list → stale.
+                if [[ -z "$pgroups" ]]; then
+                    has_gid=0
+                    if ! grep -q '^Groups:' "/proc/$pid/status" 2>/dev/null; then
+                        continue
+                    fi
+                elif gid_is_in_groups "$gid" "$pgroups"; then
+                    continue
+                else
+                    has_gid=0
+                fi
+                (( has_gid )) && continue
+                age_secs=$(( now - $(stat -c %Y "/proc/$pid" 2>/dev/null || echo "$now") ))
+                (( age_secs < STALE_PROC_MIN_AGE )) && continue
+                name="$(awk '/^Name:/{ $1=""; sub(/^ /, ""); print; exit }' "/proc/$pid/status" 2>/dev/null)" || continue
+                if (( stale_count == 0 )); then
+                    echo "box-audit: long-running process(es) owned by $me that won't see the $BOXAUDIT_GROUP group until restarted:"
+                fi
+                echo "   pid $pid ($name) — started $((age_secs / 3600))h ago"
+                stale_count=$(( stale_count + 1 ))
+            done
+            return 0
+        }
+
+        if [[ -n "${CHECK_GROUPS_MODE:-}" ]]; then
+            check_stale_groups
             exit $?
         fi
 
@@ -1286,7 +1408,6 @@ except Exception:
 # Args: $1 = full JSON document (as printed by --json)
 # Best-effort like every history operation: failures are silent.
 HISTORY_RETENTION_DAYS=30
-BOXAUDIT_GROUP="boxaudit"
 history_write() {
     local json_text="$1"
     /usr/bin/mkdir -p "$HISTORY_DIR" 2>/dev/null || return 0

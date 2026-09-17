@@ -9,6 +9,34 @@ whether to upgrade.
 
 ### Added
 
+- **Stale-group self-diagnosis** (issue #32). Supplementary groups are
+  resolved at exec time, so a long-running consumer started before
+  `usermod -aG boxaudit` keeps hitting Permission denied on the 0640
+  root:boxaudit outputs even though /etc/group is correct — the 2026-09-17
+  incident, where the error fallback pointed at the systemd timer, which
+  was fine. Two surfaces:
+  - `box-audit --check-groups` — read-only diagnosis for an
+    already-installed box: does the invoking process's own group list
+    (`/proc/self/status`, whole-token gid match) contain the boxaudit
+    gid, and which of the invoking user's own long-running processes
+    (`STALE_PROC_MIN_AGE`, default 3600s) still lack it. Exits 0 either
+    way; never restarts, signals, or re-execs anything, and never scans
+    other users' processes.
+  - The README's Hermes consumer recipe now self-diagnoses on EACCES:
+    absent gid → "stale process group membership" with the
+    `systemctl --user daemon-reexec` / re-login guidance (a bare consumer
+    restart is NOT enough under systemd --user — the user-manager passes
+    its own group list down); gid present → perm-drift message pointing
+    at the 0640 root:boxaudit layout. Missing/empty/unparseable files
+    keep pointing at the timer, which is still the right first suspect
+    for that class.
+- `test/properties/system.check_groups.sh` — exercises both EACCES
+  verdict branches (gid present / gid absent) plus the whole-token match
+  (the absent test gid substring-contains a real one, so a substring
+  matcher would false-positive) and the exit-0-on-both-branches contract.
+  Uses the `BOXAUDIT_GROUP` / `STALE_PROC_MIN_AGE` env seams; no root,
+  no new groups, no hour-long sleeps on CI.
+
 - **Property-test suite** (`test/properties/`, issue #16, part of the
   #14 three-tier test model). One bash test file per check family — the
   ten families named in the issue: `resources.disk_high`,
