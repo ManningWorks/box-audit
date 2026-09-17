@@ -5,7 +5,7 @@ All notable changes to box-audit are documented here. The format follows
 grouped by kind, not by PR, and are written for the person deciding
 whether to upgrade.
 
-## [0.7.0] - unreleased
+## [0.7.0] - 2026-09-18
 
 ### Added
 
