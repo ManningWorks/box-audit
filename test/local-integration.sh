@@ -157,14 +157,16 @@ phase_ok "audit" "$AUDIT_START"
 #      and the trailing restart hint appear in the output.
 #   2. warn-doesn't-fire: same setup but STALE_PROC_MIN_AGE=999999 — the
 #      seed process is younger than the threshold, so no warning header.
+#      (`deluser seeduser boxaudit` first — otherwise the install would
+#      take the `unchanged:` path and the no-header assertion would be
+#      vacuous.)
+#   3. unchanged: re-run — seeduser back in the group → `unchanged:`
+#      path; the scan must not run at all, even at threshold 0.
 #
 # Runs in the same container after the main install phases: the boxaudit
 # group already exists and the root-installed state is in place, so the
 # second install's group step takes the `added:` path for the NEW user
-# (never added before) — exactly the path the scan hooks into. The
-# `unchanged:` quiet path is implicitly covered: the first install (root,
-# no SUDO_USER) printed no warning header, asserted at the end of phase
-# "audit".
+# (never added before) — exactly the path the scan hooks into.
 STALE_LOG="$(mktemp)"
 STALE_ERR="$(mktemp)"
 LIB_CLEANUP_PATHS+=("$STALE_LOG" "$STALE_ERR")
@@ -188,8 +190,8 @@ if ! docker exec -e STALE_PROC_MIN_AGE=0 -e SUDO_USER=seeduser "$CID" \
     cat "$STALE_ERR" >&2
     exit 1
 fi
-WARN_HEADER_RE='long-running process(es) owned by seeduser'
-if ! grep -Fq "$WARN_HEADER_RE" "$STALE_LOG"; then
+WARN_HEADER='long-running process(es) owned by seeduser'
+if ! grep -Fq "$WARN_HEADER" "$STALE_LOG"; then
     echo "local-integration: FAIL — stale-group warning header missing (warn-fires case)" >&2
     tail -20 "$STALE_LOG" >&2
     exit 1
@@ -213,7 +215,7 @@ if ! docker exec -e STALE_PROC_MIN_AGE=999999 -e SUDO_USER=seeduser "$CID" \
     cat "$STALE_ERR" >&2
     exit 1
 fi
-if grep -Fq "$WARN_HEADER_RE" "$STALE_LOG"; then
+if grep -Fq "$WARN_HEADER" "$STALE_LOG"; then
     echo "local-integration: FAIL — stale-group warning printed below-threshold process (warn-doesn't-fire case)" >&2
     exit 1
 fi
@@ -231,7 +233,7 @@ if ! grep -q 'unchanged: seeduser is in boxaudit' "$STALE_LOG"; then
     echo "local-integration: FAIL — unchanged: path not taken on re-run" >&2
     exit 1
 fi
-if grep -Fq "$WARN_HEADER_RE" "$STALE_LOG"; then
+if grep -Fq "$WARN_HEADER" "$STALE_LOG"; then
     echo "local-integration: FAIL — scan ran on the unchanged: path (must skip entirely)" >&2
     exit 1
 fi

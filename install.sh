@@ -128,20 +128,27 @@ warn_stale_group_processes() {
     local user="$1" gid="$2"
     [[ -n "$gid" ]] || return 0   # unresolvable gid → scan nothing rather than flag everything
     local min_age="${STALE_PROC_MIN_AGE:-3600}"
+    # Non-numeric override would trip set -u arithmetic and kill the
+    # install — sanitize back to the default instead.
+    [[ "$min_age" =~ ^[0-9]+$ ]] || min_age=3600
     command -v pgrep >/dev/null 2>&1 || return 0
     command -v stat   >/dev/null 2>&1 || return 0
     [[ -d /proc ]] || return 0
 
-    local now pid groups age_secs line
+    local now pid groups_line groups g has_gid age_secs line
     now="$(date +%s)"
     local stale=()
     for pid in $(pgrep -u "$user" 2>/dev/null); do
-        # Supplementary groups of the main thread. Unreadable (vanished,
-        # or not ours despite pgrep's -u) → skip the pid silently.
-        groups="$(awk '/^Groups:/{ $1=""; print; exit }' "/proc/$pid/status" 2>/dev/null)" || continue
-        [[ -n "$groups" ]] || continue
-        # Token match, never substring: gid 142 must not match 42.
-        local g has_gid=0
+        # Groups: line of the main thread's status file. Command failure
+        # (vanished pid, /proc race) → skip; a *missing* Groups: line is
+        # exotic-kernel territory → skip too. An EMPTY group list is NOT
+        # a skip: a process with no supplementary groups genuinely lacks
+        # the new gid (usermod -aG adds it as supplementary) and belongs
+        # in the warning — daemons commonly run this way (e.g. pid 1).
+        groups_line="$(awk '/^Groups:/{ print; exit }' "/proc/$pid/status" 2>/dev/null)" || continue
+        [[ -n "$groups_line" ]] || continue
+        groups="${groups_line#Groups:}"
+        has_gid=0
         for g in $groups; do
             [[ "$g" == "$gid" ]] && { has_gid=1; break; }
         done
