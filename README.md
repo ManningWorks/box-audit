@@ -243,15 +243,39 @@ What the author actually runs: a Hermes cron job once a day whose entire
 configuration is this prompt — the agent does the reading and the
 sending, the box-audit timer does the auditing:
 
-> Read `/var/log/box-audit/latest.json`. If the file is missing, empty,
-> or unparseable, send a single Telegram message: '❌ box-audit:
-> latest.json missing or unreadable — check the systemd timer'.
-> Otherwise, parse the JSON. If `status == 'ok'`, send '✅ Box audit
-> clean (timestamp <ts>)'. If `status == 'findings'`, send each entry
+> Read `/var/log/box-audit/latest.json`.
+>
+> If the read SUCCEEDS: parse the JSON. If `status == 'ok'`, send '✅ Box
+> audit clean (timestamp <ts>)'. If `status == 'findings'`, send each entry
 > from `findings[]` as one Telegram line using `hermes-telegram-send`.
 > Group findings with the same severity together. Include the timestamp
-> from the JSON. Do NOT run the script yourself — only read the JSON
-> file written by the box-audit systemd timer.
+> from the JSON.
+>
+> If the read FAILS with Permission denied (EACCES):
+> 1. Read the `Groups:` line of `/proc/self/status`. Split its value on
+>    whitespace and compare WHOLE TOKENS (never substring — gid 43 must not
+>    match a list containing 4) against the boxaudit gid. Find the numeric
+>    gid with: `getent group boxaudit` (third colon-separated field).
+> 2. If the gid is ABSENT from your group list, send: '⚠️ box-audit:
+>    stale process group membership — this agent started before the
+>    boxaudit group was added. Restart the consumer; if it runs under
+>    systemd --user, run systemctl --user daemon-reexec first, or log out
+>    and back in.' Do NOT say 'check the systemd timer' — the timer is
+>    not the problem.
+> 3. If the gid IS present, send: '⚠️ box-audit: latest.json exists but
+>    is unreadable (Permission denied) — permissions have drifted from
+>    the documented 0640 root:boxaudit layout. Inspect the file's mode
+>    and owner.' Again, do not blame the timer.
+>
+> If the file is MISSING, EMPTY, or UNPARSEABLE (no Permission denied):
+> send a single Telegram message: '❌ box-audit: latest.json missing or
+> unreadable — check the systemd timer'.
+>
+> Do NOT run the script yourself — only read the JSON file written by the
+> box-audit systemd timer. (Diagnostic escape hatch, user request only:
+> `box-audit --check-groups` reports stale group membership for this
+> user's own processes without fixing anything.)
+>
 
 No separate delivery daemon to keep alive. Severity → Telegram format:
 see the severity table in `skills/box-audit/SKILL.md` § 2, which is

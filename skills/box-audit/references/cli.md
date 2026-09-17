@@ -15,10 +15,31 @@ All flags exit 0 on success, 2 on bad input. Manage flags (`--init`,
 | `--json` | Machine-readable JSON to stdout. Always exits 0; the JSON body's `status` field is the signal (`"ok"` or `"findings"`). | JSON |
 | `--text` | Forces human-readable output (the default). | text |
 | `--version` | Prints `box-audit X.Y.Z` and exits. The version comes from `/usr/local/share/box-audit/version`, written by `install.sh`. | text |
+| `--check-groups` | Diagnoses stale group membership (issue #32): does this process's group list contain the boxaudit gid, and which of the invoking user's own long-running processes lack it? Read-only — never restarts, signals, or re-execs anything. Exits 0 either way: "stale" is a finding, not a failure. | text |
 | `-h`, `--help` | Prints the usage block and exits. | text |
 
 Exit codes for the audit (not the manage flags): `0` = all clear,
 `1` = findings present, `2` = unknown flag. `--json` always exits 0.
+
+## Stale-group self-diagnosis (`--check-groups`)
+
+Supplementary groups are resolved at exec time, so a long-running process
+started before `usermod -aG boxaudit` keeps hitting Permission denied on
+the 0640 root:boxaudit outputs even after /etc/group is correct. Under
+`systemd --user`, processes inherit groups from the user-manager (started
+at login), so a bare consumer restart may not be enough — run
+`systemctl --user daemon-reexec` first, or log out and back in.
+
+`sudo box-audit --check-groups` reports, for the invoking user only:
+
+1. Whether the invoking process's own group list (`/proc/self/status`,
+   `Groups:` line, whole-token gid match) contains the boxaudit gid.
+2. Which of the user's OWN processes older than `STALE_PROC_MIN_AGE`
+   seconds (default 3600) still lack it — pid, name, age.
+
+Observe-never-remediate: it diagnoses; it never kills, restarts, or
+re-execs anything. A whole-box scan of other users' processes is the
+installer's job at install time, not this flag's.
 
 ## Manage flags (per-box config under /var/lib/box-audit/)
 
