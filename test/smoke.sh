@@ -117,6 +117,40 @@ else
     fail "--json key/finding check failed (rc=$rc): $JSON_ERR"
 fi
 
+# --- --json `counts` block (issue #38) --------------------------------------
+# Regression for the delta-mode signal integrity bug: history_persist_counts_from_json
+# used to source counts from findings[] (which only carries counts when the
+# absolute threshold tripped), causing false +N delta findings on healthy
+# boxes. Fix is an additive `counts` block alongside `findings`, populated
+# from the live measurement regardless of threshold. The block is the
+# single source of truth the next-day delta check reads from, so its
+# presence + shape is the load-bearing contract.
+COUNTS_PROBE='
+import json, sys
+d = json.load(sys.stdin)
+c = d.get("counts")
+if not isinstance(c, dict):
+    print("MISSING_COUNTS_BLOCK"); sys.exit(1)
+expected = ("suid_count", "outbound_remote_count", "security_pending")
+problems = []
+for k in expected:
+    v = c.get(k)
+    if not isinstance(v, int):
+        problems.append(f"{k}={v!r}")
+if problems:
+    print("BAD_COUNTS_FIELDS:" + ",".join(problems)); sys.exit(2)
+print("OK " + ",".join(f"{k}={c[k]}" for k in expected))
+'
+COUNTS_RUNNER() {
+    bash "$SCRIPT" --json 2>/dev/null | python3 -c "$COUNTS_PROBE"
+}
+if COUNTS_ERR="$(COUNTS_RUNNER 2>&1 >/dev/null)"; then
+    ok "--json has counts block with suid_count/outbound_remote_count/security_pending ($(COUNTS_RUNNER 2>/dev/null))"
+else
+    rc=$?
+    fail "--json counts block check failed (rc=$rc): $COUNTS_ERR"
+fi
+
 # --- --replay [DIR] mode (issue #15) ---------------------------------------
 # Replay is read-only against the live /var/log/box-audit/history — the
 # smoke checks here don't touch live state, only the test/fixtures/replay

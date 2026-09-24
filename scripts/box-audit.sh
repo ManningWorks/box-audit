@@ -79,10 +79,11 @@ INTEGRITY_TARGETS=(
 )
 
 # --- CLI flags -----------------------------------------------------------
-# --json   : emit machine-readable JSON to stdout (one object with findings[])
-#            instead of the human-readable Telegram-formatted text. Use when
-#            piping into a webhook / Slack / Discord / Pushover / etc. so the
-#            downstream tool can format the message itself.
+# --json   : emit machine-readable JSON to stdout (one object with findings[]
+#            and a sibling counts block added in 0.7.1) instead of the
+#            human-readable Telegram-formatted text. Use when piping into
+#            a webhook / Slack / Discord / Pushover / etc. so the downstream
+#            tool can format the message itself.
 # --help   : show usage and exit 0.
 # --version: print the script version and exit 0. install.sh copies the
 #            repo's VERSION file to /usr/local/share/box-audit/version at
@@ -128,6 +129,13 @@ Usage: $(/usr/bin/basename "$0") [OPTIONS]
 
   (default)   Human-readable report suitable for Telegram / Discord.
   --json      Machine-readable JSON to stdout, e.g. for webhook delivery.
+             Top-level keys: status, timestamp, host, counts, findings, raw_output.
+             The 'counts' block (added 0.7.1, issue #38) carries the live
+             suid_count / outbound_remote_count / security_pending values
+             regardless of whether the absolute check tripped; it is the
+             source of truth for next-day delta mode. Consumers that ignore
+             unknown fields are unaffected; strict JSON-schema consumers
+             need updating.
   --version   Print version ($BOX_AUDIT_VERSION_DISPLAY) and exit.
 
   Manage per-box config under /var/lib/box-audit/ (run as root):
@@ -918,7 +926,10 @@ report_security() {
     # whether it's legit (e.g. syncthing discovery on 22067, Telegram API).
     # Threshold of 25 to avoid alarm fatigue on a chatty gateway/hermes
     # process that legitimately opens many short-lived HTTPS sockets.
-    local outbound_remote_count=0
+    # NB: NOT `local` — main() reads this from the script scope to build
+    # the JSON `counts` block (issue #38). See suid_count above for the
+    # same comment.
+    outbound_remote_count=0
     local outbound_remote_sample=""
     local ss_out
     ss_out=$($T /usr/bin/ss -tnp state established 2>/dev/null)
@@ -983,7 +994,10 @@ report_security() {
     # attack surface, and their counts mask real findings (37 → 17 here).
     # `-path '/var/lib/docker' -prune -o` drops the whole tree before the
     # perm filter runs.
-    local suid_count
+    # NB: NOT `local` — main() reads this from the script scope to build
+    # the JSON `counts` block that history_persist_counts_from_json reads
+    # tomorrow's delta from (issue #38). Same shape for the other two
+    # counts below (outbound_remote_count, security).
     suid_count=$($T /usr/bin/find / -xdev -path '/var/lib/docker' -prune -o -perm -4000 -type f -print 2>/dev/null | /usr/bin/wc -l)
     suid_count=${suid_count:-0}
     # Baseline 18 measured 2026-09-14 on this box; flag if above the
@@ -1132,7 +1146,11 @@ report_system() {
 }
 
 report_updates() {
-    local updatable security kernel_security distro third_party
+    # NB: `security` is NOT `local` — main() reads it from the script
+    # scope to build the JSON `counts` block that drives tomorrow's delta
+    # mode (issue #38). The other apt counts stay local; they're
+    # rendering-only and don't need to leak past this function.
+    local updatable kernel_security distro third_party
 
     # Force a cache refresh before reading `apt list --upgradable`.
     # Yesterday's incident: cache went stale, unattended-upgrades ran but
@@ -1347,8 +1365,13 @@ history_load_counts
 # Re-reads today's counts out of the JSON snapshot main() just printed,
 # then writes a tiny sidecar the next day's delta mode reads. Both fail
 # silently: history is best-effort and a missing dir must not break the
-# audit. The numbers come from the JSON (single source of truth) so the
-# sidecar agrees with what `--json` printed this run.
+# audit. The numbers come from the JSON's `counts` block (issue #38),
+# which is populated from the live measurement regardless of whether
+# the corresponding absolute check tripped. The OLD implementation
+# scanned `findings[]` for the three check_ids; that path produced 0
+# for every below-threshold count, which fed the delta check today's-
+# live - 0 = today's-live and fired false suid_delta / outbound_delta /
+# security_delta every morning on a healthy box.
 # (history_tail/history_diff live above the CLI dispatch block — they are
 # dispatch targets and must be defined before the dispatch runs.)
 history_persist_counts_from_json() {
@@ -1359,14 +1382,13 @@ history_persist_counts_from_json() {
 import json, sys, datetime, socket
 try:
     d = json.loads(sys.argv[1])
-    out_c = sui_c = sec_c = 0
-    for f in d.get("findings", []):
-        cid = f.get("check_id", "")
-        n = f.get("count")
-        if not isinstance(n, int): continue
-        if cid == "security.outbound_remote_count": out_c = n
-        elif cid == "security.suid_count": sui_c = n
-        elif cid == "updates.security_pending": sec_c = n
+    c = d.get("counts", {}) or {}
+    # .get(key, 0) keeps the sidecar load-path unchanged for boxes that
+    # never produced a counts block (legacy snapshot replayed); the new
+    # audit always emits one.
+    out_c = int(c.get("outbound_remote_count", 0) or 0)
+    sui_c = int(c.get("suid_count", 0) or 0)
+    sec_c = int(c.get("security_pending", 0) or 0)
     payload = {
         "outbound_count": out_c,
         "suid_count": sui_c,
@@ -1669,15 +1691,43 @@ for f in findings:
         # Both JSON fields come from the same findings file: findings is
         # the raw JSON lines joined with commas; raw_output is the
         # rendered text (identical to what text mode prints).
-        local rendered_text findings_array_json raw_output_json full_json
+        #
+        # The `counts` block (issue #38) is the load-bearing addition
+        # that fixes the delta-mode signal integrity bug. Under the
+        # old code, history_persist_counts_from_json sourced
+        # outbound_count / suid_count / security_pending from
+        # findings[] — but findings only carries a count when the
+        # corresponding absolute check tripped (e.g. security.suid_count
+        # only fires above the per-box threshold). On a healthy box
+        # the sidecar recorded 0 for all three, and tomorrow's delta
+        # computed today's-live - 0 = today's-live, firing false
+        # security.suid_delta / outbound_delta / security_delta every
+        # morning. The new sibling block is populated from the live
+        # measurement regardless of threshold, and history_persist
+        # reads from there. The findings surface is unchanged;
+        # consumers that ignore unknown fields are unaffected; strict
+        # JSON-schema consumers need updating.
+        local rendered_text findings_array_json raw_output_json full_json counts_json
         rendered_text=$(render_text_report)
         findings_array_json=""
         [[ -n "$FINDINGS_FILE" && -s "$FINDINGS_FILE" ]] && findings_array_json=$(paste -sd, "$FINDINGS_FILE")
         raw_output_json=$(/usr/bin/printf '%s' "$rendered_text" | /usr/bin/python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-        full_json=$(/usr/bin/printf '{"status":"%s","timestamp":"%s","host":"%s","findings":[%s],"raw_output":%s}\n' \
+        # Clamp any unset count to 0 (the persisted sidecar uses 0 as
+        # "no prior snapshot" sentinel; matches the load behavior of
+        # the old findings-scanning path).
+        counts_json=$(/usr/bin/python3 -c '
+import json
+print(json.dumps({
+    "suid_count": int('"${suid_count:-0}"' or 0),
+    "outbound_remote_count": int('"${outbound_remote_count:-0}"' or 0),
+    "security_pending": int('"${security:-0}"' or 0),
+}, sort_keys=True))
+')
+        full_json=$(/usr/bin/printf '{"status":"%s","timestamp":"%s","host":"%s","counts":%s,"findings":[%s],"raw_output":%s}\n' \
             "$status" \
             "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" \
             "$(/usr/bin/hostname)" \
+            "$counts_json" \
             "$findings_array_json" \
             "$raw_output_json")
         /usr/bin/printf '%s' "$full_json"

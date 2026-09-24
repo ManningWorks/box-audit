@@ -89,6 +89,36 @@ def main() -> int:
         print("FAIL: --json 'findings' is not a list", file=sys.stderr)
         return 2
 
+    # --- `counts` block (issue #38) ----------------------------------------
+    # The persist sidecar that drives tomorrow's delta mode reads from
+    # counts.* instead of findings[]. On a healthy seeded box, every one
+    # of the three counts is below the absolute-threshold boundary, so
+    # the OLD code would have recorded 0 for them — and tomorrow's delta
+    # would have computed today's-live - 0 = today's-live. The fix is
+    # the additive counts block populated from the live measurement
+    # regardless of threshold.
+    counts = doc.get("counts")
+    if not isinstance(counts, dict):
+        print("FAIL: --json missing 'counts' block (issue #38 regression: "
+              "persisted sidecar would record 0 for below-threshold counts)",
+              file=sys.stderr)
+        return 1
+    counts_failures = 0
+    for field in ("suid_count", "outbound_remote_count", "security_pending"):
+        v = counts.get(field)
+        if not isinstance(v, int):
+            print(f"FAIL: counts.{field} is not an integer (got: {v!r})",
+                  file=sys.stderr)
+            counts_failures += 1
+            continue
+        if v < 0:
+            print(f"FAIL: counts.{field}={v} is negative", file=sys.stderr)
+            counts_failures += 1
+            continue
+        print(f"PASS: counts.{field}={v}")
+    if counts_failures:
+        return 1
+
     # Index findings by check_id for O(1) lookup; the script never
     # emits more than one finding per check_id today, but if that
     # ever changes the assertions will surface it (the dedup-by-id

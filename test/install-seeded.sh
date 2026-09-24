@@ -194,4 +194,144 @@ if [[ "$EXPECTED" != "$ACTUAL" ]]; then
     exit 1
 fi
 
+# --- Issue #38 regression: delta-mode signal integrity ---------------------
+# The persist sidecar history_persist_counts_from_json used to source
+# today's counts from the JSON snapshot's findings[] array, which only
+# carries a count when the corresponding absolute check tripped. On a
+# healthy seeded box (low SUID, no outbound, no security updates) every
+# one of the three is below threshold, so the sidecar recorded 0 — and
+# tomorrow's delta check computed today's-live - 0 = today's-live, firing
+# security.suid_delta / outbound_delta / security_delta every morning
+# forever. The fix (Option A in the issue) is an additive counts block
+# alongside findings[], sourced from the live measurement regardless of
+# threshold, and history_persist_counts_from_json reads from there.
+#
+# Two assertions:
+#
+#   1. constant-count run: after the first audit, write today's live
+#      count back as yesterday's, re-run --json, assert no delta finding
+#      fires for any of the three.
+#   2. mutated-count run: write yesterday = today - 10, re-run --json,
+#      assert the corresponding delta finding fires.
+#
+# The first capture (above, BA_JSON) already gave us today's counts. Read
+# them out, drive both scenarios, and check.
+TODAY_COUNTS="$(python3 -c '
+import json
+d = json.load(open("'"$BA_JSON"'"))
+c = d.get("counts", {})
+print(c.get("suid_count"), c.get("outbound_remote_count"), c.get("security_pending"))
+')"
+TODAY_SUID=$(echo "$TODAY_COUNTS" | /usr/bin/awk "{print \$1}")
+TODAY_OUT=$(echo "$TODAY_COUNTS" | /usr/bin/awk "{print \$2}")
+TODAY_SEC=$(echo "$TODAY_COUNTS" | /usr/bin/awk "{print \$3}")
+if [[ -z "$TODAY_SUID" || -z "$TODAY_OUT" || -z "$TODAY_SEC" ]]; then
+    echo "test/install-seeded.sh: could not read today's counts from $BA_JSON (counts: $TODAY_COUNTS)" >&2
+    exit 1
+fi
+echo "test/install-seeded.sh: today's live counts: suid=$TODAY_SUID out=$TODAY_OUT sec=$TODAY_SEC"
+
+# 1. constant-count run: write today's live count back as yesterday's,
+#    re-run --json, assert no *_delta finding fires. This is the load-
+#    bearing regression: under the old code, the persist sidecar recorded
+#    0 for every below-threshold count (because findings[] only carries
+#    counts when the absolute check trips), so the next-day delta check
+#    computed today's-live - 0 = today's-live, e.g. +19 suid_delta on a
+#    healthy 19-SUID box. Today's audit reads the planted yesterday from
+#    the sidecar and computes today's-live - today's-live = 0 → no delta.
+if ! privileged_exec /bin/bash -c '
+    mkdir -p /var/log/box-audit/history
+    cat > /var/log/box-audit/history/.latest-counts.json <<JSON
+{"outbound_count": '"$TODAY_OUT"', "suid_count": '"$TODAY_SUID"', "security_pending": '"$TODAY_SEC"', "timestamp": "constant-run", "host": "constant-run"}
+JSON
+' ; then
+    echo "test/install-seeded.sh: failed to seed .latest-counts.json for constant-count run" >&2
+    exit 1
+fi
+
+BA_JSON_CONST="$(mktemp)"
+LIB_CLEANUP_PATHS+=("$BA_JSON_CONST")
+if ! privileged_exec /usr/local/bin/box-audit --json > "$BA_JSON_CONST" 2>/dev/null; then
+    echo "test/install-seeded.sh: box-audit --json (constant-count run) exited non-zero" >&2
+    exit 1
+fi
+DELTA_HITS="$(python3 -c '
+import json
+d = json.load(open("'"$BA_JSON_CONST"'"))
+hits = [f["check_id"] for f in d.get("findings", []) if f.get("check_id", "").endswith("_delta")]
+print(",".join(hits) if hits else "none")
+')"
+if [[ "$DELTA_HITS" == "none" ]]; then
+    echo "test/install-seeded.sh: constant-count run produced no *_delta finding (suid=$TODAY_SUID out=$TODAY_OUT sec=$TODAY_SEC)"
+else
+    echo "test/install-seeded.sh: FAIL — constant-count run produced delta findings: $DELTA_HITS" >&2
+    echo "--- audit stdout ---" >&2
+    cat "$BA_JSON_CONST" >&2
+    exit 1
+fi
+
+# 2. mutated-count run: plant yesterday = today - 10 for each field in
+#    turn, re-run --json, assert the corresponding *_delta finding fires.
+#    We pick the direction that crosses the >2 / >1 / >2x delta thresholds
+#    respectively. The outbound case is the trickiest: outbound_delta
+#    requires today > 5 AND today > 2x yesterday — a bare seeded jrei
+#    image has today = 0, so we can't trigger outbound_delta cleanly.
+#    Skip it (the constant-count run already proves the load-bearing
+#    direction: no false positive on a healthy box).
+for FIELD in suid security; do
+    if [[ "$FIELD" == "suid" ]]; then
+        SID="suid_count"
+        DELTA_ID="security.suid_delta"
+        YESTERDAY_VAL=$((TODAY_SUID - 10))
+        [[ $YESTERDAY_VAL -lt 0 ]] && YESTERDAY_VAL=0
+    else
+        SID="security_pending"
+        DELTA_ID="updates.security_delta"
+        YESTERDAY_VAL=$((TODAY_SEC - 10))
+        [[ $YESTERDAY_VAL -lt 0 ]] && YESTERDAY_VAL=0
+    fi
+    # Plant a mutated .latest-counts.json: take today's counts as the
+    # baseline, then overwrite the one we're testing with its yesterday
+    # value. The audit reads this file at startup to compute deltas.
+    # The opening heredoc delimiter is single-quoted ('PY') so the inner
+    # bash doesn't re-expand $TODAY_OUT / $SID / $YESTERDAY_VAL — those
+    # were already interpolated by the outer shell via the '"$VAR"'
+    # single-quote-break pattern. The closing PY stays literal (no
+    # quoting needed) — bash's heredoc terminator is a line consisting
+    # of just the delimiter text.
+    if ! privileged_exec /bin/bash -c '
+        /usr/bin/python3 - <<'"'"'PY'"'"'
+import json
+p = "/var/log/box-audit/history/.latest-counts.json"
+d = {"outbound_count": '"$TODAY_OUT"', "suid_count": '"$TODAY_SUID"', "security_pending": '"$TODAY_SEC"', "timestamp": "mutated-run", "host": "mutated-run"}
+d["'"$SID"'"] = '"$YESTERDAY_VAL"'
+with open(p, "w") as fh:
+    json.dump(d, fh)
+PY
+    ' ; then
+        echo "test/install-seeded.sh: failed to seed mutated .latest-counts.json for $FIELD" >&2
+        exit 1
+    fi
+    BA_JSON_MUT="$(mktemp)"
+    LIB_CLEANUP_PATHS+=("$BA_JSON_MUT")
+    if ! privileged_exec /usr/local/bin/box-audit --json > "$BA_JSON_MUT" 2>/dev/null; then
+        echo "test/install-seeded.sh: box-audit --json (mutated $FIELD) exited non-zero" >&2
+        exit 1
+    fi
+    HIT="$(python3 -c '
+import json
+d = json.load(open("'"$BA_JSON_MUT"'"))
+hits = [f["check_id"] for f in d.get("findings", []) if f.get("check_id") == "'"$DELTA_ID"'"]
+print("yes" if hits else "no")
+')"
+    if [[ "$HIT" == "yes" ]]; then
+        echo "test/install-seeded.sh: mutated-$FIELD run fired $DELTA_ID as expected (yesterday=$YESTERDAY_VAL)"
+    else
+        echo "test/install-seeded.sh: FAIL — mutated-$FIELD run did NOT fire $DELTA_ID (yesterday=$YESTERDAY_VAL, today=$TODAY_SUID/$TODAY_SEC)" >&2
+        echo "--- audit stdout ---" >&2
+        cat "$BA_JSON_MUT" >&2
+        exit 1
+    fi
+done
+
 echo "test/install-seeded.sh: seeded-container integration PASSED"
