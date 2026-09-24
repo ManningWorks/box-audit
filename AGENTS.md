@@ -55,6 +55,20 @@ Rules:
   degraded-path logic → tier 1; does-it-survive-a-real-install → tier
   2; installed-binary contract → tier 3. Don't invent a fourth tier.
 
+## Per-box config files
+
+`install.sh` and the `init)` arm of `scripts/box-audit.sh`'s `main_manage`
+both write `/var/lib/box-audit/<name>`. When adding a new config file:
+(a) add the variable next to `CONFIG_DIR`/`PORTS_FILE`/etc. in
+`scripts/box-audit.sh`; (b) add the file to both the `install.sh` seeding
+block and the `init)` arm; (c) add the path to the trailing `chmod 0644`
+list in `install.sh`. Any PR that adds a per-box config without touching
+all three sites fails review.
+
+Rationale: PR #11 and PR #27 both had the same shape — one path
+updated, the other forgotten. Codified here so the third instance is
+caught at review instead of in CI.
+
 ## Other repo-specific notes
 
 - Observe-never-remediate: diagnostic features (e.g.
