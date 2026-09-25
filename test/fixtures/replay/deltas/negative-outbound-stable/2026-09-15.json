@@ -1,0 +1,1 @@
+{"status":"findings","timestamp":"2026-09-15T03:00:02Z","host":"props-fixture","counts":{"outbound_remote_count":3,"suid_count":21,"security_pending":0},"findings":[],"raw_output":"(delta fixture corpus: 3 non-LAN remote IPs, steady)"}
