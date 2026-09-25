@@ -37,7 +37,7 @@ tiers in sequence. Tier 3 skips itself on non-privileged hosts
 |------|---------|------|
 | 1 | `test/smoke.sh` (bare runner, degraded paths, shellcheck, property tests) + `install.sh --ci` in a privileged systemd container, positive and negative variants | Required check on every PR (`ci.yml`, `install.yml`) |
 | 2 | `test/install-seeded.sh` — seeded container produces known findings; asserts the expected `check_id`s and severities survive the full install path | Required check on every PR (`integration-seeded.yml`) |
-| 3 | `test/local-integration.sh` — author's pre-merge net; asserts the JSON contract and the `+replay` version-suffix invariant on the installed binary; 60s budget | Documented step, not a CI gate |
+| 3 | `test/local-integration.sh` — author's pre-merge net; asserts the JSON contract and the `+replay` version-suffix invariant on the installed binary; 240s budget (raised from 60s for issue #31) | Documented step, not a CI gate |
 
 Rules:
 

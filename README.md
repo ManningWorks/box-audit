@@ -346,8 +346,10 @@ Tier 3's probe pins the four core top-level keys (`status`, `timestamp`,
 `host`, `findings`) — `counts` and `raw_output` are intentionally not
 re-pinned here; `counts` is asserted by tier 2's `assert-json.py` on the
 installed binary (same surface), and `raw_output` is a verbatim copy
-of the text report rather than a contract field. Hard budget: 60
-seconds. Skips itself with `skipped: requires privileged Docker` and
+of the text report rather than a contract field. Hard budget: 240
+seconds (raised from 60s for issue #31 — the stale-group phase runs
+three more full installs inside the same container). Skips itself with
+`skipped: requires privileged Docker` and
 exits 0 when the host can't grant `--privileged`. Documented step, not
 a GitHub Actions gate: the `integration-seeded` status check on the PR
 is what catches regressions for external contributors; tier 3 is the
