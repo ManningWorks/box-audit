@@ -157,6 +157,82 @@ if ! python3 "$REPO/test/install-seeded/assert-json.py" < "$BA_JSON"; then
     exit 1
 fi
 
+# --- Issue #38 regression: persist-write sidecar witness (H1) --------------
+# Pin the second half of the #38 contract the existing tier-2 block above
+# leaves un-observed: history_persist_counts_from_json must actually write
+# /var/log/box-audit/history/.latest-counts.json with today's live
+# counts so that tomorrow's delta check has a baseline to read from.
+# The constant/mutated runs below exercise the *load* path; they plant
+# the sidecar by hand, so any regression here (key rename between emitter
+# and reader, silent-no-write bug, starvation of the counts vars) would
+# stay invisible to them. This block reads the sidecar back untouched —
+# the one the audit just wrote during the BA_JSON capture above — and
+# asserts it agrees with what the audit emitted.
+#
+# Sidecar keys (scripts/box-audit.sh:1389-1395): outbound_count,
+# suid_count, security_pending. stdout JSON emitter uses
+# outbound_remote_count (renamed in the sidecar by persist). Equality
+# across all three is the load-bearing check; "suid_count > 0 AND
+# security_pending > 0" pins the regression class the old code fell
+# into (writing 0 for below-threshold counts because findings[] only
+# carries a count when the absolute check tripped).
+SIDECAR_JSON="$(privileged_exec /usr/bin/cat /var/log/box-audit/history/.latest-counts.json)"
+if [[ -z "$SIDECAR_JSON" ]]; then
+    echo "test/install-seeded.sh: FAIL — persist sidecar .latest-counts.json is empty or missing after --json run" >&2
+    echo "(history_persist_counts_from_json did not write, or write failed silently)" >&2
+    exit 1
+fi
+# The probe script exits non-zero when its findings disagree; under
+# `set -e`, that would abort the driver before this block's own
+# `exit 1` ever runs (silent failure). || true swallows the rc so the
+# assignment lands, then we branch on the captured value below.
+SIDECAR_PROBE_OUT="$(SIDECAR_JSON="$SIDECAR_JSON" BA_JSON="$BA_JSON" python3 - <<'PY' || true
+import json, os, sys
+sidecar = json.loads(os.environ["SIDECAR_JSON"])
+stdout_counts = json.load(open(os.environ["BA_JSON"]))["counts"]
+# Sidecar keys (renamed in history_persist_counts_from_json at
+# scripts/box-audit.sh:1389-1395).
+checks = [
+    ("suid_count",         "suid_count"),
+    ("outbound_count",     "outbound_remote_count"),  # rename witnessed here
+    ("security_pending",   "security_pending"),
+]
+problems = []
+for sidecar_key, stdout_key in checks:
+    s = sidecar.get(sidecar_key)
+    o = stdout_counts.get(stdout_key)
+    if s != o:
+        problems.append(f"{sidecar_key}: sidecar={s!r} stdout={o!r} (mismatch)")
+# Below-threshold fields must be NON-ZERO — this is the exact invariant
+# the old code broke: it sourced counts from findings[], which only
+# carries a count when the absolute check tripped, so a healthy seeded
+# box recorded 0 for every one of the three and tomorrow's delta
+# computed today's-live - 0 = today's-live. On this seeded jrei image
+# suid_count=9 and security_pending=9 are the typical values; outbound
+# is intentionally skipped (the seeded container has no outbound
+# remote connections, so a >0 assertion would be false-positive-prone).
+for key in ("suid_count", "security_pending"):
+    v = sidecar.get(key)
+    if not isinstance(v, int) or v <= 0:
+        problems.append(f"{key}={v!r} (below-threshold field must be > 0 in sidecar)")
+if problems:
+    print("FAIL_PERSIST_SIDECAR:" + "; ".join(problems))
+    sys.exit(1)
+print(f"OK suid={sidecar['suid_count']} outbound={sidecar['outbound_count']} security_pending={sidecar['security_pending']}")
+PY
+)"
+if [[ "$SIDECAR_PROBE_OUT" == OK* ]]; then
+    echo "test/install-seeded.sh: persist sidecar agrees with --json counts (${SIDECAR_PROBE_OUT#OK })"
+else
+    echo "test/install-seeded.sh: FAIL — persist sidecar disagrees with --json counts" >&2
+    echo "$SIDECAR_PROBE_OUT" >&2
+    echo "--- sidecar ---" >&2
+    echo "$SIDECAR_JSON" >&2
+    echo "--- audit stdout ---" >&2
+    cat "$BA_JSON" >&2
+    exit 1
+fi
+
 # Regression: box-audit --init must populate timers-baseline.txt
 # with the actual .timer units from `systemctl list-timers --all`.
 # Before issue #12 was fixed, --init silently wrote 0 bytes (python

@@ -144,11 +144,19 @@ print("OK " + ",".join(f"{k}={c[k]}" for k in expected))
 COUNTS_RUNNER() {
     bash "$SCRIPT" --json 2>/dev/null | python3 -c "$COUNTS_PROBE"
 }
-if COUNTS_ERR="$(COUNTS_RUNNER 2>&1 >/dev/null)"; then
-    ok "--json has counts block with suid_count/outbound_remote_count/security_pending ($(COUNTS_RUNNER 2>/dev/null))"
+# Single audit invocation, two semantic uses (rc + diagnostic). The
+# probe writes either "OK key=val,..." or "FAIL_TAG:..." to stdout and
+# exits 0 or non-zero accordingly; stderr is silent for both paths.
+# Capturing one stream and stamping the rc on the end preserves the
+# original two-calls' information without paying for a second --json.
+COUNTS_COMBINED="$(COUNTS_RUNNER; echo "RC=$?")"
+COUNTS_RC="${COUNTS_COMBINED##*RC=}"
+COUNTS_OUT="${COUNTS_COMBINED%RC=*}"
+COUNTS_OUT="${COUNTS_OUT%$'\n'}"
+if [[ "$COUNTS_RC" -eq 0 ]]; then
+    ok "--json has counts block with suid_count/outbound_remote_count/security_pending ($COUNTS_OUT)"
 else
-    rc=$?
-    fail "--json counts block check failed (rc=$rc): $COUNTS_ERR"
+    fail "--json counts block check failed (rc=$COUNTS_RC): $COUNTS_OUT"
 fi
 
 # --- --replay [DIR] mode (issue #15) ---------------------------------------
