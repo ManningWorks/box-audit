@@ -72,10 +72,35 @@ Each JSON finding carries `severity`, `check_id`, `message`:
 Severity is assigned from the report line's leading emoji, so the table
 above is the full contract — there are no hidden levels.
 
+Count-carrying findings (`security.outbound_remote_count`,
+`security.suid_count`, `updates.security_pending`) also carry a
+numeric `count` field mirroring the same value in the top-level
+`counts` block — see "Reading counts" below for the cases where you
+should reach for `counts` directly.
+
 Check `degraded` first, always. "0 findings" from a run where the
 integrity check was skipped is not a clean bill; it's a blind spot. A
 `degraded.check` finding names the cause (missing binary, no root, no
 NOPASSWD sudo).
+
+### Reading counts
+
+The JSON envelope carries a top-level `counts` block
+(`{"suid_count", "outbound_remote_count", "security_pending"}`) that
+holds the **live measurement** of each count-carrying check, regardless
+of whether the corresponding threshold tripped. Two reasons to read it
+directly instead of going through `findings[]`:
+
+- **Below-threshold boxes.** On a healthy box, `suid_count` /
+  `outbound_remote_count` / `security_pending` are non-zero but
+  below the absolute-check thresholds, so no `warn` finding is
+  emitted. The `counts` block is the only place those values appear.
+- **Delta mode.** Tomorrow's `--diff 1` uses the `counts` block as
+  the source of truth for "did this number change since yesterday?"
+  — never the per-finding `count` field. If you need to reproduce
+  tomorrow's delta prediction by hand, read `counts`, not `findings`.
+
+Added in 0.7.1 (issue #38).
 
 **Done when:** you can state the finding count, the highest severity
 present, and — if any `degraded` finding exists — what it blinds.

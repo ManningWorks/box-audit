@@ -44,19 +44,30 @@ Lynis-style absolute scoring.
   "status": "findings",
   "timestamp": "2026-09-15T14:29:33Z",
   "host": "your-hostname",
+  "counts": {
+    "suid_count": 9,
+    "outbound_remote_count": 3,
+    "security_pending": 2
+  },
   "findings": [
-    {"severity": "warn", "check_id": "updates.security_pending", "message": "2 security update(s) pending"},
+    {"severity": "warn", "check_id": "updates.security_pending", "message": "2 security update(s) pending", "count": 2},
     {"severity": "warn", "check_id": "maintenance.kernel_restart", "message": "Kernel: 7.0.0-31-generic (newer kernel on disk, current kernel still running)"}
   ],
   "raw_output": "..."
 }
 ```
 
+The `counts` block carries the live `suid_count` / `outbound_remote_count` /
+`security_pending` measurements *regardless of whether the corresponding
+threshold tripped*, and is the source of truth for tomorrow's delta mode
+(see [issue #38](https://github.com/ManningWorks/box-audit/issues/38)).
+Added in 0.7.1.
+
 Each finding carries a stable `check_id` (see `box-audit --print-schema`
 for the full table), so downstream tools can branch without parsing the
-message text. Count-carrying checks (`security.outbound_remote_count`,
+message text. Count-carrying findings (`security.outbound_remote_count`,
 `security.suid_count`, `updates.security_pending`) also carry a numeric
-`count` field.
+`count` field mirroring the value in the top-level `counts` block.
 
 Exit codes: `0` = all clear, `1` = findings present, `2` = bad CLI flag.
 In `--json` mode the exit code is always `0`; the JSON body's `status`
@@ -329,15 +340,18 @@ filesystem state to exercise.
 
 `bash test/local-integration.sh` — the author's local pre-merge net.
 Mirrors tier 1 (privileged systemd container, install, audit) but
-asserts only the JSON contract (four top-level keys:
-`status`, `timestamp`, `host`, `findings`) plus the `+replay`
-version-suffix invariant on the *installed* binary — not per-check
-severities (that's tier 2). Hard budget: 60 seconds. Skips itself
-with `skipped: requires privileged Docker` and exits 0 when the host
-can't grant `--privileged`. Documented step, not a GitHub Actions
-gate: the `integration-seeded` status check on the PR is what catches
-regressions for external contributors; tier 3 is the author's
-pre-merge net.
+asserts the JSON shape and the `+replay` version-suffix invariant on
+the *installed* binary — not per-check severities (that's tier 2).
+Tier 3's probe pins the four core top-level keys (`status`, `timestamp`,
+`host`, `findings`) — `counts` and `raw_output` are intentionally not
+re-pinned here; `counts` is asserted by tier 2's `assert-json.py` on the
+installed binary (same surface), and `raw_output` is a verbatim copy
+of the text report rather than a contract field. Hard budget: 60
+seconds. Skips itself with `skipped: requires privileged Docker` and
+exits 0 when the host can't grant `--privileged`. Documented step, not
+a GitHub Actions gate: the `integration-seeded` status check on the PR
+is what catches regressions for external contributors; tier 3 is the
+author's pre-merge net.
 
 Dependabot bumps the base image weekly.
 

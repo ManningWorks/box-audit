@@ -20,6 +20,11 @@ driver (test/install-seeded.sh) sets up in the container:
 
 Top-level JSON contract (status, timestamp, host, findings) is also
 verified — same shape the install-ci tier-1 job implicitly relies on.
+The `counts` block (suid_count, outbound_remote_count, security_pending)
+is asserted separately further down, with integer-type and non-negative
+checks (issue #38 regression: the old code sourced counts from
+findings[], which silently wrote 0 for every below-threshold box and
+broke next-day delta mode).
 
 Exit codes:
     0  all assertions passed
