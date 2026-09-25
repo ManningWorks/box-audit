@@ -73,8 +73,12 @@ props_done() {
 # props_write_snapshot <out.json> <findings-jsonl>
 # Wrap JSONL findings (one json.dumps-shaped finding object per line, the
 # exact shape json_push appends to FINDINGS_FILE) into a --json-shaped
-# daily snapshot, byte-compatible with what --json emits. Used to build
-# ephemeral replay corpora for the delta-semantics assertions.
+# daily snapshot, byte-compatible with what --json emits modulo the
+# optional `counts` block — the property tests exercise delta semantics
+# against findings + raw_output, never against the counts block, so
+# emitting a stub here keeps the fixture small without changing what
+# the assertions cover. Used to build ephemeral replay corpora for the
+# delta-semantics assertions.
 props_write_snapshot() {
     local out="$1" jsonl="$2"
     {

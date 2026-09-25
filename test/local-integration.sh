@@ -11,7 +11,13 @@
 #   1. install.sh --ci exits 0 inside the container.
 #   2. box-audit --json exits 0.
 #   3. The emitted JSON parses with python3 -m json.tool and contains
-#      the four top-level keys: status, timestamp, host, findings.
+#      the four core top-level keys (status, timestamp, host, findings).
+#      The two auxiliary keys (counts, raw_output) are part of the
+#      contract — see `--help` and the README's --json sample — but
+#      are not re-pinned here: 'counts' is asserted by tier 2's
+#      assert-json.py on the same installed binary, and 'raw_output'
+#      is a verbatim copy of the text report rather than a contract
+#      field. Tier 3 keeps its narrow JSON-shape contract.
 #   4. /usr/local/bin/box-audit --version reports a string containing
 #      +replay (the version-suffix invariant shipped in 0.6.0).
 #
@@ -83,6 +89,11 @@ LIB_CLEANUP_PATHS+=("$BA_JSON" "$BA_ERR" "$SCHEMA_PROBE" "$PROBE_SCRIPT")
 # script is decoupled from stdin/stdout of the outer pipeline. Exit
 # 0 on success; 1 on missing keys; 2 on bad shape; non-zero on parse
 # failure (caught by the caller).
+#
+# Asserts the four *core* top-level keys (status, timestamp, host,
+# findings) — see the file header for why counts / raw_output are not
+# re-pinned here. `counts` integer assertions live in tier 2's
+# assert-json.py; tier 3's contract is JSON shape + version suffix.
 cat > "$PROBE_SCRIPT" <<'PY'
 import json, sys
 path = sys.argv[1]
@@ -133,9 +144,11 @@ fi
 if ! python3 -m json.tool < "$BA_JSON" > "$SCHEMA_PROBE" 2>>"$BA_ERR"; then
     phase_fail "audit" "$AUDIT_START" "box-audit --json output is not valid JSON"
 fi
-# Tier-3 contract 2: four top-level keys present. Probe the *original*
-# raw emission, not the pretty-printed copy, so the assertion fails
-# the same way for both the production and a future variant.
+# Tier-3 contract 2: four core top-level keys present. counts and
+# raw_output are intentionally not asserted at tier 3 (see file
+# header); probe the *original* raw emission, not the pretty-printed
+# copy, so the assertion fails the same way for both the production
+# and a future variant.
 if ! python3 "$PROBE_SCRIPT" "$BA_JSON" 2>>"$BA_ERR"; then
     phase_fail "audit" "$AUDIT_START" "JSON contract assertion failed (status/timestamp/host/findings)"
 fi

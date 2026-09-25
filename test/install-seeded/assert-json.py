@@ -20,6 +20,11 @@ driver (test/install-seeded.sh) sets up in the container:
 
 Top-level JSON contract (status, timestamp, host, findings) is also
 verified — same shape the install-ci tier-1 job implicitly relies on.
+The `counts` block (suid_count, outbound_remote_count, security_pending)
+is asserted separately further down, with integer-type and non-negative
+checks (issue #38 regression: the old code sourced counts from
+findings[], which silently wrote 0 for every below-threshold box and
+broke next-day delta mode).
 
 Exit codes:
     0  all assertions passed
@@ -88,6 +93,36 @@ def main() -> int:
     if not isinstance(findings, list):
         print("FAIL: --json 'findings' is not a list", file=sys.stderr)
         return 2
+
+    # --- `counts` block (issue #38) ----------------------------------------
+    # The persist sidecar that drives tomorrow's delta mode reads from
+    # counts.* instead of findings[]. On a healthy seeded box, every one
+    # of the three counts is below the absolute-threshold boundary, so
+    # the OLD code would have recorded 0 for them — and tomorrow's delta
+    # would have computed today's-live - 0 = today's-live. The fix is
+    # the additive counts block populated from the live measurement
+    # regardless of threshold.
+    counts = doc.get("counts")
+    if not isinstance(counts, dict):
+        print("FAIL: --json missing 'counts' block (issue #38 regression: "
+              "persisted sidecar would record 0 for below-threshold counts)",
+              file=sys.stderr)
+        return 1
+    counts_failures = 0
+    for field in ("suid_count", "outbound_remote_count", "security_pending"):
+        v = counts.get(field)
+        if not isinstance(v, int):
+            print(f"FAIL: counts.{field} is not an integer (got: {v!r})",
+                  file=sys.stderr)
+            counts_failures += 1
+            continue
+        if v < 0:
+            print(f"FAIL: counts.{field}={v} is negative", file=sys.stderr)
+            counts_failures += 1
+            continue
+        print(f"PASS: counts.{field}={v}")
+    if counts_failures:
+        return 1
 
     # Index findings by check_id for O(1) lookup; the script never
     # emits more than one finding per check_id today, but if that

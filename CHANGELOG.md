@@ -5,6 +5,43 @@ All notable changes to box-audit are documented here. The format follows
 grouped by kind, not by PR, and are written for the person deciding
 whether to upgrade.
 
+## [0.7.1] - 2026-09-24
+
+### Fixed
+
+- **Delta-mode signal integrity** (issue #38). `.latest-counts.json`
+  used to record 0 for `suid_count`, `outbound_count`, and
+  `security_pending` whenever the corresponding absolute check did NOT
+  trip — i.e. on every healthy box. The persist function sourced these
+  counts by scanning `findings[]` for the three check_ids, and
+  `findings[]` only carries a count when the absolute threshold tripped
+  (`security.suid_count` only fires above the per-box suid threshold,
+  etc.). Result: every morning's delta check computed today's-live − 0
+  = today's-live, firing false `security.suid_delta` /
+  `security.outbound_delta` / `updates.security_delta` findings
+  forever. The delta check is box-audit's primary differentiator from
+  Lynis and the headline reason the tool exists — a real rootkit that
+  genuinely adds a SUID binary blends in with the daily noise.
+  - Option A from the issue: a sibling `counts` block is added to the
+    `--json` snapshot alongside `findings[]`, populated from the live
+    measurement regardless of threshold. `history_persist_counts_from_json`
+    reads from `counts.*` instead of scanning findings.
+  - Tier-2 seeded regression: constant-count run produces no `*_delta`
+    finding; mutated-count run fires the corresponding delta. Both
+    assertions in `test/install-seeded.sh`.
+  - Tier-1 smoke assertion: `--json` output carries the `counts` block
+    with `suid_count` / `outbound_remote_count` / `security_pending`
+    as non-negative integers.
+
+### Changed
+
+- `--json` output adds a `counts` object alongside `findings`; the
+  envelope key set is now `{status, timestamp, host, counts, findings,
+  raw_output}`. **JSON output adds a counts object alongside findings;
+  consumers that ignore unknown fields are unaffected; consumers that
+  strict-validate will need updating.**
+- The `--help` text documents the new top-level keys.
+
 ## [0.7.0] - 2026-09-18
 
 ### Added
