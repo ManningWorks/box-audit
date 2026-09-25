@@ -1,0 +1,1 @@
+{"status":"findings","timestamp":"2026-09-15T03:00:02Z","host":"props-fixture","counts":{"outbound_remote_count":0,"suid_count":21,"security_pending":1},"findings":[{"severity":"warn","check_id":"updates.security_pending","section":"updates","message":"1 security update(s) pending","count":1}],"raw_output":"(delta fixture corpus: 1 security update pending both days)"}

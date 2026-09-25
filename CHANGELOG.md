@@ -5,6 +5,34 @@ All notable changes to box-audit are documented here. The format follows
 grouped by kind, not by PR, and are written for the person deciding
 whether to upgrade.
 
+## [0.8.0] - 2026-09-25
+
+### Added
+
+- **Fixture-driven regression surface for the three `*_delta` checks**
+  (`security.suid_delta`, `security.outbound_delta`,
+  `updates.security_delta`) — the delta mode repaired in 0.7.1
+  (issue #38) now has its own replay-fixture corpus and property
+  tests. The delta check is box-audit's primary differentiator from
+  Lynis; until now only the seeded container exercised the absolute
+  counts, and the delta branch itself had no fixture-driven coverage.
+  - `test/fixtures/replay/deltas/` — six self-contained two-snapshot
+    replay corpora, one positive and one negative per delta. Positive:
+    the finding exists only in the today snapshot (21 → 24 SUID,
+    0 → 6 non-LAN remote IPs, 1 → 4 security updates pending), so
+    `--replay <dir> --diff 1` reports it as `+ ADDED`. Negative:
+    identical snapshots (with `updates.security_pending` present on
+    both days in the security variant), proving a steady queue is not
+    a delta — the fixture that proves the tests' teeth.
+  - `test/properties/security.suid_delta.sh`,
+    `security.outbound_delta.sh`, `updates.security_delta.sh` — run
+    each corpus through both branches: the delta fires for the
+    positive fixture and does not fire for the negative one.
+    Property suite grows 11 → 14 files, still under the 5-second
+    smoke budget (~1.6s).
+  - Test-surface only: no change to the script, its output, the JSON
+    contract, CLI flags, or config schema.
+
 ## [0.7.1] - 2026-09-24
 
 ### Fixed

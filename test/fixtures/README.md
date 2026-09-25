@@ -60,4 +60,6 @@ touch -d '4 days ago' test/fixtures/apt-update-stamp-stale
 
 `test/fixtures/replay/` is a separate corpus: real `--json`-shaped daily
 snapshots used by the T01 replay smoke assertions, not external-tool
-output. Do not mix the two.
+output. Do not mix the two. Its `deltas/` sub-corpus carries the
+positive/negative `*_delta` regression fixtures — see
+[replay/deltas/README.md](replay/deltas/README.md).
