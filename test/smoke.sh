@@ -50,6 +50,42 @@ if check "--nope exits 2" '^2$' bash "$SCRIPT" --nope; then
     if [[ "$ERR" == *"--nope"* ]]; then ok "--nope stderr mentions the flag"; else fail "--nope stderr missing the flag (got: $ERR)"; fi
 fi
 
+# --- --init idempotency report (F1, 0.9.0) ----------------------------------
+# Root-gated (manage commands require root), so this block runs only where
+# root or passwordless sudo is available AND /var/lib/box-audit does not
+# exist — --init rewrites the allowlists from live system state, so a box
+# with a real install keeps its config untouched. This placement is
+# load-bearing: it must run before any root-executed audit below creates
+# /var/lib/box-audit for its integrity baseline. Three-run protocol pins
+# all three operator-visible outcomes: fresh seed, no-op re-run, re-seed
+# after a manual edit. The dir is removed afterwards so re-running the
+# suite stays fresh.
+INIT_SKIP=""
+if [[ -e /var/lib/box-audit ]]; then
+    INIT_SKIP="/var/lib/box-audit already exists (live install — not touched)"
+elif [[ $EUID -ne 0 ]]; then
+    if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true >/dev/null 2>&1; then
+        INIT_SKIP="no root and no passwordless sudo"
+    fi
+fi
+if [[ -n "$INIT_SKIP" ]]; then
+    ok "--init idempotency skipped: $INIT_SKIP"
+else
+    INIT_PREFIX=()
+    [[ $EUID -ne 0 ]] && INIT_PREFIX=(sudo)
+    if check "--init on a fresh config dir exits 0" '^0$' "${INIT_PREFIX[@]}" bash "$SCRIPT" --init; then
+        if [[ "$OUT" == "box-audit: seeded "* ]]; then ok "--init fresh run reports seeded"; else fail "--init fresh run not reporting seeded (got: $OUT)"; fi
+    fi
+    if check "--init re-run with no changes exits 0" '^0$' "${INIT_PREFIX[@]}" bash "$SCRIPT" --init; then
+        if [[ "$OUT" == "box-audit: config unchanged at /var/lib/box-audit" ]]; then ok "--init no-op re-run reports config unchanged"; else fail "--init no-op re-run not reporting unchanged (got: $OUT)"; fi
+    fi
+    "${INIT_PREFIX[@]}" /bin/sh -c 'echo 631 >> /var/lib/box-audit/ports-allowlist.txt'
+    if check "--init after a manual allowlist edit exits 0" '^0$' "${INIT_PREFIX[@]}" bash "$SCRIPT" --init; then
+        if [[ "$OUT" == "box-audit: seeded "* ]]; then ok "--init after manual edit reports seeded again"; else fail "--init after manual edit not reporting seeded (got: $OUT)"; fi
+    fi
+    "${INIT_PREFIX[@]}" rm -rf /var/lib/box-audit
+fi
+
 # --- --tail: optional arg, must not crash under set -u ----------------------
 check "bare --tail exits 0" '^0$' bash "$SCRIPT" --tail
 if [[ -z "$ERR" ]]; then ok "bare --tail stderr empty"; else fail "bare --tail stderr not empty: $ERR"; fi

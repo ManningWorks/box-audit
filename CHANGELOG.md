@@ -5,6 +5,21 @@ All notable changes to box-audit are documented here. The format follows
 grouped by kind, not by PR, and are written for the person deciding
 whether to upgrade.
 
+## [0.9.0] - 2026-09-25
+
+### Added
+
+- **`--init` idempotency report (F1)** — `box-audit --init` now tells the
+  operator what it did. When every per-box config file under
+  `/var/lib/box-audit/` already held exactly what a fresh snapshot would
+  write, it prints `box-audit: config unchanged at /var/lib/box-audit`
+  instead of silently rewriting; when any file was rewritten it prints the
+  existing `box-audit: seeded <files>` line. Detection is by content hash
+  (not mtime), so an identical re-seed never reads as a change. An operator
+  running `--init` as a smoke check can finally tell "rewrote everything"
+  from "no-op because config was already current". Additive stdout only:
+  no JSON contract change, no new flag, config files untouched.
+
 ## [0.8.0] - 2026-09-25
 
 ### Added

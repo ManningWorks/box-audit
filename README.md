@@ -150,6 +150,11 @@ allowlists (`--init`, `--accept-port`, `--accept-timer`,
 `--outbound-threshold`), see
 [`skills/box-audit/references/cli.md`](skills/box-audit/references/cli.md).
 
+`box-audit --init` tells you what it did: `config unchanged at
+/var/lib/box-audit` when every allowlist already held exactly what a fresh
+snapshot would write (a no-op re-run), or `seeded <files>` when it rewrote
+one or more of them.
+
 ```ini
 # /etc/systemd/system/box-audit.service
 [Unit]
