@@ -233,6 +233,42 @@ else
     exit 1
 fi
 
+# --- F1/0.9.0: --init idempotency report (both branches) --------------------
+# install.sh seeds the five config files with comment-heavy defaults; the
+# first post-install --init rewrites them from live state, so it must report
+# "seeded ...". An immediate re-run over an unchanged box must report the
+# no-op line instead — this is the branch tier 1 can only cover where root is
+# available, and the one an operator runs as a smoke check. Then a manual
+# edit to one allowlist must flip the report back to "seeded ..." (the edit
+# differs from anything --init would write, so the rewrite is real; the
+# rewrite also removes the junk line, leaving the config valid for the
+# issue-#12 block below).
+INIT_OUT="$(privileged_exec /usr/local/bin/box-audit --init || true)"
+if [[ "$INIT_OUT" == "box-audit: seeded "* ]]; then
+    echo "test/install-seeded.sh: first --init after install reports seeded"
+elif [[ "$INIT_OUT" == "box-audit: config unchanged at /var/lib/box-audit" ]]; then
+    echo "test/install-seeded.sh: FAIL — first --init after install reported unchanged; install.sh defaults must differ from a live snapshot" >&2
+    exit 1
+else
+    echo "test/install-seeded.sh: FAIL — first --init after install emitted neither 'seeded' nor 'config unchanged': $INIT_OUT" >&2
+    exit 1
+fi
+INIT_OUT="$(privileged_exec /usr/local/bin/box-audit --init || true)"
+if [[ "$INIT_OUT" == "box-audit: config unchanged at /var/lib/box-audit" ]]; then
+    echo "test/install-seeded.sh: no-op --init re-run reports config unchanged"
+else
+    echo "test/install-seeded.sh: FAIL — no-op --init re-run did not report 'config unchanged': $INIT_OUT" >&2
+    exit 1
+fi
+privileged_exec /bin/bash -c 'echo box-audit-test-junk >> /var/lib/box-audit/ports-allowlist.txt' >/dev/null
+INIT_OUT="$(privileged_exec /usr/local/bin/box-audit --init || true)"
+if [[ "$INIT_OUT" == "box-audit: seeded "* ]]; then
+    echo "test/install-seeded.sh: --init after a manual allowlist edit reports seeded again"
+else
+    echo "test/install-seeded.sh: FAIL — --init after a manual allowlist edit did not report 'seeded ...': $INIT_OUT" >&2
+    exit 1
+fi
+
 # Regression: box-audit --init must populate timers-baseline.txt
 # with the actual .timer units from `systemctl list-timers --all`.
 # Before issue #12 was fixed, --init silently wrote 0 bytes (python

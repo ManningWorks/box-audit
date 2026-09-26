@@ -241,6 +241,23 @@ EOF
         OUTBOUND_FILE="$CONFIG_DIR/outbound-threshold.conf"
         CRON_D_ALLOWLIST_FILE="$CONFIG_DIR/cron-d-allowlist.txt"
         SUID_THRESHOLD_FILE="$CONFIG_DIR/suid-threshold.conf"
+        # Content fingerprints of the five config files, one digest per line
+        # in a fixed order, 'missing' for a file that does not exist. --init
+        # hashes the set before and after its rewrite: identical outputs mean
+        # every file already held exactly what --init would have written, so
+        # the run was a no-op and can say so. String-based (not mtime) so an
+        # identical re-seed never reads as a change.
+        config_hashes() {
+            local f
+            for f in "$PORTS_FILE" "$TIMERS_FILE" "$OUTBOUND_FILE" \
+                     "$CRON_D_ALLOWLIST_FILE" "$SUID_THRESHOLD_FILE"; do
+                if [[ -f "$f" ]]; then
+                    /usr/bin/sha256sum "$f" 2>/dev/null | /usr/bin/awk '{print $1}'
+                else
+                    echo "missing"
+                fi
+            done
+        }
         note_default_used() {
             # Gate via a sentinel file rather than an in-process variable.
             # The five helpers are all called via $(...) command substitution,
@@ -338,6 +355,15 @@ EOF
             /usr/bin/mkdir -p "$CONFIG_DIR" || { echo "box-audit: cannot create $CONFIG_DIR" >&2; exit 1; }
             case "$MANAGE_MODE" in
                 init)
+                    # Fingerprint the config set before rewriting so the final
+                    # message can tell the operator whether this run actually
+                    # changed anything (idempotency report, F1/0.9.0). A full
+                    # match after the rewrite means every file already held
+                    # exactly what --init writes — report the no-op instead of
+                    # the seeded line. Any difference (fresh dir, manual edit,
+                    # drifted defaults) falls through to the existing output.
+                    local init_hashes_before
+                    init_hashes_before="$(config_hashes)"
                     /usr/bin/ss -tlnH 2>/dev/null \
                         | /usr/bin/awk '{print $4}' | /usr/bin/grep -oP ':\K\d+$' \
                         | /usr/bin/sort -un > "$PORTS_FILE"
@@ -363,7 +389,11 @@ for row in json.load(sys.stdin):
                     # a clean slate (no notice unless something is missing
                     # again).
                     /usr/bin/rm -f /var/lib/box-audit/.defaults-notice-printed
-                    echo "box-audit: seeded $PORTS_FILE, $TIMERS_FILE, $OUTBOUND_FILE, $CRON_D_ALLOWLIST_FILE, $SUID_THRESHOLD_FILE"
+                    if [[ "$(config_hashes)" == "$init_hashes_before" ]]; then
+                        echo "box-audit: config unchanged at $CONFIG_DIR"
+                    else
+                        echo "box-audit: seeded $PORTS_FILE, $TIMERS_FILE, $OUTBOUND_FILE, $CRON_D_ALLOWLIST_FILE, $SUID_THRESHOLD_FILE"
+                    fi
                     ;;
                 accept-port)
                     [[ -f "$PORTS_FILE" ]] || /usr/bin/install -D -m 0644 /dev/null "$PORTS_FILE"

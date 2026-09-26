@@ -49,7 +49,7 @@ regardless of EUID.
 
 | Flag | Argument | What it does |
 |---|---|---|
-| `--init` | none | Snapshots the box's current state into all five config files: currently-listening ports → `ports-allowlist.txt`; active `*.timer` units → `timers-baseline.txt`; current `/etc/cron.d/` entries (plus the four standard names) → `cron-d-allowlist.txt`; outbound threshold reset to 25 → `outbound-threshold.conf`; SUID threshold seeded at 30 → `suid-threshold.conf`. Idempotent — safe to re-run. |
+| `--init` | none | Snapshots the box's current state into all five config files: currently-listening ports → `ports-allowlist.txt`; active `*.timer` units → `timers-baseline.txt`; current `/etc/cron.d/` entries (plus the four standard names) → `cron-d-allowlist.txt`; outbound threshold reset to 25 → `outbound-threshold.conf`; SUID threshold seeded at 30 → `suid-threshold.conf`. Idempotent — safe to re-run. Reports what happened: `box-audit: config unchanged at /var/lib/box-audit` when every file already held exactly what a fresh snapshot would write, or `box-audit: seeded <files>` when it rewrote one or more. |
 | `--accept-port` | integer 1–65535 | Appends the port to `ports-allowlist.txt`. Refuses duplicates. Use after the audit flags a port you want to keep. |
 | `--accept-timer` | name (e.g. `lynis`) | Appends `<name>.timer` to `timers-baseline.txt`. Accepts both `name` and `name.timer`. |
 | `--outbound-threshold` | positive integer | Writes the new threshold to `outbound-threshold.conf`. The OUTBOUND finding fires only when today's count exceeds this; daily-delta awareness (PR 3) further narrows that to 2× yesterday, when yesterday exists. |
