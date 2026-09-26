@@ -5,6 +5,26 @@ All notable changes to box-audit are documented here. The format follows
 grouped by kind, not by PR, and are written for the person deciding
 whether to upgrade.
 
+## [0.8.1] - 2026-09-26
+
+### Fixed
+
+- **F10 systemd hardening profile for `box-audit.service`** (defense in
+  depth, no new functionality — ships in PATCH). The embedded
+  `SERVICE_UNIT_CONTENT` in `install.sh` now carries the five verified
+  hardening directives as one inseparable static block:
+  `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`,
+  `PrivateTmp=yes`, and the two `ReadWritePaths=` carve-outs
+  (`/var/log/box-audit`, `/var/lib/box-audit`). The combined set is
+  proven safe end-to-end (12/12 baseline `check_id`s fire, a real
+  `latest.json` is written, `integrity.change` fires identically).
+  `ProtectSystem=strict` is load-bearing-safe only *because*
+  `PrivateTmp=yes` is in the same unit — together they replace strict's
+  read-only remount of the shared `/tmp` with a fresh private writable
+  `/tmp`. The five are shipped as a unit, not as individually-toggleable
+  options: `strict` without a writable `/tmp` silently disables the
+  entire audit (clean `exit 0`, 0-byte `latest.json`, no error signal).
+
 ## [0.8.0] - 2026-09-25
 
 ### Added

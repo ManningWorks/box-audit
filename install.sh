@@ -53,6 +53,22 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+# F10 hardening profile — these five directives are ONE inseparable unit,
+# not a menu. ProtectSystem=strict read-only-remounts the *shared* /tmp,
+# which would silently disable the whole audit (clean exit 0, 0-byte
+# latest.json, no error signal); PrivateTmp=yes hands the service a fresh
+# *private* writable /tmp that the strict read-only bind-mounts do not
+# reach, so it is what rescues strict. The two ReadWritePaths lines are the
+# carve-outs strict requires for the persistent log/lib dirs. Apply them
+# together, in one change, and never ship strict without a writable /tmp
+# (PrivateTmp or a /tmp carve-out) — that coupling is load-bearing. Do not
+# add ReadWritePaths=/tmp: provable no-op under PrivateTmp=yes.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/log/box-audit
+ReadWritePaths=/var/lib/box-audit
 User=root
 # Group=boxaudit + UMask=0037 make every file the service creates
 # (latest.json via StandardOutput, history snapshots, sidecar) land as
