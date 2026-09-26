@@ -53,6 +53,45 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+# F10 hardening profile — these five directives are ONE inseparable unit,
+# not a menu. ProtectSystem=strict read-only-remounts the *shared* /tmp,
+# which would silently disable the whole audit (clean exit 0, 0-byte
+# latest.json, no error signal); PrivateTmp=yes hands the service a fresh
+# *private* writable /tmp that the strict read-only bind-mounts do not
+# reach, so it is what rescues strict. Apply them together, in one change,
+# and never ship strict without a writable /tmp (PrivateTmp or a /tmp
+# carve-out) — that coupling is load-bearing. Do not add
+# ReadWritePaths=/tmp: provable no-op under PrivateTmp=yes.
+#
+# The ReadWritePaths carve-outs fall into two load-bearing sets:
+#   (1) the box-audit persistent state — /var/log/box-audit (latest.json,
+#       history, sidecar) and /var/lib/box-audit (integrity baseline,
+#       cron-d allowlist). Without these the strict unit cannot write its
+#       own output and the audit silently no-ops.
+#   (2) the apt working dirs — /var/lib/apt (package lists + the
+#       update-success-stamp) and /var/cache/apt (archive cache).
+#       report_updates runs apt-get update in-run to prime the cache
+#       before apt list --upgradable (box-audit.sh:1166); under strict
+#       without these carve-outs the lists dir is read-only, apt returns
+#       RC=0 while emitting swallowed EROFS warnings, and the service then
+#       reads a STALE cache — recreating the documented "0 security vs 28
+#       pending" incident. Carving them out keeps priming real.
+#
+# ProtectHome=read-only, NOT yes: yes makes /home, /root and /run/user
+# *inaccessible and empty* (≈ InaccessiblePaths=), which drops the
+# /root/.ssh/authorized_keys crown jewel (box-audit.sh:78) from the
+# integrity baseline on the first hardened run — a false "removed" finding
+# plus a poisoned baseline that then never monitors that file again.
+# read-only keeps /root readable+hashable (the integrity check only reads
+# it) while still blocking writes — the hardening goal.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths=/var/log/box-audit
+ReadWritePaths=/var/lib/box-audit
+ReadWritePaths=/var/lib/apt
+ReadWritePaths=/var/cache/apt
 User=root
 # Group=boxaudit + UMask=0037 make every file the service creates
 # (latest.json via StandardOutput, history snapshots, sidecar) land as
