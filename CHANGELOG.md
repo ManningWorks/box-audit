@@ -13,9 +13,10 @@ whether to upgrade.
   depth, no new functionality — ships in PATCH). The embedded
   `SERVICE_UNIT_CONTENT` in `install.sh` now carries the five verified
   hardening directives as one inseparable static block:
-  `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`,
-  `PrivateTmp=yes`, and the two `ReadWritePaths=` carve-outs
-  (`/var/log/box-audit`, `/var/lib/box-audit`). The combined set is
+  `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=read-only`,
+  `PrivateTmp=yes`, and the four `ReadWritePaths=` carve-outs
+  (`/var/log/box-audit`, `/var/lib/box-audit`, `/var/lib/apt`,
+  `/var/cache/apt`). The combined set is
   proven safe end-to-end (12/12 baseline `check_id`s fire, a real
   `latest.json` is written, `integrity.change` fires identically).
   `ProtectSystem=strict` is load-bearing-safe only *because*
@@ -24,6 +25,12 @@ whether to upgrade.
   `/tmp`. The five are shipped as a unit, not as individually-toggleable
   options: `strict` without a writable `/tmp` silently disables the
   entire audit (clean `exit 0`, 0-byte `latest.json`, no error signal).
+  `ProtectHome=read-only` (not `yes`) keeps `/root` and `/home`
+  readable so the `/root/.ssh/authorized_keys` crown jewel stays in the
+  integrity baseline while still blocking writes; the apt carve-outs keep
+  the in-run `apt-get update` priming from no-op'ing under strict (its
+  lists/cache writes would otherwise be read-only, and a stale cache makes
+  `updates.security_pending` wrong).
 
 ## [0.8.0] - 2026-09-25
 
