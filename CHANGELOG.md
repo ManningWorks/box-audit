@@ -72,6 +72,21 @@ whether to upgrade.
   and the tier-1/tier-2 assertions; the tier-2 seeded image enables a
   second `recidive` jail and bans on both to cover the discovery and
   fallback branches.
+- **IPv6 outbound parity (F4)** — `security.outbound_remote_count_v6`
+  (warn) gives the IPv6 side of the outbound-remote check its own
+  finding: it fires when the distinct non-private IPv6 remotes from
+  `ss -tnp state established` exceed the outbound threshold. Additive —
+  the existing `security.outbound_remote_count` finding fires identically
+  to before (same check_id, same message, same sample), and the two
+  findings are separate check_ids, so a beacon that speaks only IPv6 no
+  longer has to dilute the combined count to be visible. No new CLI flag
+  or per-box config: the new check shares the existing
+  `--outbound-threshold` knob (default 25), so raising the threshold
+  quiets both families at once. On a host with no IPv6 stack the check
+  stays quiet (a parse failure must never read as a beacon). The check_id
+  is added to `--print-schema`, the emoji/label map, and the replay path
+  (a fresh v6 finding renders as `+ ADDED` in `--replay --diff`), with
+  tier-1/tier-2 coverage for both branches.
 
 ## [0.8.1] - 2026-09-26
 

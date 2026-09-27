@@ -318,6 +318,138 @@ if [[ "$EXPECTED" != "$ACTUAL" ]]; then
     exit 1
 fi
 
+# --- F4 (0.9.0): IPv6 outbound parity — both live branches ------------------
+# The v6 finding (security.outbound_remote_count_v6) reads the same
+# `ss -tnp state established` stream as the combined check and cannot be
+# faked any other way (no env override — see
+# test/properties/security.outbound_remote_count_v6.sh). This block drives
+# both branches with real sockets:
+#
+#   1. v6-to-public: two ESTAB IPv6 connections to documentation-range
+#      (RFC 3849 2001:db8::/32) addresses added on the container's lo.
+#      Loopback carries no v6 default route, so `ip -6 addr add` makes the
+#      addrs local and connect() succeeds without any external network —
+#      the kernel reports two ESTAB v6 sockets, exactly what the check
+#      parses. The threshold is lowered to 1 (the minimum valid value)
+#      via the EXISTING --outbound-threshold knob — no new per-box config,
+#      and 25 would need 26 connections.
+#   2. v6-quiet: after the holder expires and the sockets tear down, a
+#      second audit must show no v6 finding — v6 capability without v6
+#      traffic stays quiet (this is also the graceful-degradation proof
+#      for boxes that simply have no v6 traffic).
+#
+# On a runner whose kernel/bridge has no IPv6 stack, seeding fails at
+# `ip -6 addr add`; the block skips itself with a note (the property
+# suite's replay assertions still cover the finding's semantics).
+# shellcheck disable=SC2016  # bash -c string is deliberately single-quoted
+SEED_V6_OUT="$(privileged_exec /bin/bash -c '
+    set -e
+    ip -6 addr add 2001:db8::100/128 dev lo
+    ip -6 addr add 2001:db8::101/128 dev lo
+    # Holder: two listeners held at module scope (a loop that reassigns a
+    # single socket var drops the first reference and CPython refcount-
+    # closes that listener — the connect then hits ECONNREFUSED) + two
+    # ESTAB connects. setsid detaches it from this exec session.
+    setsid python3 -c "
+import socket, time
+def listen(ip, port):
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((ip, port))
+    s.listen(5)
+    return s
+ls1 = listen(\"2001:db8::100\", 443)
+ls2 = listen(\"2001:db8::101\", 443)
+c1 = socket.create_connection((\"2001:db8::100\", 443))
+c2 = socket.create_connection((\"2001:db8::101\", 443))
+time.sleep(30)
+" &
+    sleep 3
+    # The holder must have produced exactly the two ESTAB v6 remotes the
+    # check will see. Fewer means the connect raced; fail the seed so the
+    # driver skips gracefully instead of asserting on a half-state.
+    n=$(ss -tnp state established | grep -c "2001:db8::10" || true)
+    [[ "$n" -ge 2 ]]
+    echo 1 > /var/lib/box-audit/outbound-threshold.conf
+    echo SEED_OK
+' 2>&1 || true)"
+if [[ "$SEED_V6_OUT" == *SEED_OK* ]]; then
+    echo "test/install-seeded.sh: seeded 2 ESTAB v6 remotes (2001:db8::100/101 on lo), threshold=1"
+    BA_JSON_V6="$(mktemp)"
+    LIB_CLEANUP_PATHS+=("$BA_JSON_V6")
+    if ! privileged_exec /usr/local/bin/box-audit --json > "$BA_JSON_V6" 2>/dev/null; then
+        echo "test/install-seeded.sh: box-audit --json (v6-seeded run) exited non-zero" >&2
+        exit 1
+    fi
+    V6_PROBE_OUT="$(BA_JSON_V6="$BA_JSON_V6" python3 - <<'PY' || true
+import json, os
+d = json.load(open(os.environ["BA_JSON_V6"]))
+v6 = [f for f in d.get("findings", []) if f.get("check_id") == "security.outbound_remote_count_v6"]
+comb = [f for f in d.get("findings", []) if f.get("check_id") == "security.outbound_remote_count"]
+probs = []
+if len(v6) != 1:
+    probs.append(f"expected exactly 1 v6 finding, got {len(v6)}: {v6}")
+else:
+    if v6[0].get("severity") != "warn":
+        probs.append(f"v6 severity {v6[0].get('severity')!r} != warn")
+    if v6[0].get("count") != 2:
+        probs.append(f"v6 count {v6[0].get('count')!r} != 2 (two distinct doc-range remotes)")
+    msg = v6[0].get("message", "")
+    if "2001:db8::100" not in msg or "2001:db8::101" not in msg:
+        probs.append(f"v6 message missing both doc-range remotes: {msg!r}")
+if not comb:
+    probs.append("combined security.outbound_remote_count did not fire alongside the v6 finding")
+if probs:
+    print("FAIL_V6:" + "; ".join(probs))
+    raise SystemExit(1)
+print(f"OK v6={v6[0]['count']} comb={comb[0]['count']}")
+PY
+)"
+    if [[ "$V6_PROBE_OUT" == OK* ]]; then
+        echo "test/install-seeded.sh: v6-seeded run fired security.outbound_remote_count_v6 as expected (${V6_PROBE_OUT#OK })"
+    else
+        echo "test/install-seeded.sh: FAIL — v6-seeded run findings wrong: $V6_PROBE_OUT" >&2
+        echo "--- audit stdout ---" >&2
+        cat "$BA_JSON_V6" >&2
+        exit 1
+    fi
+    # Restore the threshold before the Issue #38 delta block reads the
+    # sidecar this run just wrote (it plants its own sidecar, but the
+    # live counts at that point must not include this block's sockets).
+    privileged_exec /bin/bash -c 'echo 25 > /var/lib/box-audit/outbound-threshold.conf'
+    # Branch A: wait for the holder to expire, then the v6 finding must
+    # be gone. The holder sleeps 30s; poll up to 30s for the ESTAB v6
+    # rows to disappear so the second audit runs on a settled netns.
+    for _ in $(seq 1 30); do
+        if ! privileged_exec ss -tnp state established 2>/dev/null | grep -q '2001:db8::10'; then
+            break
+        fi
+        sleep 1
+    done
+    BA_JSON_NOV6="$(mktemp)"
+    LIB_CLEANUP_PATHS+=("$BA_JSON_NOV6")
+    if ! privileged_exec /usr/local/bin/box-audit --json > "$BA_JSON_NOV6" 2>/dev/null; then
+        echo "test/install-seeded.sh: box-audit --json (v6-quiet run) exited non-zero" >&2
+        exit 1
+    fi
+    NOV6_HITS="$(python3 -c '
+import json
+d = json.load(open("'"$BA_JSON_NOV6"'"))
+hits = [f["check_id"] for f in d.get("findings", []) if f.get("check_id") == "security.outbound_remote_count_v6"]
+print("yes" if hits else "no")
+')"
+    if [[ "$NOV6_HITS" == "no" ]]; then
+        echo "test/install-seeded.sh: v6-quiet run fired no v6 finding (sockets torn down)"
+    else
+        echo "test/install-seeded.sh: FAIL — v6-quiet run still fired the v6 finding" >&2
+        echo "--- audit stdout ---" >&2
+        cat "$BA_JSON_NOV6" >&2
+        exit 1
+    fi
+else
+    echo "test/install-seeded.sh: SKIP — v6 outbound block: no IPv6 stack in this container (seeding failed: ${SEED_V6_OUT:-empty}); property suite covers the finding's replay semantics"
+fi
+
 # --- Issue #38 regression: delta-mode signal integrity ---------------------
 # The persist sidecar history_persist_counts_from_json used to source
 # today's counts from the JSON snapshot's findings[] array, which only
