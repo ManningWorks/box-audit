@@ -5,6 +5,33 @@ All notable changes to box-audit are documented here. The format follows
 grouped by kind, not by PR, and are written for the person deciding
 whether to upgrade.
 
+## [0.9.1] - 2026-09-27
+
+### Fixed
+
+- **Lock gate degrades loudly when the lock file is unopenable.** The
+  single-instance guard conflated "lock file could not be opened" with
+  "another instance holds the lock": when the lock dir is read-only
+  (`ProtectSystem=strict` without a writable `/tmp`), the `exec 200>`
+  open failed, the subsequent `flock` died on the never-opened fd, and
+  the gate read that as real contention — printing "another instance is
+  already running" and `exit 0`'ing a clean success with **zero checks
+  run**. The unit then reported `Result=success` while having audited
+  nothing. An unopenable lock file now fails the run with exit 75
+  (POSIX `EX_TEMPFAIL`) and names the lock path on stderr, so the
+  systemd `Result` flips to `fail` and the misconfiguration is visible
+  instead of silent. Real contention (a live second instance) still
+  exits 0 as before — that skip is legitimate. `--json` now exits 75
+  (with no JSON on stdout) on a refused run rather than claiming a
+  successful 0-byte report.
+  - New exit code `75` is documented in the `--help` block,
+    `skills/box-audit/references/cli.md`, `SKILL.md`, and `README.md`.
+  - Test coverage: `test/smoke.sh` gains a negative variant that stages
+    a read-only lock dir via the new `BOXAUDIT_LOCK_DIR` override and
+    asserts the run exits 75 with the failure named on stderr (skips
+    itself on boxes where a read-only dir cannot be made to bite, e.g.
+    running as root).
+
 ## [0.9.0] - 2026-09-25
 
 ### Added

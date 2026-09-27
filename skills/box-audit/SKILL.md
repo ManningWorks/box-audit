@@ -1,6 +1,6 @@
 ---
 name: box-audit
-version: 0.9.0
+version: 0.9.1
 description: Run and interpret box-audit, a daily security + health audit for Linux boxes. Use when asked to check box health/security, run or schedule box-audit, install or upgrade it, read its latest.json report, triage its findings, or repair its timer/baseline. Installation is one command (install.sh), covered in references/install.md.
 ---
 
@@ -15,8 +15,10 @@ a human decision, not a trigger for action.
 The script lives at `/usr/local/bin/box-audit`. Output: text report
 (default) or JSON (`--json`). Latest JSON snapshot:
 `/var/log/box-audit/latest.json`. Exit codes: 0 = clear, 1 = findings,
-2 = bad flag. `--json` always exits 0; branch on the `status` field
-instead (`ok` vs `findings`).
+2 = bad flag, 75 = lock file unopenable (read-only lock dir — the run
+was refused, nothing audited). `--json` always exits 0 on a run that
+executes; a refused run exits 75 with no JSON. On an executing run,
+branch on the `status` field instead (`ok` vs `findings`).
 
 Not installed yet, or upgrading? That's one command — `sudo ./install.sh`
 from a repo checkout. Prerequisites, the verify gate, and pitfalls are in

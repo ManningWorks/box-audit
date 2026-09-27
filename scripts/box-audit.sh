@@ -161,7 +161,9 @@ Usage: $(/usr/bin/basename "$0") [OPTIONS]
                                Read-only; never restarts anything.
 
 Exit codes: 0 = all clear (or manage-op success), 1 = findings present,
-             2 = bad CLI flag. (--json mode always exits 0; see status field.)
+             2 = bad CLI flag, 75 = lock file unopenable (read-only lock
+             dir) — the run was refused, nothing was audited.
+             (--json mode always exits 0; see status field.)
 EOF
             exit 0
             ;;
@@ -780,7 +782,11 @@ with open(os.environ["FINDINGS_FILE"], "a") as fh:
 # systemd timer firing on a fixed schedule. A foreign-owned lockfile is
 # removed when possible; if the sticky bit blocks that, the guard is
 # skipped with a warning rather than failing the run (see below).
-LOCK_DIR="/tmp"
+#
+# BOXAUDIT_LOCK_DIR: env-overridable for the smoke suite's EROFS test,
+# same shape as the BOX_AUDIT_GROUP / STALE_PROC_MIN_AGE overrides — the
+# test stages a read-only lock dir under /tmp and points the gate at it.
+LOCK_DIR="${BOXAUDIT_LOCK_DIR:-/tmp}"
 LOCK_FILE="$LOCK_DIR/sysadmin-healthcheck-box-audit.lock"
 LOCK_ENABLED="yes"
 # Track anything that couldn't run properly, so a silent/missing result
@@ -809,7 +815,18 @@ if [[ "$LOCK_ENABLED" == "yes" ]]; then
     fi
     if [[ ! -f "$LOCK_FILE" ]] || [[ -O "$LOCK_FILE" ]]; then
         # We can open it (either freshly creating or overwriting our own).
-        exec 200>"$LOCK_FILE"
+        # A failed open is NOT contention: with fd 200 never opened,
+        # `flock -n 200` dies "Bad file descriptor" and the gate would
+        # misread that as "another instance running" and exit 0 — a silent
+        # no-op run (ProtectSystem=strict without a writable /tmp is the
+        # canonical trigger). Fail loudly with 75 (EX_TEMPFAIL) instead:
+        # the unit's Result flips success -> fail and the lock path lands
+        # on stderr. flag_degraded is not an option here — FINDINGS_FILE
+        # doesn't exist until main(), so the finding would be a no-op.
+        if ! exec 200>"$LOCK_FILE"; then
+            echo "sysadmin-healthcheck: ERROR — cannot open lock file $LOCK_FILE (read-only lock dir?) — refusing to run without the single-instance guard (exit 75)" >&2
+            exit 75
+        fi
         if ! /usr/bin/flock -n 200; then
             echo "sysadmin-healthcheck: another instance is already running, exiting" >&2
             exit 0

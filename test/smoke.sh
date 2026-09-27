@@ -287,6 +287,48 @@ else
     fail "--version missing '+replay' suffix (got: $OUT)"
 fi
 
+# --- lock gate: unopenable lock dir degrades loudly, never exit 0 ------------
+# A read-only lock dir (ProtectSystem=strict without a writable /tmp) makes
+# the lockfile unopenable. That must be a LOUD failure (exit 75), not a
+# silent exit 0 — the old gate conflated "fd failed to open (EROFS)" with
+# "flock held by a real contender" and exit 0'd both, so the service looked
+# healthy while having run zero checks. Negative variant per AGENTS.md.
+# BOXAUDIT_LOCK_DIR keeps the harness off shared /tmp; on a box without
+# shell-exec privileges the open failure can't be induced, so the block
+# skips itself (still CI-safe on a bare runner).
+LOCKTEST_DIR=""
+cleanup_locktest() { [[ -n "$LOCKTEST_DIR" ]] && chmod -R u+w "$LOCKTEST_DIR" 2>/dev/null; rm -rf "${LOCKTEST_DIR:-}"; }
+if ! ( : > /tmp/smoke.lockprobe.$$ ) 2>/dev/null; then
+    ok "lock-gate EROFS test skipped: no /tmp write permission to stage a read-only dir"
+else
+    rm -f /tmp/smoke.lockprobe.$$
+    LOCKTEST_DIR=$(mktemp -d /tmp/lockgate.XXXXXX)
+    LOCKTEST_RO="$LOCKTEST_DIR/ro"
+    mkdir -p "$LOCKTEST_RO" && chmod 0555 "$LOCKTEST_RO"
+    if ( : > "$LOCKTEST_RO/probe" ) 2>/dev/null; then
+        # The probe write SUCCEEDED in a 0555 dir: we are root (or otherwise
+        # bypass mode checks), so a read-only dir cannot induce the open
+        # failure — the EROFS branch is not inducible here.
+        ok "lock-gate EROFS test skipped: run as $EUID, read-only dir not effective"
+    else
+        OUT="$(BOXAUDIT_LOCK_DIR="$LOCKTEST_RO" bash "$SCRIPT" --json 2>/tmp/smoke.lockerr.$$)"
+        rc=$?
+        ERR="$(cat /tmp/smoke.lockerr.$$)"
+        rm -f /tmp/smoke.lockerr.$$
+        if [[ "$rc" -eq 75 ]]; then
+            ok "unopenable lock dir exits 75 (loud failure, not silent success) (exit $rc)"
+        else
+            fail "unopenable lock dir must exit 75, got $rc (silent success is the bug)"
+        fi
+        if [[ "$ERR" == *"cannot open lock file"* ]]; then
+            ok "unopenable lock dir names the failure on stderr"
+        else
+            fail "unopenable lock dir stderr missing the failure signal (got: $ERR)"
+        fi
+    fi
+fi
+cleanup_locktest
+
 # --- shellcheck across the shipped shell surface ----------------------------
 if command -v shellcheck >/dev/null 2>&1; then
     if (cd "$REPO" && shellcheck scripts/box-audit.sh scripts/notify-webhook.sh install.sh test/install-lib.sh test/install.sh test/install-seeded.sh test/local-integration.sh test/all.sh test/properties/*.sh test/properties/live/*.sh); then

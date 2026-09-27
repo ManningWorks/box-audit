@@ -19,7 +19,10 @@ All flags exit 0 on success, 2 on bad input. Manage flags (`--init`,
 | `-h`, `--help` | Prints the usage block and exits. | text |
 
 Exit codes for the audit (not the manage flags): `0` = all clear,
-`1` = findings present, `2` = unknown flag. `--json` always exits 0.
+`1` = findings present, `2` = unknown flag, `75` = lock file unopenable
+(read-only lock dir) — the run was refused before any check ran, so the
+non-zero exit is the signal. `--json` always exits 0 on a run that
+actually executes; a refused run exits 75 with no JSON on stdout.
 
 ## Stale-group self-diagnosis (`--check-groups`)
 

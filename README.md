@@ -69,9 +69,11 @@ message text. Count-carrying findings (`security.outbound_remote_count`,
 `security.suid_count`, `updates.security_pending`) also carry a numeric
 `count` field mirroring the value in the top-level `counts` block.
 
-Exit codes: `0` = all clear, `1` = findings present, `2` = bad CLI flag.
-In `--json` mode the exit code is always `0`; the JSON body's `status`
-field (`ok` vs `findings`) is the signal instead.
+Exit codes: `0` = all clear, `1` = findings present, `2` = bad CLI flag,
+`75` = lock file unopenable (read-only lock dir) — the run was refused
+before any check ran. In `--json` mode the exit code is `0` on a run that
+executes; the JSON body's `status` field (`ok` vs `findings`) is the
+signal instead. A refused run exits `75` with no JSON on stdout.
 
 ## Install
 
