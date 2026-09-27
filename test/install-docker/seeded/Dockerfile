@@ -21,7 +21,7 @@
 #   - /etc/cron.d/0box-audit-test (extra cron drop-in)
 #   - root crontab with one entry
 #   - /etc/systemd/system/box-audit-fail.service (ExecStart=/bin/false)
-#   - /etc/fail2ban/jail.local enabling the sshd jail
+#   - /etc/fail2ban/jail.local enabling the sshd + recidive jails
 #   - python3 -m http.server 9999 listening on 127.0.0.1
 #   - 16 journald auth.err entries (drives security.ssh_fails above threshold)
 #

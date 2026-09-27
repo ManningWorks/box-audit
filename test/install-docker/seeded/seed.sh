@@ -59,11 +59,18 @@ WantedBy=multi-user.target
 UNIT
 systemctl enable box-audit-fail.service
 
-# 5. Fail2ban sshd jail config. bantime.incremental = false stops
-#    the ban from auto-expiring during the audit window
-#    (fail2ban-reincidive can shorten bans on repeat offenders).
+# 5. Fail2ban jail config: sshd (the security.fail2ban_banned floor) plus
+#    recidive (a second, non-sshd jail that drives the F2 jail-discovery
+#    check — security.fail2ban_jail). bantime.incremental = false stops the
+#    ban from auto-expiring during the audit window. The driver bans one
+#    documentation IP on each jail post-boot (sshd 192.0.2.1, recidive
+#    203.0.113.7).
 cat > /etc/fail2ban/jail.local <<'JAIL'
 [sshd]
+enabled = true
+bantime.incremental = false
+
+[recidive]
 enabled = true
 bantime.incremental = false
 JAIL

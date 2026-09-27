@@ -31,6 +31,7 @@ committing a refresh — the repo is public.
 | `journalctl-ssh-auth-fail.txt` | `journalctl --since "24 hours ago" --facility=auth --no-pager` | Three real-format `Failed password` lines (the exact patterns `security.ssh_fails` greps for), using documentation IPs. |
 | `journalctl-ssh-auth-fail-empty.txt` | same | The empty-journal boundary variant: no lines, so the count is 0 and no finding may fire. |
 | `fail2ban-status.txt` | `fail2ban-client status sshd` | Real fail2ban 1.0.2 layout with tab-indented fields and one banned documentation IP; `security.fail2ban_banned` reads the `Currently banned` value from this shape. |
+| `fail2ban-status-list.txt` | `fail2ban-client status` (full) | Real multi-jail full-status output (two active jails, `recidive, sshd`), the exact byte shape the tier-2 seeded container produces; `security.fail2ban_jail` parses the `Jail list:` value from this shape. |
 | `ss-tln.txt` | `ss -tlnp` | Header plus two `LISTEN` rows: port 22 (in the default allowlist) and port 9999 (not), which is the `security.new_port` classification boundary. |
 | `apt-update-stamp-fresh` | `touch` | `/var/lib/apt/periodic/update-success-stamp` analogue. The real stamp file is empty — its **mtime** is the signal `maintenance.apt_cache_stale` reads. Regenerate the "fresh" state with `touch apt-update-stamp-fresh`. |
 | `apt-update-stamp-stale` | `touch -d '4 days ago'` | Same file, aged past the 48h staleness window. Regenerate with `touch -d '4 days ago' apt-update-stamp-stale`. |

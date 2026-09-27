@@ -73,6 +73,13 @@ privileged_exec systemctl start box-audit-fail.service >/dev/null 2>&1 || true
 # an IP. `fail2ban-client ping` returning "pong" is the documented
 # readiness signal; `systemctl start` returns before the server is
 # listening.
+#
+# The recidive jail (drives the F2 jail-discovery check) inherits the
+# default logpath /var/log/fail2ban.log, and the container mounts /var/log
+# as a tmpfs so the build-time file is hidden at runtime. fail2ban-server
+# refuses to start when a jail's logpath is missing, so create the file
+# here, at boot, before the start.
+privileged_exec touch /var/log/fail2ban.log >/dev/null 2>&1 || true
 privileged_exec systemctl start fail2ban >/dev/null 2>&1 || true
 F2B_READY=""
 for _ in $(seq 1 30); do
@@ -87,6 +94,11 @@ if [[ -z "$F2B_READY" ]]; then
     exit 1
 fi
 privileged_exec fail2ban-client set sshd banip 192.0.2.1 >/dev/null 2>&1 || true
+# Ban one documentation IP on the second (non-sshd) jail too — recidive
+# drives the F2 jail-discovery check (security.fail2ban_jail). Different IPs
+# keep the two findings' messages distinguishable (sshd 192.0.2.1, recidive
+# 203.0.113.7, both RFC 5737 documentation ranges).
+privileged_exec fail2ban-client set recidive banip 203.0.113.7 >/dev/null 2>&1 || true
 
 # Start the python http.server that drives the new_port check.
 # Backgrounded with setsid so it survives the docker exec subshell —

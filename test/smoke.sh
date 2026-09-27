@@ -39,6 +39,29 @@ else
     fail "--print-schema output is not valid JSON"
 fi
 
+# --- F2 (0.9.0) fail2ban jail discovery: schema + degraded-floor pins --------
+# The per-jail id must be registered in --print-schema (the --json gate below
+# rejects any emitted check_id not in the map), and the sshd floor id must
+# stay put. Both hold regardless of whether fail2ban is installed here.
+if printf '%s' "$SCHEMA" | grep -q '"security.fail2ban_jail"'; then
+    ok "--print-schema registers security.fail2ban_jail"
+else
+    fail "--print-schema missing security.fail2ban_jail"
+fi
+if printf '%s' "$SCHEMA" | grep -q '"security.fail2ban_banned"'; then
+    ok "--print-schema still registers the security.fail2ban_banned floor"
+else
+    fail "--print-schema missing the security.fail2ban_banned floor id"
+fi
+# Degraded-floor contract: on a box without fail2ban (CI runner) the check
+# must not crash and the audit must stay JSON-valid — the hardcoded floor
+# remains the no-regression path when discovery is unavailable.
+if bash "$SCRIPT" --json 2>/dev/null | python3 -m json.tool >/dev/null 2>&1; then
+    ok "--json stays valid with no fail2ban client (degraded floor path)"
+else
+    fail "--json not valid on the no-fail2ban path"
+fi
+
 # --- help / version --------------------------------------------------------
 if check "--help exits 0" '^0$' bash "$SCRIPT" --help; then
     if [[ "$OUT" == *"Usage:"* ]]; then ok "--help prints usage"; else fail "--help output missing 'Usage:'"; fi
