@@ -222,6 +222,18 @@ body to `$BOX_AUDIT_WEBHOOK_URL` (set it in the environment or in
 `/etc/default/box-audit`). Any incoming-webhook endpoint works — Discord
 webhook, a Telegram bot via a relay, ntfy, your own receiver.
 
+Even on a healthy box the snapshot carries a few routine `info`-level
+findings, so the push lands almost daily. If you'd rather be woken only
+for real signal, set `BOX_AUDIT_NOTIFY_MIN_SEVERITY` in the same
+environment (or `/etc/default/box-audit`) to `warn` or `crit`: findings
+below the threshold stay on the box — `latest.json` and the pull path
+are untouched — and the notifier logs a `suppressed N findings below
+<threshold> threshold` count to stderr. `warn` keeps `warn` and above;
+`crit` keeps only the top severity. `degraded` findings are never
+suppressed: they say a check couldn't run, and hiding that in the push
+is worse than a noisy push. The default is unchanged — with the variable
+unset, every finding is posted, exactly as before.
+
 Wire it into the daily run with a drop-in, not a second unit:
 
 ```bash

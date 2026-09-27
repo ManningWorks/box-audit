@@ -229,8 +229,9 @@ EOF
 
         # --- Per-box config lookups -----------------------------------------------
         # /var/lib/box-audit/ holds per-box state: ports-allowlist.txt,
-        # timers-baseline.txt, outbound-threshold.conf. The helpers below read
-        # them, falling back to small built-in defaults when the file is missing
+        # timers-baseline.txt, outbound-threshold.conf, cron-d-allowlist.txt,
+        # suid-threshold.conf. The helpers below read them, falling back to
+        # small built-in defaults when the file is missing
         # (fresh install before --init ran; or just-installed agent-path clone).
         # Each first-miss per run prints a one-time stderr note telling the user
         # how to populate them. The gate is a sentinel file (see
