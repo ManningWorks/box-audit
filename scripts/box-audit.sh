@@ -703,6 +703,7 @@ out = {
         "security.sudo_fails":           "sudo auth failures in last 24h",
         "security.new_port":             "open port not in ports-allowlist",
         "security.outbound_remote_count":"non-LAN remote IPs established",
+        "security.outbound_remote_count_v6":"non-LAN IPv6 remote IPs established (separate from the combined v4+v6 count)",
         "security.outbound_delta":       "today > 2x yesterday AND > 5 absolute",
         "security.suid_count":           "SUID binary count",
         "security.suid_delta":           "today suid - yesterday suid > 2",
@@ -914,6 +915,42 @@ report_resources() {
     awk -v l="$load" -v thresh="$LOAD_THRESHOLD" 'BEGIN{exit !(l>thresh)}' && json_push warn resources.load_high resources "load ${load} (threshold ${LOAD_THRESHOLD})"
 }
 
+# Resolve the 1-based data column holding the peer (remote) address in
+# `ss -tnp state established` output, read from the header row.
+#
+# The position is NOT stable across iproute2 versions. On 5.x the header
+# carries a leading `State` column (`State Recv-Q Send-Q Local Peer
+# Process` — peer = 5th data column); from 6.x on, `ss` suppresses
+# columns whose value is constant across the printed rows (the state
+# filter makes every row ESTAB), so the peer shifts to the 4th data
+# column and $5 is the Process column. A hardcoded $5 (what the v4 line
+# still uses) reads process names on any 6.x box and captures no IPs.
+#
+# The header is the only authoritative source: `Local Address:Port` and
+# `Peer Address:Port` are two-word titles, counted as data columns
+# left-to-right until `Peer`. An unparseable header (no `Peer` title, or
+# empty input) prints nothing and the caller falls back to 5 — the
+# pre-F4 behavior — so a parse failure degrades to the old behavior,
+# never to garbage.
+ss_peer_column() {
+    local hdr
+    hdr=$(head -1)
+    printf '%s\n' "$hdr" | awk '
+        {
+            dcol = 0
+            for (i = 1; i <= NF; i++) {
+                if ($i == "Local" || $i == "Peer") {
+                    dcol++
+                    if ($i == "Peer") pc = dcol
+                    i++          # skip the following "Address:Port" word
+                } else {
+                    dcol++
+                }
+            }
+            if (pc) print pc
+        }'
+}
+
 report_security() {
 
     # fail2ban banned IPs
@@ -1019,23 +1056,34 @@ report_security() {
     # the JSON `counts` block (issue #38). See suid_count above for the
     # same comment.
     outbound_remote_count=0
-    local outbound_remote_sample=""
+    # F4 (0.9.0): v6-specific counter — the IPv6 slice of the remotes below,
+    # kept separate from the combined count so a v6-only beacon has its own
+    # finding (security.outbound_remote_count_v6). Same threshold knob, same
+    # per-box config: no new CLI flag, no new per-box file.
+    local outbound_remote_count_v6=0
+    local outbound_remote_sample_v6=""
     local ss_out
     ss_out=$($T /usr/bin/ss -tnp state established 2>/dev/null)
     if [[ -n "$ss_out" ]]; then
         # IPv4: column 5 holds remote addr:port.
         local remote_ips
         remote_ips=$(echo "$ss_out" | awk 'NR>1 {print $5}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
-        # IPv6: same column, but addresses are hex with colons and often a
-        # %if suffix ([2001:db8::1]:443 or [fe80::1%eth0]:22). Grab the
-        # bracketed address, strip port/brackets/interface. Without this,
-        # a compromised process phoning home over IPv6 is invisible to the
-        # check on any dual-stack box.
+        # IPv6: same extraction, but the peer column is resolved from the
+        # header rather than hardcoded (see ss_peer_column — iproute2 6.x
+        # suppresses the constant State column and shifts the peer left).
+        # The v4 line above intentionally keeps the historical $5: the
+        # DoD pins the IPv4 path byte-identical, and the v4 $5/6.x gap is
+        # a pre-existing bug tracked separately. Without the v6 column
+        # being right, a compromised process phoning home over IPv6 is
+        # invisible to the check on any dual-stack box.
         local remote_ips6
-        remote_ips6=$(echo "$ss_out" | awk 'NR>1 {print $5}' \
+        local v6_col
+        v6_col=$(printf '%s\n' "$ss_out" | ss_peer_column)
+        remote_ips6=$(echo "$ss_out" | awk -v c="${v6_col:-5}" 'NR>1 {print $c}' \
             | grep -oE '^\[[0-9a-fA-F:]+(%[a-z0-9]+)?\]' \
             | /usr/bin/sed -E 's/^\[//; s/\]$//' | sort -u)
         local suspicious_ips=""
+        local suspicious_ips_v6=""
         local ip
         for ip in $remote_ips; do
             # Skip RFC1918 + CGNAT + loopback
@@ -1060,12 +1108,25 @@ report_security() {
                 continue
             fi
             suspicious_ips="$suspicious_ips $ip"
+            # F4: the v6 finding counts exactly this filtered v6 slice,
+            # appended in parallel to the combined set (which keeps both
+            # families — the existing finding is unchanged).
+            suspicious_ips_v6="$suspicious_ips_v6 $ip"
         done
         outbound_remote_count=$(echo "$suspicious_ips" | /usr/bin/wc -w)
         outbound_remote_count=${outbound_remote_count:-0}
         outbound_remote_sample=$(echo "$suspicious_ips" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -v '^$' | /usr/bin/head -5 | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')
+        outbound_remote_count_v6=$(echo "$suspicious_ips_v6" | /usr/bin/wc -w)
+        outbound_remote_count_v6=${outbound_remote_count_v6:-0}
+        outbound_remote_sample_v6=$(echo "$suspicious_ips_v6" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -v '^$' | /usr/bin/head -5 | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')
     fi
     [[ $outbound_remote_count -gt $(get_outbound_threshold) ]] && json_push warn security.outbound_remote_count security "$outbound_remote_count non-LAN remote IP(s) connected: $outbound_remote_sample" "$outbound_remote_count"
+    # F4 (0.9.0): v6 parity. Same threshold knob as the combined check —
+    # raising --outbound-threshold quiets both, so a box that tunes the
+    # v4 side for alarm fatigue does not get a louder v6 twin. No v6 stack
+    # (ss prints nothing, or nothing bracketed) leaves the count at 0 and
+    # the check stays quiet: a parse failure must never read as a beacon.
+    [[ $outbound_remote_count_v6 -gt $(get_outbound_threshold) ]] && json_push warn security.outbound_remote_count_v6 security "$outbound_remote_count_v6 non-LAN IPv6 remote IP(s) connected: $outbound_remote_sample_v6" "$outbound_remote_count_v6"
     # Delta finding — only fires if today's count is 2x AND 5+ above yesterday.
     # When yesterday's snapshot is missing the delta is mute and the absolute
     # threshold above is the only signal (graceful degradation: ~day 1 of use).
@@ -1728,6 +1789,7 @@ EMOJI_LABEL = {
     "security.sudo_fails":             ("⚠️", "sudo"),
     "security.new_port":               ("🆕", "PORT"),
     "security.outbound_remote_count":  ("🌐", "OUTBOUND"),
+    "security.outbound_remote_count_v6": ("🌐", "OUTBOUND-V6"),
     "security.outbound_delta":         ("🌐", "OUTBOUND-DELTA"),
     "security.suid_count":             ("🔓", "SUID"),
     "security.suid_delta":             ("🔓", "SUID-DELTA"),

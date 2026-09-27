@@ -19,7 +19,7 @@ answering a different question:
 | Section | Checks |
 |---|---|
 | Resources | Disk > 85%, swap > 70%, load > 3.0 |
-| Security | fail2ban banned IPs (per jail — active jails discovered at runtime via `fail2ban-client status`; the `sshd` floor is the pinned `security.fail2ban_banned`), SSH failures (24h), sudo failures, listening ports vs baseline, **outbound non-LAN IPs** (catches C2), **SUID binary count** (catches rootkits) |
+| Security | fail2ban banned IPs (per jail — active jails discovered at runtime via `fail2ban-client status`; the `sshd` floor is the pinned `security.fail2ban_banned`), SSH failures (24h), sudo failures, listening ports vs baseline, **outbound non-LAN IPs** (catches C2 — IPv4+IPv6 combined as `security.outbound_remote_count`, the IPv6 slice as its own `security.outbound_remote_count_v6`), **SUID binary count** (catches rootkits) |
 | System | Failed systemd units, unhealthy Docker containers, Apport crash dumps, kernel errors, **non-standard systemd timers** (catches persistence), **unexpected user crontabs**, **unexpected `/etc/cron.d/` drop-ins** |
 | Updates | Pending security updates, kernel CVEs (reboot-required), origin classification (distro vs third-party) |
 | Maintenance | Reboot-required state, apt cache freshness, unattended-upgrades health, needrestart (libc/kernel drift, services needing restart) |

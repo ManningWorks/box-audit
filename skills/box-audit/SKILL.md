@@ -147,9 +147,13 @@ forgetting that. The recurring ones:
 - **`SUID: N suid binaries (baseline M)`** — count drift. New SUID
   binaries are a classic rootkit persistence move. Check the diff, not
   just the count.
-- **`OUTBOUND: <ip>`** — a non-LAN outbound connection. Expected for apt,
-  NTP, your own services. Unexpected IPs are the C2 question; resolve and
-  identify before dismissing.
+- **`OUTBOUND: <ip>`** — a non-LAN outbound connection (IPv4 and IPv6
+  combined). Expected for apt, NTP, your own services. Unexpected IPs are
+  the C2 question; resolve and identify before dismissing.
+- **`OUTBOUND-V6: <ip>`** — the IPv6-only slice of the outbound check,
+  reported as a separate finding (`security.outbound_remote_count_v6`)
+  so a v6-only beacon is visible without diluting the combined count.
+  Same threshold knob as `OUTBOUND`; triage it the same way.
 - **`CUSTOM-TIMERS: N non-standard`** — systemd timers outside the known
   set. Persistence mechanism of choice. box-audit's own timer is exempt
   from this check.
