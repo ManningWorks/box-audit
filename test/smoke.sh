@@ -329,6 +329,237 @@ else
 fi
 cleanup_locktest
 
+# --- notify-webhook severity floor (F3, 0.9.0) --------------------------------
+# The notifier POSTs the snapshot to a URL; the sink here is a stub curl
+# (temp dir prepended to PATH for this block only) that records the posted
+# --data-binary body. No network, no root: the snapshot is a local fixture
+# passed as $1, so this holds on a bare CI runner. The fixture carries one
+# finding per severity tier, so the filter arithmetic is exact.
+NOTIFY_DIR="$(mktemp -d /tmp/notifytest.XXXXXX)"
+NOTIFY_FIX="$NOTIFY_DIR/latest.json"
+NOTIFY_BODY="$NOTIFY_DIR/body"
+NOTIFY_ARGS="$NOTIFY_DIR/args"
+NOTIFY_ERRF="$NOTIFY_DIR/stderr"
+cat > "$NOTIFY_FIX" <<'NOTIFY_JSON'
+{
+  "findings": [
+    {
+      "check_id": "updates.upgradable",
+      "message": "3 packages upgradable",
+      "section": "updates",
+      "severity": "info"
+    },
+    {
+      "check_id": "security.new_port",
+      "message": "open port 12345 not in ports-allowlist",
+      "section": "security",
+      "severity": "warn"
+    },
+    {
+      "check_id": "security.ssh_fails",
+      "message": "12 sudo auth failures in last 24h",
+      "section": "security",
+      "severity": "alert"
+    },
+    {
+      "check_id": "degraded.check",
+      "message": "docker not installed",
+      "section": "system",
+      "severity": "degraded"
+    }
+  ],
+  "host": "fixture",
+  "status": "ok",
+  "timestamp": "2026-01-01T00:00:00Z"
+}
+NOTIFY_JSON
+cat > "$NOTIFY_DIR/curl" <<'NOTIFY_STUB'
+#!/usr/bin/env bash
+# stub curl: record the --data-binary body and the arg list, exit 0 (no network).
+prev=""
+for a in "$@"; do
+    if [[ "$prev" == "--data-binary" ]]; then
+        cat -- "${a#@}" >> "${NOTIFY_STUB_BODY:?}"
+    fi
+    prev="$a"
+done
+printf '%s\n' "$@" >> "${NOTIFY_STUB_ARGS:?}"
+exit 0
+NOTIFY_STUB
+chmod +x "$NOTIFY_DIR/curl"
+
+# notify_run <threshold|"">: run the notifier against the fixture with the
+# stub sink; rc and stderr land in NOTIFY_RC / NOTIFY_ERR. PATH is restored
+# before returning so the stub curl never leaks into later tiers.
+notify_run() {
+    local threshold="${1:-}"
+    local old_path="$PATH"
+    : > "$NOTIFY_BODY"
+    : > "$NOTIFY_ARGS"
+    export BOX_AUDIT_WEBHOOK_URL="https://fixture.example.com/hook"
+    export NOTIFY_STUB_BODY="$NOTIFY_BODY" NOTIFY_STUB_ARGS="$NOTIFY_ARGS"
+    export PATH="$NOTIFY_DIR:$old_path"
+    if [[ -n "$threshold" ]]; then
+        export BOX_AUDIT_NOTIFY_MIN_SEVERITY="$threshold"
+    else
+        unset BOX_AUDIT_NOTIFY_MIN_SEVERITY
+    fi
+    NOTIFY_RC=0
+    bash "$REPO/scripts/notify-webhook.sh" "$NOTIFY_FIX" 2>"$NOTIFY_ERRF" || NOTIFY_RC=$?
+    NOTIFY_ERR="$(cat "$NOTIFY_ERRF")"
+    PATH="$old_path"
+    unset BOX_AUDIT_WEBHOOK_URL NOTIFY_STUB_BODY NOTIFY_STUB_ARGS BOX_AUDIT_NOTIFY_MIN_SEVERITY
+}
+
+# notify_posted_count <severity>: findings of that severity in the posted body.
+# notify_posted_total: all findings in the posted body. Empty body -> 0.
+notify_posted_count() {
+    local sev="$1"
+    if [[ -s "$NOTIFY_BODY" ]]; then
+        python3 - "$NOTIFY_BODY" "$sev" <<'NOTIFY_PY'
+import json, sys
+print(sum(1 for f in json.load(open(sys.argv[1])).get("findings", []) if f.get("severity") == sys.argv[2]))
+NOTIFY_PY
+    else
+        echo 0
+    fi
+}
+notify_posted_total() {
+    if [[ -s "$NOTIFY_BODY" ]]; then
+        python3 - "$NOTIFY_BODY" <<'NOTIFY_PY'
+import json, sys
+print(len(json.load(open(sys.argv[1])).get("findings", [])))
+NOTIFY_PY
+    else
+        echo 0
+    fi
+}
+
+# 1. Unset threshold (default): backward-compat — the snapshot is posted
+#    byte-identical, the stub got the URL, stderr stays quiet about the filter.
+notify_run ""
+if [[ "$NOTIFY_RC" -eq 0 ]]; then
+    ok "notify-webhook unset threshold exits 0"
+else
+    fail "notify-webhook unset threshold must exit 0, got $NOTIFY_RC ($NOTIFY_ERR)"
+fi
+if grep -q "fixture.example.com/hook" "$NOTIFY_ARGS"; then
+    ok "notify-webhook unset threshold posts to the webhook URL"
+else
+    fail "notify-webhook unset threshold did not post to the webhook URL (args: $(cat "$NOTIFY_ARGS"))"
+fi
+if cmp -s "$NOTIFY_FIX" "$NOTIFY_BODY"; then
+    ok "notify-webhook unset threshold posts the snapshot byte-identical"
+else
+    fail "notify-webhook unset threshold changed the posted payload"
+fi
+if [[ "$NOTIFY_ERR" == *"suppressed"* ]]; then
+    fail "notify-webhook unset threshold leaked a suppression line: $NOTIFY_ERR"
+else
+    ok "notify-webhook unset threshold is stderr-quiet about the filter"
+fi
+
+# 2. warn: info dropped, warn + alert kept, degraded never suppressed,
+#    suppressed count on stderr, envelope keys intact.
+notify_run "warn"
+if [[ "$NOTIFY_RC" -eq 0 ]]; then
+    ok "notify-webhook warn threshold exits 0"
+else
+    fail "notify-webhook warn threshold must exit 0, got $NOTIFY_RC ($NOTIFY_ERR)"
+fi
+if [[ "$(notify_posted_total)" -eq 3 ]]; then
+    ok "notify-webhook warn threshold posts 3 of 4 findings (info suppressed)"
+else
+    fail "notify-webhook warn threshold posted $(notify_posted_total) findings, want 3"
+fi
+if [[ "$(notify_posted_count info)" -eq 0 ]]; then
+    ok "notify-webhook warn threshold suppresses the info finding"
+else
+    fail "notify-webhook warn threshold still posted an info finding"
+fi
+if [[ "$(notify_posted_count degraded)" -eq 1 ]]; then
+    ok "notify-webhook warn threshold never suppresses a degraded finding"
+else
+    fail "notify-webhook warn threshold dropped the degraded finding (blindedness hidden)"
+fi
+if [[ "$NOTIFY_ERR" == "notify-webhook: suppressed 1 findings below warn threshold" ]]; then
+    ok "notify-webhook warn threshold logs the suppressed count to stderr"
+else
+    fail "notify-webhook warn threshold stderr wrong (want 'suppressed 1 findings below warn threshold', got: $NOTIFY_ERR)"
+fi
+if python3 - "$NOTIFY_BODY" <<'NOTIFY_PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(0 if all(k in d for k in ("status", "timestamp", "host")) else 1)
+NOTIFY_PY
+then
+    ok "notify-webhook warn threshold keeps the status/timestamp/host envelope"
+else
+    fail "notify-webhook warn threshold lost envelope keys in the posted body"
+fi
+
+# 3. crit: alert only among content severities; degraded still passes.
+notify_run "crit"
+if [[ "$NOTIFY_RC" -eq 0 ]]; then
+    ok "notify-webhook crit threshold exits 0"
+else
+    fail "notify-webhook crit threshold must exit 0, got $NOTIFY_RC ($NOTIFY_ERR)"
+fi
+if [[ "$(notify_posted_total)" -eq 2 ]]; then
+    ok "notify-webhook crit threshold posts alert + degraded only"
+else
+    fail "notify-webhook crit threshold posted $(notify_posted_total) findings, want 2 (alert + degraded)"
+fi
+if [[ "$(notify_posted_count warn)" -eq 0 && "$(notify_posted_count info)" -eq 0 ]]; then
+    ok "notify-webhook crit threshold suppresses warn and info"
+else
+    fail "notify-webhook crit threshold still posted a warn/info finding"
+fi
+if [[ "$NOTIFY_ERR" == "notify-webhook: suppressed 2 findings below crit threshold" ]]; then
+    ok "notify-webhook crit threshold logs the suppressed count to stderr"
+else
+    fail "notify-webhook crit threshold stderr wrong (want 'suppressed 2 findings below crit threshold', got: $NOTIFY_ERR)"
+fi
+
+# 4. Invalid value: fail loudly, non-zero exit, and no POST at all
+#    (negative variant — the filter's teeth, per AGENTS.md).
+notify_run "foo"
+if [[ "$NOTIFY_RC" -ne 0 ]]; then
+    ok "notify-webhook invalid threshold exits non-zero"
+else
+    fail "notify-webhook invalid threshold must exit non-zero, got 0"
+fi
+if [[ "$NOTIFY_ERR" == *"BOX_AUDIT_NOTIFY_MIN_SEVERITY"* && "$NOTIFY_ERR" == *"info, warn or crit"* ]]; then
+    ok "notify-webhook invalid threshold names the variable and allowed values"
+else
+    fail "notify-webhook invalid threshold stderr unclear (got: $NOTIFY_ERR)"
+fi
+if [[ ! -s "$NOTIFY_BODY" && ! -s "$NOTIFY_ARGS" ]]; then
+    ok "notify-webhook invalid threshold posts nothing"
+else
+    fail "notify-webhook invalid threshold still POSTed a body"
+fi
+
+# 5. Explicit info: the spelled-out no-filter — identical to unset.
+notify_run "info"
+INFO_LEAK=0
+[[ "$NOTIFY_ERR" == *"suppressed"* ]] && INFO_LEAK=1
+if [[ "$NOTIFY_RC" -ne 0 ]]; then
+    fail "notify-webhook explicit info threshold must exit 0, got $NOTIFY_RC ($NOTIFY_ERR)"
+fi
+if [[ "$INFO_LEAK" -ne 0 ]]; then
+    fail "notify-webhook explicit info threshold leaked a suppression line: $NOTIFY_ERR"
+else
+    ok "notify-webhook explicit info threshold is the no-filter default"
+fi
+if cmp -s "$NOTIFY_FIX" "$NOTIFY_BODY"; then
+    ok "notify-webhook explicit info threshold posts the snapshot byte-identical"
+else
+    fail "notify-webhook explicit info threshold changed the posted payload"
+fi
+
+rm -rf "$NOTIFY_DIR"
+
 # --- shellcheck across the shipped shell surface ----------------------------
 if command -v shellcheck >/dev/null 2>&1; then
     if (cd "$REPO" && shellcheck scripts/box-audit.sh scripts/notify-webhook.sh install.sh test/install-lib.sh test/install.sh test/install-seeded.sh test/local-integration.sh test/all.sh test/properties/*.sh test/properties/live/*.sh); then
