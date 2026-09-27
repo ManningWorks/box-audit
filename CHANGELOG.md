@@ -9,6 +9,17 @@ whether to upgrade.
 
 ### Added
 
+- **Webhook severity floor (F3)** — `notify-webhook.sh` now honors an
+  opt-in `BOX_AUDIT_NOTIFY_MIN_SEVERITY` (`warn` or `crit`) so operators
+  can suppress routine `info`-level pushes on a healthy box. Unset keeps
+  today's behaviour exactly: the full snapshot is POSTed. When active,
+  only the POSTed body is filtered — `latest.json` and the pull path are
+  untouched — and a `suppressed N findings below <threshold> threshold`
+  count is logged to stderr. `warn` keeps `warn` and above; `crit` keeps
+  only the top severity; `degraded` findings are never suppressed so a
+  blinded check can't be hidden in the push. An invalid value exits
+  non-zero before anything is POSTed. Additive only: no new flag, no JSON
+  contract change — the "Default is pull" posture holds.
 - **`--init` idempotency report (F1)** — `box-audit --init` now tells the
   operator what it did. When every per-box config file under
   `/var/lib/box-audit/` already held exactly what a fresh snapshot would
