@@ -784,7 +784,7 @@ with open(os.environ["FINDINGS_FILE"], "a") as fh:
 # skipped with a warning rather than failing the run (see below).
 #
 # BOXAUDIT_LOCK_DIR: env-overridable for the smoke suite's EROFS test,
-# same shape as the BOX_AUDIT_GROUP / STALE_PROC_MIN_AGE overrides — the
+# same shape as the BOXAUDIT_GROUP / STALE_PROC_MIN_AGE overrides — the
 # test stages a read-only lock dir under /tmp and points the gate at it.
 LOCK_DIR="${BOXAUDIT_LOCK_DIR:-/tmp}"
 LOCK_FILE="$LOCK_DIR/sysadmin-healthcheck-box-audit.lock"
