@@ -12,7 +12,7 @@ All flags exit 0 on success, 2 on bad input. Manage flags (`--init`,
 | Flag | Default behavior | Output |
 |---|---|---|
 | (no flag) | Human-readable emoji-coded report to stdout | text |
-| `--json` | Machine-readable JSON to stdout. Always exits 0; the JSON body's `status` field is the signal (`"ok"` or `"findings"`). | JSON |
+| `--json` | Machine-readable JSON to stdout. Exits 0 on a run that executes — the JSON body's `status` field is the signal (`"ok"` or `"findings"`); a refused run (lock dir unopenable) exits 75 with no JSON on stdout. | JSON |
 | `--text` | Forces human-readable output (the default). | text |
 | `--version` | Prints `box-audit X.Y.Z` and exits. The version comes from `/usr/local/share/box-audit/version`, written by `install.sh`. | text |
 | `--check-groups` | Diagnoses stale group membership (issue #32): does this process's group list contain the boxaudit gid, and which of the invoking user's own long-running processes lack it? Read-only — never restarts, signals, or re-execs anything. Exits 0 either way: "stale" is a finding, not a failure. | text |
