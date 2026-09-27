@@ -695,6 +695,7 @@ out = {
     },
     "check_ids": {
         "security.fail2ban_banned":      "Currently banned IPs on fail2ban jail",
+        "security.fail2ban_jail":        "Currently banned IPs on a discovered non-sshd fail2ban jail",
         "security.ssh_fails":            "SSH auth failures in last 24h",
         "security.sudo_fails":           "sudo auth failures in last 24h",
         "security.new_port":             "open port not in ports-allowlist",
@@ -898,16 +899,56 @@ report_resources() {
 report_security() {
 
     # fail2ban banned IPs
+    #
+    # F2 (0.9.0): discover the active jails at runtime via
+    # `fail2ban-client status` and report each non-sshd jail's banned count
+    # as its own finding (security.fail2ban_jail). sshd stays on the existing
+    # security.fail2ban_banned floor (shape-unchanged) so it is never
+    # double-reported.
+    #
+    # Fallback: when discovery is unavailable — client missing, server down,
+    # or `status` failing non-zero — the jail list falls back to the
+    # hardcoded default jail (sshd). The per-jail queries no-op gracefully
+    # when the client cannot answer, so the check stays a silent no-op in
+    # exactly the boxes where it was one before F2.
+    #
+    # rc capture: `$?` right after `var=$(cmd | awk | tr)` reflects the LAST
+    # pipeline stage (awk/tr), which always succeeds — so a non-zero client
+    # exit would be invisible to a plain `[[ $var_status -ne 0 ]]`. Capture
+    # the client output first (no pipeline) and read `$?` while it still
+    # holds the client's exit, THEN awk the variable. The previous
+    # `${PIPESTATUS[0]}` here was always 0 (the substitution resets it),
+    # so the degraded branch never fired.
+    local f2b_status_out="" f2b_status_rc=0 jail_names="" jail jail_status_out jail_banned
     if /usr/bin/sudo -n /usr/bin/fail2ban-client status >/dev/null 2>&1; then
-        local currently_banned
-        currently_banned=$($T /usr/bin/sudo /usr/bin/fail2ban-client status sshd 2>/dev/null | awk '/Currently banned/ {print $4}' | tr -d ' ')
-        local f2b_status=${PIPESTATUS[0]}
-        if [[ $f2b_status -ne 0 ]]; then
-            flag_degraded "fail2ban-client check failed or timed out (exit $f2b_status)"
-        elif [[ -n "$currently_banned" ]] && [[ "$currently_banned" != "0" ]]; then
-            json_push alert security.fail2ban_banned security "$currently_banned IP(s) banned on sshd"
+        f2b_status_out=$($T /usr/bin/sudo /usr/bin/fail2ban-client status 2>/dev/null)
+        f2b_status_rc=$?
+        if [[ $f2b_status_rc -ne 0 ]]; then
+            flag_degraded "fail2ban-client status failed or timed out (exit $f2b_status_rc) — falling back to the hardcoded sshd floor"
+        else
+            # `Jail list:\tname1, name2` — the value spans several fields
+            # (comma+space separated), so take everything after `list:` and
+            # strip the tab prefix and the commas.
+            jail_names=$(printf '%s\n' "$f2b_status_out" | awk -F'list:' '/Jail list/ {print $2}' | tr -d '\t' | tr ',' ' ')
         fi
     fi
+    [[ -n "$jail_names" ]] || jail_names="sshd"
+    for jail in $jail_names; do
+        [[ -n "$jail" ]] || continue
+        jail_status_out=$($T /usr/bin/sudo /usr/bin/fail2ban-client status "$jail" 2>/dev/null)
+        jail_banned=$(printf '%s\n' "$jail_status_out" | awk '/Currently banned/ {print $4}' | tr -d ' ')
+        if [[ -n "$jail_banned" && "$jail_banned" != "0" ]]; then
+            if [[ "$jail" == "sshd" ]]; then
+                # Hardcoded floor — id and message shape unchanged.
+                json_push alert security.fail2ban_banned security "$jail_banned IP(s) banned on sshd"
+            else
+                # Discovered jail — per-jail finding (static id, jail name
+                # carried in the message; same multi-instance convention as
+                # system.failed_units).
+                json_push alert security.fail2ban_jail security "$jail_banned IP(s) banned on $jail"
+            fi
+        fi
+    done
 
     # SSH failures (last 24h)
     local ssh_fails
@@ -1664,6 +1705,7 @@ EMOJI_LABEL = {
     "resources.swap_high":             ("⚠️", "SWAP"),
     "resources.load_high":             ("⚠️", "LOAD"),
     "security.fail2ban_banned":        ("🚨", "fail2ban"),
+    "security.fail2ban_jail":          ("🚨", "fail2ban-jail"),
     "security.ssh_fails":              ("⚠️", "SSH"),
     "security.sudo_fails":             ("⚠️", "sudo"),
     "security.new_port":               ("🆕", "PORT"),

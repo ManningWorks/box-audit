@@ -10,7 +10,8 @@ Eight check_ids are asserted — one per seeded-state condition the
 driver (test/install-seeded.sh) sets up in the container:
 
     security.new_port          (warn)  -> port 9999 listening
-    security.fail2ban_banned   (alert) -> one IP banned on sshd
+    security.fail2ban_banned   (alert) -> one IP banned on sshd (the floor)
+    security.fail2ban_jail     (alert) -> one IP banned on recidive (discovered)
     security.ssh_fails         (warn)  -> >15 auth-fail journal lines
     system.cron_d_dropins       (warn)  -> /etc/cron.d/0box-audit-test
     system.user_cron            (warn)  -> non-empty root crontab
@@ -62,6 +63,10 @@ class Expected(NamedTuple):
 EXPECTED: list[Expected] = [
     Expected("security.new_port",          "warn",  r"9999"),
     Expected("security.fail2ban_banned",   "alert", r"banned on sshd"),
+    # F2 jail discovery: recidive is the only non-sshd jail with a banned IP,
+    # so exactly one per-jail finding must appear (strict count). sshd is NOT
+    # double-reported here — it stays on the fail2ban_banned floor above.
+    Expected("security.fail2ban_jail",     "alert", r"banned on recidive"),
     Expected("security.ssh_fails",         "warn",  r"failed auth attempts"),
     Expected("system.cron_d_dropins",      "warn",  r"0box-audit-test"),
     Expected("system.user_cron",           "warn",  r"root's crontab"),

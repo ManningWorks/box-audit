@@ -19,6 +19,21 @@ whether to upgrade.
   running `--init` as a smoke check can finally tell "rewrote everything"
   from "no-op because config was already current". Additive stdout only:
   no JSON contract change, no new flag, config files untouched.
+- **Fail2ban jail discovery (F2)** — `box-audit` now reads the live jail
+  set from `fail2ban-client status` at runtime instead of only checking a
+  hardcoded `sshd`. The `sshd` jail keeps its pinned
+  `security.fail2ban_banned` finding (floor, shape unchanged); every other
+  active jail with a banned IP emits its own `security.fail2ban_jail`
+  alert (`N IP(s) banned on <jail>`) so a jail that bans on a non-SSH
+  service is no longer invisible. When the client is unreachable or the
+  jail list can't be read, the check degrades gracefully: it falls back to
+  the hardcoded `sshd` floor and records a `degraded` check — the sshd
+  floor is never lost because discovery failed. `security.fail2ban_jail`
+  is a new static check_id (multi-instance convention, like
+  `system.failed_units`), added to `--print-schema`, the emoji/label map,
+  and the tier-1/tier-2 assertions; the tier-2 seeded image enables a
+  second `recidive` jail and bans on both to cover the discovery and
+  fallback branches.
 
 ## [0.8.1] - 2026-09-26
 
