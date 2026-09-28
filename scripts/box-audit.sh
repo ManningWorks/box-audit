@@ -163,7 +163,7 @@ Usage: $(/usr/bin/basename "$0") [OPTIONS]
 Exit codes: 0 = all clear (or manage-op success), 1 = findings present,
              2 = bad CLI flag, 75 = lock file unopenable (read-only lock
              dir) — the run was refused, nothing was audited.
-             (--json mode always exits 0; see status field.)
+             (--json mode exits 0 on a run that executes; see status field.)
 EOF
             exit 0
             ;;

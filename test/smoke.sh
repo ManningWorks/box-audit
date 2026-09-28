@@ -65,6 +65,15 @@ fi
 # --- help / version --------------------------------------------------------
 if check "--help exits 0" '^0$' bash "$SCRIPT" --help; then
     if [[ "$OUT" == *"Usage:"* ]]; then ok "--help prints usage"; else fail "--help output missing 'Usage:'"; fi
+    # The lock gate (exit 75) runs before the output mode is ever
+    # consulted, so a refused run exits 75 in --json mode too — the
+    # help text must not claim --json "always exits 0" (PR #49 fixed the
+    # same claim in cli.md; the in-code usage block was out of scope).
+    if [[ "$OUT" == *"always exits 0"* ]]; then
+        fail "--help still claims '--json mode always exits 0' (refused runs exit 75)"
+    else
+        ok "--help does not claim '--json always exits 0'"
+    fi
 fi
 check "--version exits 0" '^0$' bash "$SCRIPT" --version
 
