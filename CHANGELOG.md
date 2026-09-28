@@ -5,6 +5,73 @@ All notable changes to box-audit are documented here. The format follows
 grouped by kind, not by PR, and are written for the person deciding
 whether to upgrade.
 
+## [0.9.2] - 2026-09-28
+
+### Added
+
+- **Fail2ban jail discovery (F2)** — `box-audit` now reads the live jail
+  set from `fail2ban-client status` at runtime instead of only checking a
+  hardcoded `sshd`. The `sshd` jail keeps its pinned
+  `security.fail2ban_banned` finding (floor, shape unchanged); every other
+  active jail with a banned IP emits its own `security.fail2ban_jail`
+  alert (`N IP(s) banned on <jail>`) so a jail that bans on a non-SSH
+  service is no longer invisible. When the client is unreachable or the
+  jail list can't be read, the check degrades gracefully: it falls back to
+  the hardcoded `sshd` floor and records a `degraded` check — the sshd
+  floor is never lost because discovery failed. `security.fail2ban_jail`
+  is a new static check_id (multi-instance convention, like
+  `system.failed_units`), added to `--print-schema`, the emoji/label map,
+  and the tier-1/tier-2 assertions; the tier-2 seeded image enables a
+  second `recidive` jail and bans on both to cover the discovery and
+  fallback branches.
+- **Webhook severity floor (F3)** — `notify-webhook.sh` now honors an
+  opt-in `BOX_AUDIT_NOTIFY_MIN_SEVERITY` (`warn` or `crit`) so operators
+  can suppress routine `info`-level pushes on a healthy box. Unset keeps
+  today's behaviour exactly: the full snapshot is POSTed. When active,
+  only the POSTed body is filtered — `latest.json` and the pull path are
+  untouched — and a `suppressed N findings below <threshold> threshold`
+  count is logged to stderr. `warn` keeps `warn` and above; `crit` keeps
+  only the top severity; `degraded` findings are never suppressed so a
+  blinded check can't be hidden in the push. An invalid value exits
+  non-zero before anything is POSTed. Additive only: no new flag, no JSON
+  contract change — the "Default is pull" posture holds.
+- **IPv6 outbound parity (F4)** — `security.outbound_remote_count_v6`
+  (warn) gives the IPv6 side of the outbound-remote check its own
+  finding: it fires when the distinct non-private IPv6 remotes from
+  `ss -tnp state established` exceed the outbound threshold. Additive —
+  the existing `security.outbound_remote_count` finding keeps its
+  check_id, message, and sample format unchanged; on a 5.x-shaped host
+  its input is also unchanged, while on a 6.x-shaped host it additionally
+  counts the v6 remotes its old hardcoded peer column missed (previously
+  invisible to the combined count). The two findings are separate
+  check_ids, so a beacon that speaks only IPv6 no longer has to dilute
+  the combined count to be visible. No new CLI flag
+  or per-box config: the new check shares the existing
+  `--outbound-threshold` knob (default 25), so raising the threshold
+  quiets both families at once. On a host with no IPv6 stack the check
+  stays quiet (a parse failure must never read as a beacon). The check_id
+  is added to `--print-schema`, the emoji/label map, and the replay path
+  (a fresh v6 finding renders as `+ ADDED` in `--replay --diff`), with
+  tier-1/tier-2 coverage for both branches.
+
+### Fixed
+
+- **v4 outbound remote extraction on iproute2 6.x** (issue #53). The v4
+  half of the combined `security.outbound_remote_count` check hardcoded
+  the 5th `awk` field for the remote peer. iproute2 6.x `ss` suppresses
+  the constant State column and shifts the peer to field 4 — field 5 is
+  the Process column — so on a 6.x host the extraction returned nothing
+  and the check reported a false "outbound remote: none". The peer column is
+  now resolved from the `ss` header via `ss_peer_column()` (5 on 5.x,
+  4 on 6.x) in a new `ss_v4_remote_ips()`; 5.x output stays
+  byte-identical and the v6 path is unaffected (it already resolved the
+  header). Tier-1 property test (RED on master, GREEN on the fix) plus
+  a tier-2 seeded iproute2 6.x proof.
+- **`--help` usage block** — the `--json` parenthetical no longer claims
+  "always exits 0": the lock gate (exit 75) fires before the output
+  mode is consulted, so a refused run exits 75 even in `--json` mode.
+  Pinned by a tier-1 smoke assertion (PR #56).
+
 ## [0.9.1] - 2026-09-27
 
 ### Fixed
@@ -36,17 +103,6 @@ whether to upgrade.
 
 ### Added
 
-- **Webhook severity floor (F3)** — `notify-webhook.sh` now honors an
-  opt-in `BOX_AUDIT_NOTIFY_MIN_SEVERITY` (`warn` or `crit`) so operators
-  can suppress routine `info`-level pushes on a healthy box. Unset keeps
-  today's behaviour exactly: the full snapshot is POSTed. When active,
-  only the POSTed body is filtered — `latest.json` and the pull path are
-  untouched — and a `suppressed N findings below <threshold> threshold`
-  count is logged to stderr. `warn` keeps `warn` and above; `crit` keeps
-  only the top severity; `degraded` findings are never suppressed so a
-  blinded check can't be hidden in the push. An invalid value exits
-  non-zero before anything is POSTed. Additive only: no new flag, no JSON
-  contract change — the "Default is pull" posture holds.
 - **`--init` idempotency report (F1)** — `box-audit --init` now tells the
   operator what it did. When every per-box config file under
   `/var/lib/box-audit/` already held exactly what a fresh snapshot would
@@ -57,39 +113,6 @@ whether to upgrade.
   running `--init` as a smoke check can finally tell "rewrote everything"
   from "no-op because config was already current". Additive stdout only:
   no JSON contract change, no new flag, config files untouched.
-- **Fail2ban jail discovery (F2)** — `box-audit` now reads the live jail
-  set from `fail2ban-client status` at runtime instead of only checking a
-  hardcoded `sshd`. The `sshd` jail keeps its pinned
-  `security.fail2ban_banned` finding (floor, shape unchanged); every other
-  active jail with a banned IP emits its own `security.fail2ban_jail`
-  alert (`N IP(s) banned on <jail>`) so a jail that bans on a non-SSH
-  service is no longer invisible. When the client is unreachable or the
-  jail list can't be read, the check degrades gracefully: it falls back to
-  the hardcoded `sshd` floor and records a `degraded` check — the sshd
-  floor is never lost because discovery failed. `security.fail2ban_jail`
-  is a new static check_id (multi-instance convention, like
-  `system.failed_units`), added to `--print-schema`, the emoji/label map,
-  and the tier-1/tier-2 assertions; the tier-2 seeded image enables a
-  second `recidive` jail and bans on both to cover the discovery and
-  fallback branches.
-- **IPv6 outbound parity (F4)** — `security.outbound_remote_count_v6`
-  (warn) gives the IPv6 side of the outbound-remote check its own
-  finding: it fires when the distinct non-private IPv6 remotes from
-  `ss -tnp state established` exceed the outbound threshold. Additive —
-  the existing `security.outbound_remote_count` finding keeps its
-  check_id, message, and sample format unchanged; on a 5.x-shaped host
-  its input is also unchanged, while on a 6.x-shaped host it additionally
-  counts the v6 remotes its old hardcoded peer column missed (previously
-  invisible to the combined count). The two findings are separate
-  check_ids, so a beacon that speaks only IPv6 no longer has to dilute
-  the combined count to be visible. No new CLI flag
-  or per-box config: the new check shares the existing
-  `--outbound-threshold` knob (default 25), so raising the threshold
-  quiets both families at once. On a host with no IPv6 stack the check
-  stays quiet (a parse failure must never read as a beacon). The check_id
-  is added to `--print-schema`, the emoji/label map, and the replay path
-  (a fresh v6 finding renders as `+ ADDED` in `--replay --diff`), with
-  tier-1/tier-2 coverage for both branches.
 
 ## [0.8.1] - 2026-09-26
 
