@@ -76,10 +76,13 @@ whether to upgrade.
   (warn) gives the IPv6 side of the outbound-remote check its own
   finding: it fires when the distinct non-private IPv6 remotes from
   `ss -tnp state established` exceed the outbound threshold. Additive —
-  the existing `security.outbound_remote_count` finding fires identically
-  to before (same check_id, same message, same sample), and the two
-  findings are separate check_ids, so a beacon that speaks only IPv6 no
-  longer has to dilute the combined count to be visible. No new CLI flag
+  the existing `security.outbound_remote_count` finding keeps its
+  check_id, message, and sample format unchanged; on a 5.x-shaped host
+  its input is also unchanged, while on a 6.x-shaped host it additionally
+  counts the v6 remotes its old hardcoded peer column missed (previously
+  invisible to the combined count). The two findings are separate
+  check_ids, so a beacon that speaks only IPv6 no longer has to dilute
+  the combined count to be visible. No new CLI flag
   or per-box config: the new check shares the existing
   `--outbound-threshold` knob (default 25), so raising the threshold
   quiets both families at once. On a host with no IPv6 stack the check
