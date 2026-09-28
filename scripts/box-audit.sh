@@ -951,6 +951,24 @@ ss_peer_column() {
         }'
 }
 
+# Extract the distinct IPv4 remote (peer) addresses from an `ss -tnp
+# state established` stream on stdin. The peer column is resolved from
+# the header via ss_peer_column rather than hardcoded: iproute2 6.x
+# suppresses the constant State column and shifts the peer from field 5
+# to field 4, so a fixed $5 read the wrong column on 6.x and returned
+# nothing — the v4 outbound check went blind on any 6.x box (issue #53).
+# Header-driven resolution keeps the 5.x result byte-identical (column
+# 5) and fixes 6.x (column 4) in one code path. Malformed/empty header
+# (no "Peer" word) leaves col empty and falls back to the historical 5.
+ss_v4_remote_ips() {
+    local ss_out col
+    ss_out=$(cat)
+    col=$(printf '%s\n' "$ss_out" | ss_peer_column)
+    printf '%s\n' "$ss_out" | awk -v c="${col:-5}" 'NR>1 {print $c}' |
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' |
+        sort -u
+}
+
 report_security() {
 
     # fail2ban banned IPs
@@ -1065,17 +1083,16 @@ report_security() {
     local ss_out
     ss_out=$($T /usr/bin/ss -tnp state established 2>/dev/null)
     if [[ -n "$ss_out" ]]; then
-        # IPv4: column 5 holds remote addr:port.
+        # IPv4: the peer column is resolved from the header, not
+        # hardcoded — see ss_v4_remote_ips. iproute2 6.x suppresses the
+        # constant State column and shifts the peer from field 5 to
+        # field 4; a fixed $5 went blind on 6.x (issue #53).
         local remote_ips
-        remote_ips=$(echo "$ss_out" | awk 'NR>1 {print $5}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
-        # IPv6: same extraction, but the peer column is resolved from the
-        # header rather than hardcoded (see ss_peer_column — iproute2 6.x
-        # suppresses the constant State column and shifts the peer left).
-        # The v4 line above intentionally keeps the historical $5: the
-        # DoD pins the IPv4 path byte-identical, and the v4 $5/6.x gap is
-        # a pre-existing bug tracked separately. Without the v6 column
-        # being right, a compromised process phoning home over IPv6 is
-        # invisible to the check on any dual-stack box.
+        remote_ips=$(printf '%s\n' "$ss_out" | ss_v4_remote_ips)
+        # IPv6: same header-driven resolution (see ss_peer_column —
+        # iproute2 6.x suppresses the constant State column and shifts
+        # the peer left). A compromised process phoning home over IPv6
+        # is invisible on any dual-stack box unless this column is right.
         local remote_ips6
         local v6_col
         v6_col=$(printf '%s\n' "$ss_out" | ss_peer_column)
