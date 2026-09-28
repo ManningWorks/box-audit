@@ -450,6 +450,129 @@ else
     echo "test/install-seeded.sh: SKIP — v6 outbound block: no IPv6 stack in this container (seeding failed: ${SEED_V6_OUT:-empty}); property suite covers the finding's replay semantics"
 fi
 
+# --- issue #53: IPv4 outbound peer column — live 6.x regression ------------
+# The combined finding's v4 side historically hardcoded field $5 for the
+# remote (peer) address. iproute2 6.x suppresses the constant State column
+# and shifts the peer to field 4, so $5 read empty and the v4 outbound
+# check went blind on any 6.x box. This block drives the live path with
+# real sockets, mirroring the F4 v6 block above:
+#
+#   1. v4-to-public: two ESTAB IPv4 connections to documentation-range
+#      (RFC 5737 198.51.100.0/24) addresses added on the container's lo.
+#      The seeded container ships iproute2 6.x, so this exercises the
+#      previously-blind 6.x column layout. The threshold is lowered to 1
+#      via the existing --outbound-threshold knob, then restored.
+#   2. v4-quiet: after the holder expires and the sockets tear down, a
+#      second audit must show no combined finding — the v4 capability
+#      without v4 traffic stays quiet.
+#
+# On a runner where seeding fails the block skips itself; the property
+# suite (security.outbound_remote_count_v4.sh) still covers the
+# header-driven extraction against 5.x- and 6.x-shaped ss captures.
+# shellcheck disable=SC2016  # bash -c string is deliberately single-quoted
+SEED_V4_OUT="$(privileged_exec /bin/bash -c '
+    set -e
+    ip -4 addr add 198.51.100.100/32 dev lo
+    ip -4 addr add 198.51.100.101/32 dev lo
+    # Holder: two listeners held at module scope + two ESTAB connects.
+    # setsid detaches it from this exec session.
+    setsid python3 -c "
+import socket, time
+def listen(ip, port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((ip, port))
+    s.listen(5)
+    return s
+ls1 = listen(\"198.51.100.100\", 443)
+ls2 = listen(\"198.51.100.101\", 443)
+c1 = socket.create_connection((\"198.51.100.100\", 443))
+c2 = socket.create_connection((\"198.51.100.101\", 443))
+time.sleep(30)
+" &
+    sleep 3
+    n=$(ss -tnp state established | grep -c "198.51.100" || true)
+    [[ "$n" -ge 2 ]]
+    echo 1 > /var/lib/box-audit/outbound-threshold.conf
+    echo SEED_OK
+' 2>&1 || true)"
+if [[ "$SEED_V4_OUT" == *SEED_OK* ]]; then
+    echo "test/install-seeded.sh: seeded 2 ESTAB v4 remotes (198.51.100.100/101 on lo), threshold=1"
+    BA_JSON_V4="$(mktemp)"
+    LIB_CLEANUP_PATHS+=("$BA_JSON_V4")
+    if ! privileged_exec /usr/local/bin/box-audit --json > "$BA_JSON_V4" 2>/dev/null; then
+        echo "test/install-seeded.sh: box-audit --json (v4-seeded run) exited non-zero" >&2
+        exit 1
+    fi
+    V4_PROBE_OUT="$(BA_JSON_V4="$BA_JSON_V4" python3 - <<'PY' || true
+import json, os
+d = json.load(open(os.environ["BA_JSON_V4"]))
+comb = [f for f in d.get("findings", []) if f.get("check_id") == "security.outbound_remote_count"]
+probs = []
+if len(comb) != 1:
+    probs.append(f"expected exactly 1 combined finding, got {len(comb)}: {comb}")
+else:
+    if comb[0].get("severity") != "warn":
+        probs.append(f"combined severity {comb[0].get('severity')!r} != warn")
+    # The combined counter includes any baseline non-LAN v4 traffic, so
+    # assert the two seeded remotes are present rather than an exact
+    # count (mirrors the F4 block's defensiveness on the combined finding).
+    msg = comb[0].get("message", "")
+    if "198.51.100.100" not in msg or "198.51.100.101" not in msg:
+        probs.append(f"combined message missing both doc-range v4 remotes: {msg!r}")
+    if comb[0].get("count", 0) < 2:
+        probs.append(f"combined count {comb[0].get('count')!r} < 2")
+if probs:
+    print("FAIL_V4:" + "; ".join(probs))
+    raise SystemExit(1)
+print(f"OK comb={comb[0]['count']}")
+PY
+)"
+    if [[ "$V4_PROBE_OUT" == OK* ]]; then
+        echo "test/install-seeded.sh: v4-seeded run fired security.outbound_remote_count as expected (${V4_PROBE_OUT#OK })"
+    else
+        echo "test/install-seeded.sh: FAIL — v4-seeded run findings wrong: $V4_PROBE_OUT" >&2
+        echo "--- audit stdout ---" >&2
+        cat "$BA_JSON_V4" >&2
+        exit 1
+    fi
+    # Restore the threshold before the Issue #38 delta block reads the
+    # sidecar this run just wrote (the live counts must not include this
+    # block's sockets).
+    privileged_exec /bin/bash -c 'echo 25 > /var/lib/box-audit/outbound-threshold.conf'
+    # v4-quiet: wait for the holder to expire, then the combined finding
+    # must be gone. The holder sleeps 30s; poll up to 30s for the ESTAB
+    # v4 rows to disappear so the second audit runs on a settled netns.
+    for _ in $(seq 1 30); do
+        if ! privileged_exec ss -tnp state established 2>/dev/null | grep -q '198.51.100'; then
+            break
+        fi
+        sleep 1
+    done
+    BA_JSON_NOV4="$(mktemp)"
+    LIB_CLEANUP_PATHS+=("$BA_JSON_NOV4")
+    if ! privileged_exec /usr/local/bin/box-audit --json > "$BA_JSON_NOV4" 2>/dev/null; then
+        echo "test/install-seeded.sh: box-audit --json (v4-quiet run) exited non-zero" >&2
+        exit 1
+    fi
+    NOV4_HITS="$(python3 -c '
+import json
+d = json.load(open("'"$BA_JSON_NOV4"'"))
+hits = [f["check_id"] for f in d.get("findings", []) if f.get("check_id") == "security.outbound_remote_count"]
+print("yes" if hits else "no")
+')"
+    if [[ "$NOV4_HITS" == "no" ]]; then
+        echo "test/install-seeded.sh: v4-quiet run fired no combined finding (sockets torn down)"
+    else
+        echo "test/install-seeded.sh: FAIL — v4-quiet run still fired the combined finding" >&2
+        echo "--- audit stdout ---" >&2
+        cat "$BA_JSON_NOV4" >&2
+        exit 1
+    fi
+else
+    echo "test/install-seeded.sh: SKIP — v4 outbound block: seeding failed (${SEED_V4_OUT:-empty}); property suite covers the header-driven v4 extraction"
+fi
+
 # --- Issue #38 regression: delta-mode signal integrity ---------------------
 # The persist sidecar history_persist_counts_from_json used to source
 # today's counts from the JSON snapshot's findings[] array, which only
