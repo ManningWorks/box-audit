@@ -35,7 +35,7 @@ jobs:
     # proves the tag EXISTs on origin; this proves the tag's CONTENT: the
     # VERSION in the tagged tree must equal the tag name minus the leading
     # v. Runs on tag pushes only.
-    if: startsWith(github.ref, "refs/tags/v")
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
