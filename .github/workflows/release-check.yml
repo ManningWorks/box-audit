@@ -3,6 +3,10 @@ name: release-check
 on:
   push:
     branches: [master]
+    # Tag pushes fire the tag-integrity job (below): the tag push itself
+    # is the green proof after a release, so no empty-commit re-trigger
+    # on master is needed.
+    tags: ['v*']
 
 jobs:
   tag-current:
@@ -23,5 +27,29 @@ jobs:
             echo "::error::bump VERSION and tag in the same release:"
             echo "::error::  git tag -a v${VERSION} <bump-commit>"
             echo "::error::  git push origin --tags"
+            exit 1
+          fi
+
+  tag-integrity:
+    # Tag push is the green proof after a release. tag-current above only
+    # proves the tag EXISTs on origin; this proves the tag's CONTENT: the
+    # VERSION in the tagged tree must equal the tag name minus the leading
+    # v. Runs on tag pushes only.
+    if: startsWith(github.ref, "refs/tags/v")
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The tag ref itself (github.ref_name is the tag name on a tag
+          # push). We only read the checked-out tree, so no fetch-depth: 0.
+          ref: ${{ github.ref_name }}
+
+      - name: Tagged tree VERSION must equal the tag name
+        run: |
+          TAG=${GITHUB_REF_NAME#v}
+          VERSION=$(cat VERSION)
+          if [ "$VERSION" != "$TAG" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} points at a tree with VERSION=${VERSION}, tag name says ${TAG}"
+            echo "::error::re-tag on the right commit or fix VERSION before pushing"
             exit 1
           fi

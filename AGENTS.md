@@ -17,11 +17,12 @@ Three files move together, as one unit, in the PR that ships a release:
 
 **Why the tag is not optional:** `.github/workflows/release-check.yml`
 runs `tag-current` on every push to master and fails the build with
-`VERSION=X but tag vX is not on origin` if the tag is missing. The
-workflow only triggers on push — pushing the tag alone does NOT
-re-run it. If you add the tag after merging, push an empty commit to
-master (`git commit --allow-empty`) to re-trigger `release-check` and
-turn the red X green.
+`VERSION=X but tag vX is not on origin` if the tag is missing. Pushing
+the tag ALSO fires the workflow: the `tag-integrity` job runs on tag
+pushes, checks out the tagged tree, and fails if that tree's `VERSION`
+does not equal the tag name (leading `v` stripped). So the tag push
+itself is the green proof after a release — no empty commit, no direct
+push to master.
 
 `skills/box-audit/SKILL.md` carries a `version:` in its frontmatter,
 kept in sync **by hand** with `VERSION` (see the comment in that file)
@@ -84,7 +85,8 @@ follow:
    file/line citations. Reviewers never merge.
 3. **Maintainer release-tail card** (created only after an approving
    verdict) merges, tags `v$VERSION` on the merge commit, and pushes
-   the empty commit to re-trigger `release-check`.
+   the tag — the tag push fires release-check (tag-integrity) which
+   is the green proof. No empty commit.
 
 No agent merges without an approving review verdict on the PR — not
 the coder that opened it, not a steered mid-run instruction, not
