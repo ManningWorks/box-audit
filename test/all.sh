@@ -62,6 +62,12 @@ run_tier() {
 # Smoke is the cheapest gate — catches dispatch-order regressions
 # before we spend 30+ seconds on a privileged container.
 run_tier "smoke"             "test/smoke.sh"
+# F6 mutation-coverage driver — its tier-1 negative variant: the driver's
+# loop (registry parse, sed application, FLIPPED/SURVIVED verdicts, error
+# -> non-zero) proven with a stubbed docker, no privileged container. The
+# real container driver (test/mutation-coverage.sh) is opt-in and NOT run
+# here — it costs one seeded container per registry entry.
+run_tier "mutation-coverage-selftest" "test/fixtures/mutation-coverage/selftest.sh"
 # Tier 1 install driver — exercises install.sh --ci end-to-end on a
 # privileged systemd container, positive path only (the negative
 # variant lives in install.yml and is a CI gate, not a local check).
