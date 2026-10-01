@@ -71,3 +71,6 @@ updates.security_pending	scripts/box-audit.sh	s|json_push warn updates.security_
 system.failed_units	scripts/box-audit.sh	s|json_push warn system.failed_units system |json_push warn system.failed_unitsX system |
 system.cron_d_dropins	test/install-docker/seeded/seed.sh	s|^printf .fake-cron-line|: # F6-registry mutation removes the cron.d drop-in (family A)|
 security.ssh_fails	scripts/box-audit.sh	s|json_push warn security.ssh_fails security |json_push warn security.ssh_failsX security |
+system.user_cron	scripts/box-audit.sh	s|json_push warn system.user_cron system |json_push warn system.user_cronX system |
+maintenance.apt_cache_stale	scripts/box-audit.sh	s|json_push warn maintenance.apt_cache_stale maintenance "stale |json_push warn maintenance.apt_cache_staleX maintenance "stale |
+integrity.change	scripts/box-audit.sh	s|json_push warn integrity.change integrity "changed |json_push warn integrity.changeX integrity "changed |
