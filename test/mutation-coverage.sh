@@ -46,12 +46,15 @@
 #
 # Exit codes:
 #   0  every entry produced a verdict (FLIPPED or SURVIVED)
-#   1  a hard error: baseline boot/audit failure, a malformed registry
-#      line, an unknown --entry id, a sed that did not apply, a
-#      container/audit failure, a --json that is not a findings list, or
-#      a finding that APPEARS after the mutation (seed/mutation
-#      misbehaviour — never a silent SURVIVED).
+#   1  a hard error: a dirty working tree at start (refusal — the dirty
+#      paths are named on stderr), baseline boot/audit failure, a
+#      malformed registry line, an unknown --entry id, a sed that did
+#      not apply, a container/audit failure, a --json that is not a
+#      findings list, or a finding that APPEARS after the mutation
+#      (seed/mutation misbehaviour — never a silent SURVIVED).
 #   2  bad arguments.
+#   130/143  SIGINT/SIGTERM delivered mid-run — the tree is restored
+#      before exit (see the tree-safety contract below).
 #
 # --selftest runs the same loop with a stubbed docker (env
 # MUTATION_COVERAGE_DOCKER_STUB=1 set by the tier-1 harness in
@@ -65,10 +68,17 @@
 # (runs the command verbatim in $PWD). --repo <dir> points the driver at
 # the scratch repo (selftest only).
 #
-# This card is the skeleton: it prints raw per-entry lines and restores
-# only the live-tree files it actually mutated (selftest mode). The
-# polished report table and the trap-based restoration machinery are
-# later cards.
+# Tree-safety contract (F6-safety card):
+#   * refuses to start on a dirty working tree (`git status --porcelain`
+#     non-empty → exit 1 naming the dirty paths), so a pre-existing mess
+#     is never blamed on the driver;
+#   * traps EXIT/INT/TERM: an interrupted run (kill mid-container,
+#     Ctrl-C, a set -e trip) restores every live-tree file it mutated
+#     to its pre-run state byte-for-byte before exiting. Real mode never
+#     mutates the live tree (the mutation lives in the staged scratch
+#     work), so the restore is a no-op there; selftest mode seds the
+#     scratch tree directly and is the path the tier-1 negative variant
+#     kills mid-run to prove the trap.
 
 set -euo pipefail
 
@@ -99,6 +109,26 @@ REPO="$SELFTEST_REPO"
 [[ -z "$REPO" ]] && REPO="$(cd "$(dirname "$0")/.." && pwd)"
 REGISTRY="$REPO/test/mutations.list"
 
+# Live-tree files this run mutated (selftest mode seds the scratch tree
+# directly; real mode mutates only the staged work, so this stays empty
+# and the trap's restore is a no-op). Declared BEFORE the library source
+# and before the dirty-tree gate so it is visible to the trap below and
+# to every exit path from here on.
+LIVE_MUTATED=()
+
+# Refuse to start on a dirty working tree: a pre-existing mess would
+# otherwise be blamed on the driver, and the trap's restore (scoped to
+# LIVE_MUTATED) would rightly leave it alone. The dirty paths are named
+# so the operator knows exactly what to stash/commit first.
+if [[ -d "$REPO/.git" ]]; then
+    DIRTY="$(git -C "$REPO" status --porcelain)"
+    if [[ -n "$DIRTY" ]]; then
+        echo "test/mutation-coverage.sh: refusing to start — working tree is dirty. Fix or stash these paths first:" >&2
+        printf '%s\n' "$DIRTY" >&2
+        exit 1
+    fi
+fi
+
 # shellcheck source=./install-lib.sh
 source "$(dirname "$0")/install-lib.sh"
 
@@ -114,8 +144,6 @@ SEEDED_TAG="box-audit-mc:seeded"
 # entry), so it tracks every boot in MC_CONTAINERS and removes them all on
 # exit — install-lib's trap only removes the LAST container it created
 # (the global CID), which would strand the baseline + earlier entries.
-# The trap also runs _lib_cleanup first so LIB_CLEANUP_PATHS (mktemp work
-# dirs + capture files) are still rm -rf'd as the library intends.
 MC_CONTAINERS=()
 remove_mc_containers() {
     local c
@@ -124,8 +152,35 @@ remove_mc_containers() {
     done
     MC_CONTAINERS=()
 }
-# shellcheck disable=SC2064
-trap '_lib_cleanup; remove_mc_containers' EXIT
+# Tree restoration: restore EXACTLY the live-tree files this run mutated
+# (selftest mode seds the scratch tree directly; real mode mutates only
+# the staged work, so LIVE_MUTATED is empty and this is a no-op). Never
+# a blanket `git checkout -- .` — that would discard unrelated local
+# edits the driver was invoked on top of.
+restore_tree() {
+    [[ -d "$REPO/.git" ]] || return 0
+    (( ${#LIVE_MUTATED[@]} > 0 )) || return 0
+    local t
+    for t in "${LIVE_MUTATED[@]}"; do
+        git -C "$REPO" checkout -- "$t" 2>/dev/null || true
+    done
+}
+# _mc_cleanup is the driver's own cleanup unit, run last so the tree is
+# restored and the library's mktemp paths + container removed after it.
+# (Ordering does not couple: restore_tree and _lib_cleanup touch
+# disjoint resources.)
+_mc_cleanup() {
+    restore_tree
+    _lib_cleanup
+    remove_mc_containers
+}
+# EXIT covers every exit path (normal completion, set -e trip, early
+# exits). INT/TERM additionally restore then exit with the conventional
+# signal codes (128+signum) so an interrupted run is distinguishable
+# from a hard error — and the restore cannot be skipped by the signal.
+trap _mc_cleanup EXIT
+trap '_mc_cleanup; trap - EXIT; exit 130' INT
+trap '_mc_cleanup; trap - EXIT; exit 143' TERM
 
 # --- registry parse ------------------------------------------------------------
 # Parallel arrays. The registry header documents three tab-separated
@@ -296,13 +351,6 @@ PY
 FLIPPED=0
 SURVIVED=0
 START_S=$(date +%s)
-# Live-tree files this run mutated. Real mode NEVER touches the live tree
-# (the mutation lives in the staged scratch work), so this stays empty and
-# the end-of-run restore is a no-op. Selftest mode seds the scratch repo's
-# own tree directly, so we record each target here and restore EXACTLY
-# those paths — never a blanket `git checkout -- .`, which would discard
-# unrelated local edits the driver was invoked on top of.
-LIVE_MUTATED=()
 
 # --- pristine baseline -----------------------------------------------------------
 # Boot the unmutated tree once for the baseline audit. In selftest mode
@@ -401,17 +449,6 @@ for i in "${RUN_IDX[@]}"; do
     [[ "$baseline_present" == "no" ]] && note=" (absent-in-baseline: the seed for this check did not fire in this container)"
     echo "ENTRY $i $id $verdict target=$target baseline=$baseline_present mutated=$mutated_present$note"
 done
-
-# Safety net: restore EXACTLY the live-tree files this run mutated (selftest
-# mode seds the scratch tree directly; real mode mutates only the staged
-# work, so LIVE_MUTATED is empty and this is a no-op). Never a blanket
-# `git checkout -- .` — that would discard unrelated local edits the driver
-# was invoked on top of.
-if [[ -d "$REPO/.git" && ${#LIVE_MUTATED[@]} -gt 0 ]]; then
-    for t in "${LIVE_MUTATED[@]}"; do
-        git -C "$REPO" checkout -- "$t" 2>/dev/null || true
-    done
-fi
 
 ELAPSED_S=$(( $(date +%s) - START_S ))
 echo "mutation-coverage: ${#RUN_IDX[@]} entries — $FLIPPED flipped, $SURVIVED survived — ${ELAPSED_S}s"
