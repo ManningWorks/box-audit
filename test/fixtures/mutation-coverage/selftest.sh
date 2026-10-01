@@ -281,6 +281,112 @@ else
 fi
 rm -rf "$S6"
 
+# --- scenario 7: --list — prints the registry, exits 0, never touches docker ---
+# --list is the cheap CI dry-run: it must list every registry entry and exit
+# WITHOUT booting a container. The stub docker here records its own invocation
+# in a marker; if --list ever reached the container loop the marker appears
+# and the assertion fails. Run with the stub docker on PATH so a stray docker
+# call would be caught.
+S7="$(mktemp -d /tmp/mc-selftest-list.XXXXXX)"
+make_repo "$S7"
+# Replace the plain stub with a marker-recording one.
+cat > "$S7/bin/docker" <<D
+#!/usr/bin/env bash
+: > "$S7/dcalled"
+exit 0
+D
+chmod +x "$S7/bin/docker"
+OUT7="$(cd "$S7/repo" && PATH="$S7/bin:$PATH" \
+    bash "$DRIVER" --list --repo "$S7/repo" 2>&1)"
+RC7=$?
+if [[ $RC7 -eq 0 ]]; then
+    ok "--list exits 0 (rc=$RC7)"
+else
+    fail "--list rc=$RC7"
+fi
+if [[ "$OUT7" == *"security.fail2ban_banned"* && "$OUT7" == *"system.cron_d_dropins"* ]]; then
+    ok "--list prints every registry check_id"
+else
+    fail "--list missing registry check_ids: $(echo "$OUT7" | tr '\n' '|')"
+fi
+if [[ "$OUT7" == *"scripts/box-audit.sh"* && "$OUT7" == *"test/install-docker/seeded/seed.sh"* ]]; then
+    ok "--list prints each entry's mutation target"
+else
+    fail "--list missing mutation targets: $(echo "$OUT7" | tr '\n' '|')"
+fi
+if [[ "$OUT7" == *"ENTRY "* ]]; then
+    fail "--list must not run the entry loop: $(echo "$OUT7" | tr '\n' '|')"
+else
+    ok "--list does not run the entry loop (no ENTRY lines)"
+fi
+if [[ -e "$S7/dcalled" ]]; then
+    fail "--list invoked docker (a --list dry-run must not)"
+else
+    ok "--list never invoked docker"
+fi
+rm -rf "$S7"
+
+# --- scenario 8: --report-fixture mixed (1 FLIPPED + 1 SURVIVED) --------------
+# The report renderer is exercised on a fixture result set (no container):
+# the per-entry verdict table and the score (flipped/total) must render, and
+# the exit code stays 0 regardless of flips (SURVIVED is a signal, not a fail).
+S8="$(mktemp -d /tmp/mc-selftest-rpt.XXXXXX)"
+mkdir -p "$S8"
+{
+    printf 'security.fail2ban_banned\tscripts/box-audit.sh\tFLIPPED\n'
+    printf 'system.cron_d_dropins\ttest/install-docker/seeded/seed.sh\tSURVIVED\n'
+} > "$S8/mixed.tsv"
+OUT8="$(bash "$DRIVER" --report-fixture "$S8/mixed.tsv" 2>&1)"
+RC8=$?
+if [[ $RC8 -eq 0 ]]; then
+    ok "--report-fixture mixed exits 0 (rc=$RC8)"
+else
+    fail "--report-fixture mixed rc=$RC8"
+fi
+if [[ "$OUT8" == *"security.fail2ban_banned"*"FLIPPED"* && "$OUT8" == *"system.cron_d_dropins"*"SURVIVED"* ]]; then
+    ok "--report-fixture renders the per-entry verdict table"
+else
+    fail "--report-fixture missing verdict table: $(echo "$OUT8" | tr '\n' '|')"
+fi
+if [[ "$OUT8" == *"total=2"* && "$OUT8" == *"flipped=1"* && "$OUT8" == *"survived=1"* && "$OUT8" == *"score=50.0%"* ]]; then
+    ok "--report-fixture mixed score 50.0% (total=2 flipped=1 survived=1)"
+else
+    fail "--report-fixture mixed score/counts wrong: $(echo "$OUT8" | tr '\n' '|')"
+fi
+rm -rf "$S8"
+
+# --- scenario 9: --report-fixture survived-only + 0-entry (the negative set) ---
+# A survived-only set is a coverage signal, NOT a failure: the renderer must
+# report score 0.0% and exit 0 (no FLIPPED line). The 0-entry set must not
+# divide by zero (score n/a) and must exit 0.
+S9="$(mktemp -d /tmp/mc-selftest-rpt2.XXXXXX)"
+mkdir -p "$S9"
+{
+    printf 'system.failed_units\tscripts/box-audit.sh\tSURVIVED\n'
+    printf 'updates.security_delta\tscripts/box-audit.sh\tSURVIVED\n'
+} > "$S9/survived.tsv"
+: > "$S9/empty.tsv"
+OUT9a="$(bash "$DRIVER" --report-fixture "$S9/survived.tsv" 2>&1)"
+RC9a=$?
+OUT9b="$(bash "$DRIVER" --report-fixture "$S9/empty.tsv" 2>&1)"
+RC9b=$?
+if [[ $RC9a -eq 0 && "$OUT9a" == *"flipped=0"* && "$OUT9a" == *"survived=2"* && "$OUT9a" == *"score=0.0%"* ]]; then
+    ok "--report-fixture survived-only → score 0.0%, exit 0 (a signal, not a failure)"
+else
+    fail "--report-fixture survived-only wrong (rc=$RC9a): $(echo "$OUT9a" | tr '\n' '|')"
+fi
+if [[ "$OUT9a" == *"FLIPPED"* ]]; then
+    fail "--report-fixture survived-only must not render a FLIPPED line: $(echo "$OUT9a" | tr '\n' '|')"
+else
+    ok "--report-fixture survived-only has no FLIPPED line"
+fi
+if [[ $RC9b -eq 0 && "$OUT9b" == *"total=0"* && "$OUT9b" == *"score=n/a"* ]]; then
+    ok "--report-fixture 0-entry → total=0 score=n/a, exit 0 (no divide-by-zero)"
+else
+    fail "--report-fixture 0-entry wrong (rc=$RC9b): $(echo "$OUT9b" | tr '\n' '|')"
+fi
+rm -rf "$S9"
+
 echo
 echo "mutation-coverage selftest: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]
