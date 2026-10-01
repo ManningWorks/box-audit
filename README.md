@@ -374,6 +374,56 @@ a GitHub Actions gate: the `integration-seeded` status check on the PR
 is what catches regressions for external contributors; tier 3 is the
 author's pre-merge net.
 
+### Mutation coverage (F6) — opt-in, not a fourth tier
+
+Beyond the three tiers there is a **named-mutation registry** that proves
+the tier-2 gates still have teeth. `test/mutations.list` is a table of
+one-line mutations — each either renames a `check_id` (family B, inside
+`scripts/box-audit.sh`) or removes a seeded condition (family A, inside
+`test/install-docker/seeded/seed.sh`) — and `test/mutation-coverage.sh`
+replays the tier-2 seeded-container boot against a mutated copy of the
+tree, then compares each entry's `check_id` in the post-mutation `--json`
+against a pristine baseline. It is an **extension of the tier-2 surface**
+(it reuses `test/install-seeded.sh`'s boot sequence), **not a fourth tier**
+—the repo rule is not to invent one — and it is **opt-in**: it does not run
+under `bash test/all.sh` and is not a required check.
+
+- **Full registry (manual, pre-release posture):** `bash
+  test/mutation-coverage.sh` with no `--entry` runs every entry. This is the
+  maintainer's pre-release net — run it before tagging a release. (As of
+  this branch the registry holds 14 entries and the full run reads
+  10 FLIPPED / 4 SURVIVED, score 71.4%; the four SURVIVED entries are
+  documented `absent-in-baseline` — their seed does not fire in the
+  driver's container, so they can only carry a note and cannot flip.
+  `--list` is the source of truth for the live count.)
+- **A subset:** `bash test/mutation-coverage.sh --entry <id> --entry <id>`
+  (repeatable) runs only the named entries.
+- **Dry-run / no container:** `bash test/mutation-coverage.sh --list` prints
+  the registry without booting anything (the CI dry-run seam); `--selftest`
+  and `--report-fixture <file>` are the stubbed-docker and offline-report
+  seams tier 1 uses. The driver has **no `--help` flag** — the usage block
+  is the banner at the top of `test/mutation-coverage.sh`.
+- **CI runs a pinned 5-entry subset, not the full registry.**
+  `.github/workflows/mutation-coverage.yml` runs a FIXED five-entry subset on
+  every PR and on pushes to master — four family-B `check_id` renames plus
+  one family-A seed-state entry (`system.cron_d_dropins`) — chosen so every
+  entry genuinely **flips** in the seeded baseline. A SURVIVED line in that
+  job means the gate really lost a check, not that a seed failed to fire.
+  The full registry is deliberately **not** a CI gate — it is the manual
+  pre-release step above. The job is additive, not a required check
+  (making it required is a GitHub branch-protection settings decision).
+
+Reading the report: **FLIPPED** = the `check_id` was present in the pristine
+baseline and absent after the mutation — the gate caught the mutation, so
+the gate has teeth. **SURVIVED** = the mutation did not flip a finding the
+baseline produced — that is **uncovered surface** (a signal to investigate,
+not a failure). When the baseline never produced the finding at all, the row
+carries an `absent-in-baseline:` note so it is not mistaken for a caught
+flip. Exit 0 = every entry produced a verdict; exit 1 = a hard error (dirty
+working tree at start, a baseline boot/audit failure, a sed that did not
+apply, or — the one case that is never a silent SURVIVED — a finding that
+*appears* after the mutation).
+
 Dependabot bumps the base image weekly.
 
 ## What it does NOT do
