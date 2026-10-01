@@ -44,24 +44,30 @@ printf '# dummy\n* * * * * /bin/echo fake\n' > /tmp/root-cron
 crontab -u root /tmp/root-cron
 rm -f /tmp/root-cron
 
-# 3b. Deterministic security-pending update (drives updates.security_pending
+# 3b. Deterministic security-pending updates (drives updates.security_pending
 #     + the Issue #38 persist-sidecar "below-threshold field must be > 0"
-#     probe in test/install-seeded.sh).
+#     probe AND the delta-mutation block, both in test/install-seeded.sh).
 #
 # The security_pending check (scripts/box-audit.sh:1351) counts lines in
 # `apt list --upgradable` that mention "security". On a real box that is the
 # live Ubuntu security pocket. The seeded container must NOT depend on live
 # archive state — the archive drains and refills on a schedule, and when it
-# hits 0 the "below-threshold field must be > 0" assertion in the driver
-# flips to a fail (the 2026-10-01 master integration-seeded failure:
-# `FAIL_PERSIST_SIDECAR: security_pending=0`).
+# hits 0: (a) the "below-threshold field must be > 0" sidecar probe fails
+# (the 2026-10-01 master integration-seeded failure:
+# `FAIL_PERSIST_SIDECAR: security_pending=0`), and (b) the mutated-security
+# delta run needs today - yesterday > 1, which is impossible when
+# today <= 1 (yesterday clamps to 0, delta = today = 1, not > 1).
 #
-# So we CREATE the pending update: install a base version of a fixture
-# package, then expose a local file:// apt repo whose Release Codename is
-# "resolute-security" and which offers a NEWER version. After `apt-get
-# update`, `apt list --upgradable` always carries
-# `boxaudit-secfixture/resolute-security ... [upgradable from: ...]` ->
-# `grep -ci security` is deterministically >= 1, independent of the archive.
+# So we CREATE the pending updates: install base versions of three fixture
+# packages, then expose a local file:// apt repo (Release Codename
+# "resolute-security") that offers a NEWER version of each. After
+# `apt-get update`, `apt list --upgradable` always carries three
+# `boxaudit-sec* /resolute-security ... [upgradable from: ...]` lines ->
+# `grep -ci security` is deterministically >= 3, independent of the archive.
+# Three (not one) is the floor that keeps the delta-mutation arithmetic
+# deterministic: today >= 3, so the clamped-yesterday path (today < 10)
+# yields delta = today >= 3 > 1 and the natural path (today >= 10) yields
+# delta = 10.
 #
 # Layout is the hierarchical form apt requires
 # (dists/<dist>/main/binary-amd64/Packages + dists/<dist>/Release);
@@ -69,40 +75,44 @@ rm -f /tmp/root-cron
 # is NOT required — the Packages index is hand-written (dpkg-deb is shipped
 # by the base image).
 SEC_REPO=/opt/box-audit-security-fixture
-SEC_PKG=boxaudit-secfixture
-SEC_BASE=1:1.0
-SEC_NEW=1:2.0
 SEC_DIST=resolute-security
 SEC_WORK=/opt/box-audit-secfixture-build
-mkdir -p "$SEC_WORK/deb/DEBIAN" "$SEC_WORK/deb/usr/bin"
-build_sec_deb() { # $1 = version
-    printf '#!/bin/sh\nexit 0\n' > "$SEC_WORK/deb/usr/bin/$SEC_PKG"
-    chmod 0755 "$SEC_WORK/deb/usr/bin/$SEC_PKG"
-    cat > "$SEC_WORK/deb/DEBIAN/control" <<EOF
-Package: $SEC_PKG
-Version: $1
+# Three packages -> three upgradable security lines, the deterministic floor.
+# dpkg-deb packages the WHOLE build tree, so each build gets its own isolated
+# tree ($SEC_WORK/build-<pkg>-<ver>/) — a shared tree would let later .debs
+# pick up earlier packages' /usr/bin files and dpkg -i would fail on the
+# file-ownership conflict.
+SEC_PKGS=(boxaudit-secfixture boxaudit-secfixture2 boxaudit-secfixture3)
+build_sec_deb() { # $1 = pkg, $2 = version
+    local pkg="$1" ver="$2" tree
+    tree="$SEC_WORK/build-${pkg}-${ver//:/_}"
+    mkdir -p "$tree/DEBIAN" "$tree/usr/bin"
+    printf '#!/bin/sh\nexit 0\n' > "$tree/usr/bin/$pkg"
+    chmod 0755 "$tree/usr/bin/$pkg"
+    cat > "$tree/DEBIAN/control" <<EOF
+Package: $pkg
+Version: $ver
 Architecture: amd64
 Maintainer: box-audit <test@example.com>
 Description: deterministic security-pending fixture
 EOF
-    dpkg-deb --build --root-owner-group "$SEC_WORK/deb" \
-        "$SEC_WORK/${SEC_PKG}_${1//:/_}.deb" >/dev/null
+    dpkg-deb --build --root-owner-group "$tree" \
+        "$SEC_WORK/${pkg}_${ver//:/_}.deb" >/dev/null
 }
-# Install the base version so apt has something to upgrade FROM.
-build_sec_deb "$SEC_BASE"
-dpkg -i "$SEC_WORK/${SEC_PKG}_1_1.0.deb" >/dev/null 2>&1 || true
-# Newer version laid out as a local apt repo.
-build_sec_deb "$SEC_NEW"
+SEC_BASE=1:1.0
+SEC_NEW=1:2.0
 mkdir -p "$SEC_REPO/pool/main/b" "$SEC_REPO/dists/$SEC_DIST/main/binary-amd64"
-cp "$SEC_WORK/${SEC_PKG}_1_2.0.deb" "$SEC_REPO/pool/main/b/${SEC_PKG}_1_2.0.deb"
-cat > "$SEC_REPO/dists/$SEC_DIST/main/binary-amd64/Packages" <<EOF
-Package: $SEC_PKG
-Version: $SEC_NEW
-Architecture: amd64
-Maintainer: box-audit <test@example.com>
-Filename: pool/main/b/${SEC_PKG}_1_2.0.deb
-Description: deterministic security-pending fixture
-EOF
+for pkg in "${SEC_PKGS[@]}"; do
+    # Install the base version so apt has something to upgrade FROM.
+    build_sec_deb "$pkg" "$SEC_BASE"
+    dpkg -i "$SEC_WORK/${pkg}_1_1.0.deb" >/dev/null 2>&1 || true
+    # Newer version into the pool + append to the Packages index.
+    build_sec_deb "$pkg" "$SEC_NEW"
+    cp "$SEC_WORK/${pkg}_1_2.0.deb" "$SEC_REPO/pool/main/b/${pkg}_1_2.0.deb"
+    printf 'Package: %s\nVersion: %s\nArchitecture: amd64\nMaintainer: box-audit <test@example.com>\nFilename: pool/main/b/%s_1_2.0.deb\nDescription: deterministic security-pending fixture\n\n' \
+        "$pkg" "$SEC_NEW" "$pkg" \
+        >> "$SEC_REPO/dists/$SEC_DIST/main/binary-amd64/Packages"
+done
 cat > "$SEC_REPO/dists/$SEC_DIST/Release" <<EOF
 Origin: box-audit-security-fixture
 Label: box-audit-security-fixture
@@ -110,6 +120,7 @@ Suite: $SEC_DIST
 Codename: $SEC_DIST
 Architectures: amd64
 Components: main
+Date: 2026-01-01T00:00:00Z
 Description: local security-pending fixture for the seeded audit tier
 EOF
 # Point apt at the local repo (trusted: no GPG at build time) and refresh.
