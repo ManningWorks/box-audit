@@ -521,7 +521,7 @@ print(f'  baseline=$baseline_label today=$today_label  (+{len(added)} -{len(remo
 
         # --replay <DIR>: treat DIR as a self-contained history root.
         # Read-only against the live /var/log/box-audit/: no history_write,
-        # no history_persist_counts_from_json, no mkdir of live paths. The
+        # no history_persist_live_counts, no mkdir of live paths. The
         # dir-override plumbing reuses history_diff (see the $2 / $3 / $4
         # branch above) so the comparison logic is not forked.
         run_replay() {
@@ -1166,9 +1166,10 @@ report_security() {
     # `-path '/var/lib/docker' -prune -o` drops the whole tree before the
     # perm filter runs.
     # NB: NOT `local` — main() reads this from the script scope to build
-    # the JSON `counts` block that history_persist_counts_from_json reads
-    # tomorrow's delta from (issue #38). Same shape for the other two
-    # counts below (outbound_remote_count, security).
+    # the JSON `counts` block AND passes it straight to the persist
+    # writer (history_persist_live_counts), which records it in the
+    # sidecar tomorrow's delta mode reads (issue #38). Same shape for
+    # the other two counts below (outbound_remote_count, security).
     suid_count=$($T /usr/bin/find / -xdev -path '/var/lib/docker' -prune -o -perm -4000 -type f -print 2>/dev/null | /usr/bin/wc -l)
     suid_count=${suid_count:-0}
     # Baseline 18 measured 2026-09-14 on this box; flag if above the
@@ -1540,18 +1541,21 @@ history_load_counts
 # Args: $1 = suid_count, $2 = outbound_remote_count, $3 = security_pending.
 # These are the LIVE measurements (script-scope vars set by
 # report_security / report_updates), passed through by main() at persist
-# time. Sourcing from the live vars — not by re-parsing the --json
-# snapshot's `counts` block — is the load-bearing fix for the delta-mode
-# signal integrity bug: a below-threshold count (e.g. suid_count=19 on a
-# healthy box, below the default 30 threshold) must still be persisted, so
-# tomorrow's delta computes today-live - yesterday-live. The pre-#38
-# implementation re-derived the counts from the findings[] list, which only
-# carries a count when the absolute check tripped, so below-threshold boxes
-# recorded 0 and the next day computed today-live - 0 = today-live — firing
-# false suid_delta / outbound_delta / security_delta every morning.
+# time. Sourcing from the live vars — same values as the JSON `counts`
+# block, one fewer round-trip — keeps the writer independent of the
+# snapshot main() just printed surviving to persist time. Behavior is
+# unchanged by the switch: the pre-PR-#68 implementation parsed the
+# `counts` block out of the snapshot, and that block is populated from
+# these same three live vars (main() builds `counts_json` from them).
+# Historical note: the original issue #38 defect — the persist sidecar
+# re-deriving counts from findings[], which only carries a count when the
+# absolute check tripped, so below-threshold boxes recorded 0 and the next
+# day's delta fired false suid_delta / outbound_delta / security_delta —
+# was fixed in v0.7.1 (94c250a); a production box that exhibited the 19→0
+# SUID symptom was still running pre-v0.7.1, not a live defect.
 # (history_tail/history_diff live above the CLI dispatch block — they are
 # dispatch targets and must be defined before the dispatch runs.)
-history_persist_counts_from_json() {
+history_persist_live_counts() {
     local suid_c="${1:-0}" outbound_c="${2:-0}" security_c="${3:-0}"
     # Coerce to integer; a non-numeric input degrades to 0 rather than
     # emitting a malformed sidecar (the load path reads these as ints).
@@ -1866,21 +1870,20 @@ for f in findings:
         # the raw JSON lines joined with commas; raw_output is the
         # rendered text (identical to what text mode prints).
         #
-        # The `counts` block (issue #38) is the load-bearing addition
-        # that fixes the delta-mode signal integrity bug. Under the
-        # old code, history_persist_counts_from_json sourced
-        # outbound_count / suid_count / security_pending from
-        # findings[] — but findings only carries a count when the
-        # corresponding absolute check tripped (e.g. security.suid_count
-        # only fires above the per-box threshold). On a healthy box
-        # the sidecar recorded 0 for all three, and tomorrow's delta
-        # computed today's-live - 0 = today's-live, firing false
+        # The `counts` block (issue #38, fixed in v0.7.1 / 94c250a) is the
+        # addition that fixes the delta-mode signal integrity bug: the
+        # original persist path sourced outbound_count / suid_count /
+        # security_pending from findings[], but findings only carries a
+        # count when the corresponding absolute check tripped (e.g.
+        # security.suid_count only fires above the per-box threshold). On a
+        # healthy box the sidecar recorded 0 for all three, and tomorrow's
+        # delta computed today's-live - 0 = today's-live, firing false
         # security.suid_delta / outbound_delta / security_delta every
-        # morning. The new sibling block is populated from the live
-        # measurement regardless of threshold, and history_persist
-        # reads from there. The findings surface is unchanged;
-        # consumers that ignore unknown fields are unaffected; strict
-        # JSON-schema consumers need updating.
+        # morning. The block is populated from the live measurement
+        # regardless of threshold, and history_persist_live_counts takes
+        # the same three values straight from the script-scope vars. The
+        # findings surface is unchanged; consumers that ignore unknown
+        # fields are unaffected; strict JSON-schema consumers need updating.
         local rendered_text findings_array_json raw_output_json full_json counts_json
         rendered_text=$(render_text_report)
         findings_array_json=""
@@ -1911,11 +1914,10 @@ print(json.dumps({
         # Persist the per-day count sidecar for delta mode tomorrow.
         # Best-effort: a failing write is silent (history dir is optional).
         # Pass the LIVE counts (script-scope vars set by report_security /
-        # report_updates) — the writer no longer re-derives them from the
-        # snapshot's counts block, so a below-threshold count (no finding
-        # emitted) still lands in the sidecar and tomorrow's delta is
-        # today-live - yesterday-live, not today-live - 0.
-        history_persist_counts_from_json \
+        # report_updates) — the same values main() just emitted in the JSON
+        # `counts` block, taken directly instead of re-parsed from the
+        # snapshot.
+        history_persist_live_counts \
             "${suid_count:-0}" "${outbound_remote_count:-0}" "${security:-0}" || true
         # Always exit 0 in JSON mode — the JSON itself encodes "status:ok"
         # vs "status:findings", so callers can branch on that instead of
@@ -1933,7 +1935,7 @@ print(json.dumps({
 # Source-me-or-run-me guard: the smoke suite sources this file (subshell, so
 # the top-level `set -uo pipefail -o errtrace` above doesn't leak into the
 # test's shell options) to exercise the delta-mode surface — specifically
-# history_persist_counts_from_json, which main() only reaches on a full
+# history_persist_live_counts, which main() only reaches on a full
 # --json run. Sourcing must NOT run the audit, so main fires only when the
 # script is invoked directly ($BASH_SOURCE == $0). When run directly this is
 # a no-op (bash sets $0 to the script path).

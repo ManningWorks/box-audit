@@ -186,12 +186,12 @@ else
 fi
 
 # --- --json `counts` block (issue #38) --------------------------------------
-# Regression for the delta-mode signal integrity bug: history_persist_counts_from_json
-# used to source counts from findings[] (which only carries counts when the
+# Regression for the delta-mode signal integrity bug: the original persist
+# path sourced counts from findings[] (which only carries counts when the
 # absolute threshold tripped), causing false +N delta findings on healthy
-# boxes. Fix is an additive `counts` block alongside `findings`, populated
-# from the live measurement regardless of threshold. The block is the
-# single source of truth the next-day delta check reads from, so its
+# boxes — fixed in v0.7.1 / 94c250a by the additive `counts` block. The
+# block is populated from the live measurement regardless of threshold and
+# is the single source of truth the next-day delta check reads from, so its
 # presence + shape is the load-bearing contract.
 COUNTS_PROBE='
 import json, sys
@@ -228,25 +228,26 @@ else
 fi
 
 # --- persist sidecar records LIVE counts below threshold (#38 / t_c362fe49) -
-# history_persist_counts_from_json writes .latest-counts.json from the live
+# history_persist_live_counts writes .latest-counts.json from the live
 # measurement, so a count that did NOT trip its absolute check (no finding)
 # still lands in the sidecar and tomorrow's delta is today-live -
-# yesterday-live, not today-live - 0 (the pre-#38 false "+19 SUID / day"
+# yesterday-live, not today-live - 0 (the pre-v0.7.1 false "+19 SUID / day"
 # regression class). Sourcing box-audit.sh in a subshell exercises the REAL
 # writer — main() is not reached because the source-me guard suppresses it —
 # and BOXAUDIT_HISTORY_DIR redirects the write to a scratch dir the test
 # owns (no root needed). A second, different run must OVERWRITE the first:
 # the sidecar tracks live values, not a one-time seed.
 PERSIST_DIR="$(mktemp -d /tmp/persist.XXXXXX)"
+PERSIST_SRC_ERR="$(mktemp /tmp/persist-src.XXXXXX)"
 (
   set +u
   # Redirect the writer to the scratch dir BEFORE sourcing: HISTORY_DIR is
   # computed from BOXAUDIT_HISTORY_DIR at source time (scripts/box-audit.sh),
   # so the var must be set for the source line, not just the assertion.
   export BOXAUDIT_HISTORY_DIR="$PERSIST_DIR"
-  source "$REPO/scripts/box-audit.sh" 2>/dev/null
-  history_persist_counts_from_json 19 3 7   # below every default threshold
-  history_persist_counts_from_json 7 0 3    # a later run, different live values
+  source "$REPO/scripts/box-audit.sh" 2>"$PERSIST_SRC_ERR"
+  history_persist_live_counts 19 3 7   # below every default threshold
+  history_persist_live_counts 7 0 3    # a later run, different live values
 ) >/dev/null 2>&1
 PERSIST_OK="fail"
 if [[ -f "$PERSIST_DIR/.latest-counts.json" ]]; then
@@ -263,9 +264,13 @@ fi
 if [[ "$PERSIST_OK" == "ok" ]]; then
     ok "persist sidecar records live counts below threshold (19/3/7 then overwritten to 7/0/3)"
 else
+    # Surface any source-time noise from the subshell — a partial source of
+    # box-audit.sh is the most likely reason the sidecar is missing/bad,
+    # and 2>/dev/null used to hide it from exactly this failure branch.
+    [[ -s "$PERSIST_SRC_ERR" ]] && cat "$PERSIST_SRC_ERR" >&2
     fail "persist sidecar did not record the live below-threshold counts (got: $PERSIST_OK)"
 fi
-rm -rf "$PERSIST_DIR"
+rm -rf "$PERSIST_DIR" "$PERSIST_SRC_ERR"
 
 # --- --replay [DIR] mode (issue #15) ---------------------------------------
 # Replay is read-only against the live /var/log/box-audit/history — the

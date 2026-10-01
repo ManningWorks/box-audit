@@ -171,7 +171,7 @@ fi
 
 # --- Issue #38 regression: persist-write sidecar witness (H1) --------------
 # Pin the second half of the #38 contract the existing tier-2 block above
-# leaves un-observed: history_persist_counts_from_json must actually write
+# leaves un-observed: history_persist_live_counts must actually write
 # /var/log/box-audit/history/.latest-counts.json with today's live
 # counts so that tomorrow's delta check has a baseline to read from.
 # The constant/mutated runs below exercise the *load* path; they plant
@@ -191,7 +191,7 @@ fi
 SIDECAR_JSON="$(privileged_exec /usr/bin/cat /var/log/box-audit/history/.latest-counts.json)"
 if [[ -z "$SIDECAR_JSON" ]]; then
     echo "test/install-seeded.sh: FAIL — persist sidecar .latest-counts.json is empty or missing after --json run" >&2
-    echo "(history_persist_counts_from_json did not write, or write failed silently)" >&2
+    echo "(history_persist_live_counts did not write, or write failed silently)" >&2
     exit 1
 fi
 # The probe script exits non-zero when its findings disagree; under
@@ -202,7 +202,7 @@ SIDECAR_PROBE_OUT="$(SIDECAR_JSON="$SIDECAR_JSON" BA_JSON="$BA_JSON" python3 - <
 import json, os, sys
 sidecar = json.loads(os.environ["SIDECAR_JSON"])
 stdout_counts = json.load(open(os.environ["BA_JSON"]))["counts"]
-# Sidecar keys (renamed in history_persist_counts_from_json at
+# Sidecar keys (renamed in history_persist_live_counts at
 # scripts/box-audit.sh:1389-1395).
 checks = [
     ("suid_count",         "suid_count"),
@@ -574,16 +574,18 @@ else
 fi
 
 # --- Issue #38 regression: delta-mode signal integrity ---------------------
-# The persist sidecar history_persist_counts_from_json used to source
+# History: the ORIGINAL issue #38 defect — the persist sidecar sourcing
 # today's counts from the JSON snapshot's findings[] array, which only
 # carries a count when the corresponding absolute check tripped. On a
 # healthy seeded box (low SUID, no outbound, no security updates) every
 # one of the three is below threshold, so the sidecar recorded 0 — and
 # tomorrow's delta check computed today's-live - 0 = today's-live, firing
 # security.suid_delta / outbound_delta / security_delta every morning
-# forever. The fix (Option A in the issue) is an additive counts block
-# alongside findings[], sourced from the live measurement regardless of
-# threshold, and history_persist_counts_from_json reads from there.
+# forever. That was fixed in v0.7.1 (94c250a): the additive counts block
+# alongside findings[] is populated from the live measurement regardless
+# of threshold, and history_persist_live_counts now takes the same three
+# values straight from the script-scope vars instead of re-parsing the
+# snapshot.
 #
 # Two assertions:
 #
