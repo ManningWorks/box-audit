@@ -227,6 +227,46 @@ else
     fail "--json counts block check failed (rc=$COUNTS_RC): $COUNTS_OUT"
 fi
 
+# --- persist sidecar records LIVE counts below threshold (#38 / t_c362fe49) -
+# history_persist_counts_from_json writes .latest-counts.json from the live
+# measurement, so a count that did NOT trip its absolute check (no finding)
+# still lands in the sidecar and tomorrow's delta is today-live -
+# yesterday-live, not today-live - 0 (the pre-#38 false "+19 SUID / day"
+# regression class). Sourcing box-audit.sh in a subshell exercises the REAL
+# writer — main() is not reached because the source-me guard suppresses it —
+# and BOXAUDIT_HISTORY_DIR redirects the write to a scratch dir the test
+# owns (no root needed). A second, different run must OVERWRITE the first:
+# the sidecar tracks live values, not a one-time seed.
+PERSIST_DIR="$(mktemp -d /tmp/persist.XXXXXX)"
+(
+  set +u
+  # Redirect the writer to the scratch dir BEFORE sourcing: HISTORY_DIR is
+  # computed from BOXAUDIT_HISTORY_DIR at source time (scripts/box-audit.sh),
+  # so the var must be set for the source line, not just the assertion.
+  export BOXAUDIT_HISTORY_DIR="$PERSIST_DIR"
+  source "$REPO/scripts/box-audit.sh" 2>/dev/null
+  history_persist_counts_from_json 19 3 7   # below every default threshold
+  history_persist_counts_from_json 7 0 3    # a later run, different live values
+) >/dev/null 2>&1
+PERSIST_OK="fail"
+if [[ -f "$PERSIST_DIR/.latest-counts.json" ]]; then
+  PERSIST_OK="$(BOXAUDIT_HISTORY_DIR="$PERSIST_DIR" python3 -c '
+import json, os
+d = json.load(open(os.environ["BOXAUDIT_HISTORY_DIR"] + "/.latest-counts.json"))
+if d.get("suid_count") == 7 and d.get("outbound_count") == 0 \
+        and d.get("security_pending") == 3:
+    print("ok")
+else:
+    print("bad", d)
+' 2>/dev/null)"
+fi
+if [[ "$PERSIST_OK" == "ok" ]]; then
+    ok "persist sidecar records live counts below threshold (19/3/7 then overwritten to 7/0/3)"
+else
+    fail "persist sidecar did not record the live below-threshold counts (got: $PERSIST_OK)"
+fi
+rm -rf "$PERSIST_DIR"
+
 # --- --replay [DIR] mode (issue #15) ---------------------------------------
 # Replay is read-only against the live /var/log/box-audit/history — the
 # smoke checks here don't touch live state, only the test/fixtures/replay
