@@ -1,0 +1,73 @@
+# test/mutations.list — F6 named-mutation registry (tier-2 surface)
+#
+# One mutation per line. A mutation "targets" a check when a seeded
+# container run against the mutated tree no longer produces that
+# check's expected finding, i.e. its check_id flips out of the audit
+# output (or the seeded tier-2 driver fails on a probe for it).
+#
+# FORMAT — three tab-separated fields per entry line:
+#
+#   check_id <TAB> target <TAB> sed_expression
+#
+#   check_id        The check_id whose expected finding should flip
+#                   out of the --json findings[] after the mutation.
+#   target          Repo-relative path of the file the sed applies to
+#                   (the driver applies it to a scratch copy of the
+#                   tree and restores with git after each entry).
+#   sed_expression  A single sed s-command, e.g.
+#                   s|json_push alert security.fail2ban_banned security |json_push alert security.fail2ban_bannedX security |
+#
+# CONVENTIONS
+#   - Lines beginning with '#' and blank lines are ignored.
+#   - The sed uses '|' as the delimiter so the regex slashes (e.g.
+#     /usr/bin/find) stay literal; no expression here needs '/'.
+#   - Fields are applied verbatim by the driver with no shell
+#     expansion: sed -i "<sed_expression>" "<target>".
+#   - Dots in search strings are plain-text identifiers and match
+#     'any char' in regex; that is harmless here because every
+#     search string occurs on exactly one line of its target file
+#     (verified at registry creation — keep it that way when adding
+#     entries).
+#   - Each entry must be a single line: no tabs, no backslash
+#     line-continuations inside a field.
+#   - Family A entries mutate the seeded STATE (seed.sh); family B
+#     entries mutate the audit's own emission (scripts/box-audit.sh)
+#     by renaming the check_id it pushes. Both families flip the
+#     targeted check_id out of the output; family B is the only
+#     family available for checks whose seed state is produced
+#     post-boot by test/install-seeded.sh (sockets, bans, journal
+#     lines) — those lines live in the driver, which the registry
+#     must not edit.
+#
+# COVERAGE — one entry per check_id test/install-seeded.sh asserts
+# (the nine listed below plus the F2 jail and the #38 counts field,
+# eleven total):
+#   security.outbound_remote_count, security.outbound_remote_count_v6,
+#   security.suid_delta, security.fail2ban_banned,
+#   security.fail2ban_jail, updates.security_delta,
+#   updates.security_pending, system.failed_units,
+#   system.cron_d_dropins, security.new_port
+#
+# CHECKS THAT CANNOT BE BROKEN BY A SINGLE SED: none. Every listed
+# check_id has a single-line sed that flips it (above). Noted for
+# completeness: the v4/v6 outbound *socket seeding* and the fail2ban
+# banip calls are multi-line driver actions and cannot be removed by
+# one sed — but each of those checks also has a one-line emission
+# site in scripts/box-audit.sh, which is what these entries target.
+#
+# The driver (test/mutation-coverage.sh, separate card) reads this
+# file, applies each entry to a scratch tree, re-runs the seeded
+# tier-2 suite, and records FLIPPED (caught — good) or SURVIVED
+# (uncovered surface — signal) per entry.
+
+security.fail2ban_banned	scripts/box-audit.sh	s|json_push alert security.fail2ban_banned security |json_push alert security.fail2ban_bannedX security |
+security.fail2ban_jail	scripts/box-audit.sh	s|json_push alert security.fail2ban_jail security |json_push alert security.fail2ban_jailX security |
+security.new_port	scripts/box-audit.sh	s|json_push warn security.new_port security |json_push warn security.new_portX security |
+security.outbound_remote_count	scripts/box-audit.sh	s|json_push warn security.outbound_remote_count security |json_push warn security.outbound_remote_countX security |
+security.outbound_remote_count_v6	scripts/box-audit.sh	s|json_push warn security.outbound_remote_count_v6 security |json_push warn security.outbound_remote_count_v6X security |
+security.suid_delta	scripts/box-audit.sh	s|json_push warn security.suid_delta security |json_push warn security.suid_deltaX security |
+updates.security_delta	scripts/box-audit.sh	s|json_push warn updates.security_delta updates |json_push warn updates.security_deltaX updates |
+updates.security_pending	scripts/box-audit.sh	s|json_push warn updates.security_pending updates |json_push warn updates.security_pendingX updates |
+system.failed_units	scripts/box-audit.sh	s|json_push warn system.failed_units system |json_push warn system.failed_unitsX system |
+system.cron_d_dropins	test/install-docker/seeded/seed.sh	s|^printf .fake-cron-line|: # F6-registry mutation removes the cron.d drop-in (family A)|
+security.ssh_fails	scripts/box-audit.sh	s|json_push warn security.ssh_fails security |json_push warn security.ssh_failsX security |
