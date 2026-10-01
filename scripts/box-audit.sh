@@ -433,7 +433,11 @@ for row in json.load(sys.stdin):
         # Read-only; /var/log/box-audit/history is optional state.
         # --tail [N] (default 7) / --diff [N] (default 1); the parser in the
         # CLI block above applies those defaults, matching the help text.
-        HISTORY_DIR="/var/log/box-audit/history"
+        # BOXAUDIT_HISTORY_DIR: env-overridable for the smoke suite's
+        # persist-sidecar unit test, same shape as BOXAUDIT_LOCK_DIR — the
+        # test points the writer at a scratch dir it owns instead of the
+        # root-only /var/log/box-audit.
+        HISTORY_DIR="${BOXAUDIT_HISTORY_DIR:-/var/log/box-audit/history}"
 
         # Tail mode: read-only summary of the last N daily snapshots. Sorted
         # most-recent-first.
@@ -1529,45 +1533,46 @@ except Exception:
 }
 history_load_counts
 
-# Re-reads today's counts out of the JSON snapshot main() just printed,
-# then writes a tiny sidecar the next day's delta mode reads. Both fail
-# silently: history is best-effort and a missing dir must not break the
-# audit. The numbers come from the JSON's `counts` block (issue #38),
-# which is populated from the live measurement regardless of whether
-# the corresponding absolute check tripped. The OLD implementation
-# scanned `findings[]` for the three check_ids; that path produced 0
-# for every below-threshold count, which fed the delta check today's-
-# live - 0 = today's-live and fired false suid_delta / outbound_delta /
-# security_delta every morning on a healthy box.
+# Writes today's live counts to the sidecar the next day's delta mode
+# reads. Both the write and any failure are silent: history is best-effort
+# and a missing dir must not break the audit.
+#
+# Args: $1 = suid_count, $2 = outbound_remote_count, $3 = security_pending.
+# These are the LIVE measurements (script-scope vars set by
+# report_security / report_updates), passed through by main() at persist
+# time. Sourcing from the live vars — not by re-parsing the --json
+# snapshot's `counts` block — is the load-bearing fix for the delta-mode
+# signal integrity bug: a below-threshold count (e.g. suid_count=19 on a
+# healthy box, below the default 30 threshold) must still be persisted, so
+# tomorrow's delta computes today-live - yesterday-live. The pre-#38
+# implementation re-derived the counts from the findings[] list, which only
+# carries a count when the absolute check tripped, so below-threshold boxes
+# recorded 0 and the next day computed today-live - 0 = today-live — firing
+# false suid_delta / outbound_delta / security_delta every morning.
 # (history_tail/history_diff live above the CLI dispatch block — they are
 # dispatch targets and must be defined before the dispatch runs.)
 history_persist_counts_from_json() {
-    local json_text="$1"
+    local suid_c="${1:-0}" outbound_c="${2:-0}" security_c="${3:-0}"
+    # Coerce to integer; a non-numeric input degrades to 0 rather than
+    # emitting a malformed sidecar (the load path reads these as ints).
+    [[ "$suid_c" =~ ^[0-9]+$ ]] || suid_c=0
+    [[ "$outbound_c" =~ ^[0-9]+$ ]] || outbound_c=0
+    [[ "$security_c" =~ ^[0-9]+$ ]] || security_c=0
     /usr/bin/mkdir -p "$HISTORY_DIR" 2>/dev/null || return 0
     [[ -d "$HISTORY_DIR" ]] || return 0
     /usr/bin/python3 -c '
 import json, sys, datetime, socket
-try:
-    d = json.loads(sys.argv[1])
-    c = d.get("counts", {}) or {}
-    # .get(key, 0) keeps the sidecar load-path unchanged for boxes that
-    # never produced a counts block (legacy snapshot replayed); the new
-    # audit always emits one.
-    out_c = int(c.get("outbound_remote_count", 0) or 0)
-    sui_c = int(c.get("suid_count", 0) or 0)
-    sec_c = int(c.get("security_pending", 0) or 0)
-    payload = {
-        "outbound_count": out_c,
-        "suid_count": sui_c,
-        "security_pending": sec_c,
-        "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "host": socket.gethostname(),
-    }
-    with open("'"$HISTORY_DIR"'/.latest-counts.json","w") as fh:
-        fh.write(json.dumps(payload))
-except Exception:
-    pass
-' "$json_text" 2>/dev/null
+suid_c, outbound_c, security_c = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+payload = {
+    "outbound_count": outbound_c,
+    "suid_count": suid_c,
+    "security_pending": security_c,
+    "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "host": socket.gethostname(),
+}
+with open("'"$HISTORY_DIR"'/.latest-counts.json","w") as fh:
+    fh.write(json.dumps(payload))
+' "$suid_c" "$outbound_c" "$security_c" 2>/dev/null || return 0
     # Tighten perms to 0640 root:boxaudit: python's open() inherits
     # the parent umask (typically 0022 under the root systemd unit),
     # so the file would otherwise end up 0644 world-readable. Chmod
@@ -1905,7 +1910,13 @@ print(json.dumps({
         history_write "$full_json" || true
         # Persist the per-day count sidecar for delta mode tomorrow.
         # Best-effort: a failing write is silent (history dir is optional).
-        history_persist_counts_from_json "$full_json" || true
+        # Pass the LIVE counts (script-scope vars set by report_security /
+        # report_updates) — the writer no longer re-derives them from the
+        # snapshot's counts block, so a below-threshold count (no finding
+        # emitted) still lands in the sidecar and tomorrow's delta is
+        # today-live - yesterday-live, not today-live - 0.
+        history_persist_counts_from_json \
+            "${suid_count:-0}" "${outbound_remote_count:-0}" "${security:-0}" || true
         # Always exit 0 in JSON mode — the JSON itself encodes "status:ok"
         # vs "status:findings", so callers can branch on that instead of
         # the exit code. This matters because pipefail in shells / systemd
@@ -1919,4 +1930,13 @@ print(json.dumps({
     return 0
 }
 
-main
+# Source-me-or-run-me guard: the smoke suite sources this file (subshell, so
+# the top-level `set -uo pipefail -o errtrace` above doesn't leak into the
+# test's shell options) to exercise the delta-mode surface — specifically
+# history_persist_counts_from_json, which main() only reaches on a full
+# --json run. Sourcing must NOT run the audit, so main fires only when the
+# script is invoked directly ($BASH_SOURCE == $0). When run directly this is
+# a no-op (bash sets $0 to the script path).
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+    main "$@"
+fi
