@@ -1,0 +1,41 @@
+name: mutation-coverage
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  # Pinned-subset variant of the F6 named-mutation registry run. CI runs a
+  # FIXED set of five of the eleven test/mutations.list entries (one
+  # family-A seed-state entry + four family-B emission renames) on every
+  # PR; the FULL eleven-entry registry is deliberately NOT a CI gate — it
+  # is a manual pre-release step (`bash test/mutation-coverage.sh` with no
+  # --entry, ~6-7 min) run by the maintainer before tagging a release.
+  #
+  # The pinned set is kept in this file on purpose. Every entry flips in
+  # the seeded container baseline (verified against the feat/f6-report
+  # tree: 5/5 FLIPPED, score 100.0%); a SURVIVED line here means the
+  # gate genuinely lost a check, not that its seed failed to fire. The
+  # set stays small enough to run within ~2x of the tier-2 job's
+  # runtime, and mixes both mutation families so a regression in either
+  # driver path is caught. If an entry stops flipping, fix the
+  # check/seed or re-pin — don't swap in an absent-in-baseline entry
+  # (those always SURVIVE by construction and hide flips).
+  #
+  # This job is additive: it is not (and should not be) a required check
+  # in branch protection — that is a GitHub settings decision outside
+  # the repo (see the PR that added this file).
+  mutation-coverage-subset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run pinned mutation-coverage subset (5 of 11 registry entries)
+        run: |
+          bash test/mutation-coverage.sh \
+            --entry security.fail2ban_banned \
+            --entry security.new_port \
+            --entry security.ssh_fails \
+            --entry system.failed_units \
+            --entry system.cron_d_dropins

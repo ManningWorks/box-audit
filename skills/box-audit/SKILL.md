@@ -211,3 +211,34 @@ test model and how to run it are in the repo README ("Testing" section),
 entry point `bash test/all.sh`. Nothing in this skill is needed to develop
 the tool.
 
+### Mutation coverage (F6) — a silent-gate regression net
+
+Beyond the three tiers there is an opt-in **named-mutation registry** that
+guards a specific regression class: a gate that *silently* stops firing
+without failing loudly. Two shipped incidents motivated it:
+
+- **v0.8.1 ProtectSystem trap** — `ProtectSystem=strict` without a writable
+  `/tmp` silently disabled the entire audit (clean `exit 0`, 0-byte
+  `latest.json`, no error signal). The `PrivateTmp=yes` carve-out in the
+  same unit is what makes `strict` load-bearing-safe.
+- **v0.9.1 lock-gate** — the single-instance guard conflated "lock file
+  could not be opened" with "another instance holds the lock"; under a
+  read-only lock dir the run `exit 0`'d with **zero checks run** while the
+  systemd unit reported `Result=success`. Now an unopenable lock fails the
+  run with exit 75 so the misconfiguration is visible instead of silent.
+
+Both are the same shape: the audit *looks* healthy while it audited nothing.
+The mutation-coverage driver exists so that shape is caught at the gate, not
+at the operator. It is an extension of the tier-2 surface (reuses
+`test/install-seeded.sh`'s seeded-container boot), **not a fourth tier**, and
+is opt-in — it does not run under `bash test/all.sh`.
+
+To run it: `bash test/mutation-coverage.sh` (full registry, the
+pre-release posture), `bash test/mutation-coverage.sh --entry <id>` (a
+subset, repeatable), or `bash test/mutation-coverage.sh --list` (no-container
+dry run). The driver has no `--help` flag; the usage block is the banner at
+the top of `test/mutation-coverage.sh`. CI runs a pinned 5-entry subset
+(`.github/workflows/mutation-coverage.yml`), not the full registry — see the
+repo README ("Testing") and AGENTS.md ("Testing convention") for the
+subset-vs-full and the report's FLIPPED/SURVIVED semantics.
+
