@@ -3,7 +3,14 @@
 #
 #   bash test/mutation-coverage.sh                 # run every registry entry
 #   bash test/mutation-coverage.sh --entry <id>    # repeatable; run a subset
+#   bash test/mutation-coverage.sh --list          # print the registry, no
+#                                                  # container (CI dry-run)
 #   bash test/mutation-coverage.sh --selftest      # stubbed-docker harness mode
+#   bash test/mutation-coverage.sh --report-fixture <file>
+#                                                  # render a report from a
+#                                                  # fixture result set (tier-1
+#                                                  # property-test seam; no
+#                                                  # container, no docker)
 #
 # For each registry entry the driver runs the seeded tier-2 container path
 # (test/install-seeded.sh's boot sequence) against a MUTATED copy of the
@@ -46,12 +53,15 @@
 #
 # Exit codes:
 #   0  every entry produced a verdict (FLIPPED or SURVIVED)
-#   1  a hard error: baseline boot/audit failure, a malformed registry
-#      line, an unknown --entry id, a sed that did not apply, a
-#      container/audit failure, a --json that is not a findings list, or
-#      a finding that APPEARS after the mutation (seed/mutation
-#      misbehaviour — never a silent SURVIVED).
+#   1  a hard error: a dirty working tree at start (refusal — the dirty
+#      paths are named on stderr), baseline boot/audit failure, a
+#      malformed registry line, an unknown --entry id, a sed that did
+#      not apply, a container/audit failure, a --json that is not a
+#      findings list, or a finding that APPEARS after the mutation
+#      (seed/mutation misbehaviour — never a silent SURVIVED).
 #   2  bad arguments.
+#   130/143  SIGINT/SIGTERM delivered mid-run — the tree is restored
+#      before exit (see the tree-safety contract below).
 #
 # --selftest runs the same loop with a stubbed docker (env
 # MUTATION_COVERAGE_DOCKER_STUB=1 set by the tier-1 harness in
@@ -65,10 +75,17 @@
 # (runs the command verbatim in $PWD). --repo <dir> points the driver at
 # the scratch repo (selftest only).
 #
-# This card is the skeleton: it prints raw per-entry lines and restores
-# only the live-tree files it actually mutated (selftest mode). The
-# polished report table and the trap-based restoration machinery are
-# later cards.
+# Tree-safety contract (F6-safety card):
+#   * refuses to start on a dirty working tree (`git status --porcelain`
+#     non-empty → exit 1 naming the dirty paths), so a pre-existing mess
+#     is never blamed on the driver;
+#   * traps EXIT/INT/TERM: an interrupted run (kill mid-container,
+#     Ctrl-C, a set -e trip) restores every live-tree file it mutated
+#     to its pre-run state byte-for-byte before exiting. Real mode never
+#     mutates the live tree (the mutation lives in the staged scratch
+#     work), so the restore is a no-op there; selftest mode seds the
+#     scratch tree directly and is the path the tier-1 negative variant
+#     kills mid-run to prove the trap.
 
 set -euo pipefail
 
@@ -76,16 +93,20 @@ set -euo pipefail
 SELFTEST=0
 SELFTEST_REPO=""
 WANT_ENTRIES=()
+LIST=0
+REPORT_FIXTURE=""
 
 prev=""
 for arg in "$@"; do
     case "$prev" in
         --entry) WANT_ENTRIES+=("$arg") ;;
         --repo)  SELFTEST_REPO="$arg" ;;
+        --report-fixture) REPORT_FIXTURE="$arg" ;;
     esac
     case "$arg" in
         --selftest) SELFTEST=1 ;;
-        --entry|--repo) ;;
+        --list) LIST=1 ;;
+        --entry|--repo|--report-fixture) ;;
         --) ;;
         -*)
             echo "test/mutation-coverage.sh: unknown argument: $arg" >&2
@@ -99,35 +120,60 @@ REPO="$SELFTEST_REPO"
 [[ -z "$REPO" ]] && REPO="$(cd "$(dirname "$0")/.." && pwd)"
 REGISTRY="$REPO/test/mutations.list"
 
-# shellcheck source=./install-lib.sh
-source "$(dirname "$0")/install-lib.sh"
-
-# box-audit-base:test is the exact FROM tag of the seeded Dockerfile, and
-# it is what a prior tier-2 run (or this driver) leaves cached, so the
-# base build is a docker cache no-op. The seeded image is rebuilt per run
-# from the (possibly mutated) staged work — for family B the COPY seed.sh
-# layer is unchanged and layer-cached; for family A it re-runs.
-BASE_TAG="box-audit-base:test"
-SEEDED_TAG="box-audit-mc:seeded"
-
-# This driver runs MULTIPLE containers (one pristine baseline + one per
-# entry), so it tracks every boot in MC_CONTAINERS and removes them all on
-# exit — install-lib's trap only removes the LAST container it created
-# (the global CID), which would strand the baseline + earlier entries.
-# The trap also runs _lib_cleanup first so LIB_CLEANUP_PATHS (mktemp work
-# dirs + capture files) are still rm -rf'd as the library intends.
-MC_CONTAINERS=()
-remove_mc_containers() {
-    local c
-    for c in ${MC_CONTAINERS[@]+"${MC_CONTAINERS[@]}"}; do
-        docker rm -f "$c" >/dev/null 2>&1 || true
-    done
-    MC_CONTAINERS=()
+# --- report renderer -----------------------------------------------------------
+# render_report <results-tsv> <elapsed-seconds>: the human-readable F6 report.
+# Reads a result set — one row per registry entry,
+# `check_id <TAB> target <TAB> verdict <TAB> [note]` — prints one verdict line
+# per entry, then a summary block (total / flipped / survived / mutation score
+# / wall-clock). A SURVIVED entry is a coverage signal, NOT a failure: the
+# function always returns 0 and the CALLER owns the driver's exit code. A
+# 0-entry set renders total=0 with score n/a (no divide-by-zero).
+#
+# Used two ways: --report-fixture (the tier-1 property-test seam — it feeds
+# this exact function a fixture result set, elapsed 0, no docker, no tree
+# gate) and the final report of a real run (elapsed = wall-clock seconds).
+render_report() {
+    local results="$1" elapsed_s="${2:-0}"
+    local line id target verdict note
+    local total=0 flipped=0 survived=0 score="n/a"
+    echo "mutation-coverage report:"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        IFS=$'\t' read -r id target verdict note <<< "$line"
+        [[ -z "${id:-}" ]] && continue
+        total=$((total + 1))
+        case "$verdict" in
+            FLIPPED)  flipped=$((flipped + 1)) ;;
+            SURVIVED) survived=$((survived + 1)) ;;
+        esac
+        if [[ -n "${note:-}" ]]; then
+            printf '  %-30s %-45s %s  %s\n' "$id" "$target" "$verdict" "$note"
+        else
+            printf '  %-30s %-45s %s\n' "$id" "$target" "$verdict"
+        fi
+    done < "$results"
+    if (( total > 0 )); then
+        score="$(awk -v f="$flipped" -v t="$total" 'BEGIN{printf "%.1f%%", (f*100)/t}')"
+    fi
+    echo "  total=$total flipped=$flipped survived=$survived score=$score elapsed=${elapsed_s}s"
+    return 0
 }
-# shellcheck disable=SC2064
-trap '_lib_cleanup; remove_mc_containers' EXIT
 
-# --- registry parse ------------------------------------------------------------
+# --- --report-fixture: pure render seam (read-only; no docker, no tree gate) ----
+# Exits before the dirty-tree gate on purpose: rendering a fixture mutates
+# nothing, so tree cleanliness is irrelevant and the mode must work from any
+# CWD/tree state. This is the seam the tier-1 property test feeds fixtures to.
+if [[ -n "$REPORT_FIXTURE" ]]; then
+    if [[ ! -f "$REPORT_FIXTURE" ]]; then
+        echo "test/mutation-coverage.sh: --report-fixture: not a file: $REPORT_FIXTURE" >&2
+        exit 1
+    fi
+    render_report "$REPORT_FIXTURE" 0
+    exit 0
+fi
+
+# --- registry parse (moved before the gate so --list can use it) ---------------
 # Parallel arrays. The registry header documents three tab-separated
 # fields: check_id <TAB> target <TAB> sed_expression. Applied verbatim
 # (sed -i "<expr>" "<target>"), no shell expansion.
@@ -156,7 +202,95 @@ if (( ${#ENTRIES_ID[@]} == 0 )); then
     exit 1
 fi
 
-# Resolve the requested subset (or the full registry).
+# --- --list: read-only registry dry-run (no container, no tree gate) -----------
+# Prints every registry entry and exits WITHOUT booting a container. This is
+# the cheap CI-subset planning view ("what can CI pin over?"), so it must work
+# on any tree state and without docker. It lists the FULL registry (not the
+# --entry subset) — the point is to see the whole set.
+if (( LIST )); then
+    printf 'test/mutations.list — %s entries (check_id<TAB>target<TAB>sed):\n' "${#ENTRIES_ID[@]}"
+    for i in "${!ENTRIES_ID[@]}"; do
+        printf '%s\t%s\t%s\n' "${ENTRIES_ID[$i]}" "${ENTRIES_TARGET[$i]}" "${ENTRIES_SED[$i]}"
+    done
+    exit 0
+fi
+
+# Live-tree files this run mutated (selftest mode seds the scratch tree
+# directly; real mode mutates only the staged work, so this stays empty
+# and the trap's restore is a no-op). Declared BEFORE the library source
+# and before the dirty-tree gate so it is visible to the trap below and
+# to every exit path from here on.
+LIVE_MUTATED=()
+
+# Refuse to start on a dirty working tree: a pre-existing mess would
+# otherwise be blamed on the driver, and the trap's restore (scoped to
+# LIVE_MUTATED) would rightly leave it alone. The dirty paths are named
+# so the operator knows exactly what to stash/commit first.
+if [[ -d "$REPO/.git" ]]; then
+    DIRTY="$(git -C "$REPO" status --porcelain)"
+    if [[ -n "$DIRTY" ]]; then
+        echo "test/mutation-coverage.sh: refusing to start — working tree is dirty. Fix or stash these paths first:" >&2
+        printf '%s\n' "$DIRTY" >&2
+        exit 1
+    fi
+fi
+
+# shellcheck source=./install-lib.sh
+source "$(dirname "$0")/install-lib.sh"
+
+# box-audit-base:test is the exact FROM tag of the seeded Dockerfile, and
+# it is what a prior tier-2 run (or this driver) leaves cached, so the
+# base build is a docker cache no-op. The seeded image is rebuilt per run
+# from the (possibly mutated) staged work — for family B the COPY seed.sh
+# layer is unchanged and layer-cached; for family A it re-runs.
+BASE_TAG="box-audit-base:test"
+SEEDED_TAG="box-audit-mc:seeded"
+
+# This driver runs MULTIPLE containers (one pristine baseline + one per
+# entry), so it tracks every boot in MC_CONTAINERS and removes them all on
+# exit — install-lib's trap only removes the LAST container it created
+# (the global CID), which would strand the baseline + earlier entries.
+MC_CONTAINERS=()
+remove_mc_containers() {
+    local c
+    for c in ${MC_CONTAINERS[@]+"${MC_CONTAINERS[@]}"}; do
+        docker rm -f "$c" >/dev/null 2>&1 || true
+    done
+    MC_CONTAINERS=()
+}
+# Tree restoration: restore EXACTLY the live-tree files this run mutated
+# (selftest mode seds the scratch tree directly; real mode mutates only
+# the staged work, so LIVE_MUTATED is empty and this is a no-op). Never
+# a blanket `git checkout -- .` — that would discard unrelated local
+# edits the driver was invoked on top of.
+restore_tree() {
+    [[ -d "$REPO/.git" ]] || return 0
+    (( ${#LIVE_MUTATED[@]} > 0 )) || return 0
+    local t
+    for t in "${LIVE_MUTATED[@]}"; do
+        git -C "$REPO" checkout -- "$t" 2>/dev/null || true
+    done
+}
+# _mc_cleanup is the driver's own cleanup unit, run last so the tree is
+# restored and the library's mktemp paths + container removed after it.
+# (Ordering does not couple: restore_tree and _lib_cleanup touch
+# disjoint resources.)
+_mc_cleanup() {
+    restore_tree
+    _lib_cleanup
+    remove_mc_containers
+}
+# EXIT covers every exit path (normal completion, set -e trip, early
+# exits). INT/TERM additionally restore then exit with the conventional
+# signal codes (128+signum) so an interrupted run is distinguishable
+# from a hard error — and the restore cannot be skipped by the signal.
+trap _mc_cleanup EXIT
+trap '_mc_cleanup; trap - EXIT; exit 130' INT
+trap '_mc_cleanup; trap - EXIT; exit 143' TERM
+
+# The registry was parsed earlier (moved up so --list and --report-fixture can
+# exit before the tree gate). Resolve the requested subset (or full registry)
+# here, before the entry loop.
 RUN_IDX=()
 for i in "${!ENTRIES_ID[@]}"; do
     id="${ENTRIES_ID[$i]}"
@@ -296,13 +430,11 @@ PY
 FLIPPED=0
 SURVIVED=0
 START_S=$(date +%s)
-# Live-tree files this run mutated. Real mode NEVER touches the live tree
-# (the mutation lives in the staged scratch work), so this stays empty and
-# the end-of-run restore is a no-op. Selftest mode seds the scratch repo's
-# own tree directly, so we record each target here and restore EXACTLY
-# those paths — never a blanket `git checkout -- .`, which would discard
-# unrelated local edits the driver was invoked on top of.
-LIVE_MUTATED=()
+# One TSV row per entry (`check_id<TAB>target<TAB>verdict<TAB>[note]`),
+# accumulated as the loop runs and fed to render_report at the end. Registered
+# for cleanup so an early exit doesn't strand it.
+RESULTS_TSV="$(mktemp)"
+LIB_CLEANUP_PATHS+=("$RESULTS_TSV")
 
 # --- pristine baseline -----------------------------------------------------------
 # Boot the unmutated tree once for the baseline audit. In selftest mode
@@ -397,22 +529,16 @@ for i in "${RUN_IDX[@]}"; do
             exit 1
             ;;
     esac
-    note=""
-    [[ "$baseline_present" == "no" ]] && note=" (absent-in-baseline: the seed for this check did not fire in this container)"
-    echo "ENTRY $i $id $verdict target=$target baseline=$baseline_present mutated=$mutated_present$note"
+    note_text=""
+    [[ "$baseline_present" == "no" ]] && note_text="(absent-in-baseline: the seed for this check did not fire in this container)"
+    printf '%s\t%s\t%s\t%s\n' "$id" "$target" "$verdict" "$note_text" >> "$RESULTS_TSV"
+    echo "ENTRY $i $id $verdict target=$target baseline=$baseline_present mutated=$mutated_present${note_text:+ $note_text}"
 done
 
-# Safety net: restore EXACTLY the live-tree files this run mutated (selftest
-# mode seds the scratch tree directly; real mode mutates only the staged
-# work, so LIVE_MUTATED is empty and this is a no-op). Never a blanket
-# `git checkout -- .` — that would discard unrelated local edits the driver
-# was invoked on top of.
-if [[ -d "$REPO/.git" && ${#LIVE_MUTATED[@]} -gt 0 ]]; then
-    for t in "${LIVE_MUTATED[@]}"; do
-        git -C "$REPO" checkout -- "$t" 2>/dev/null || true
-    done
-fi
-
 ELAPSED_S=$(( $(date +%s) - START_S ))
-echo "mutation-coverage: ${#RUN_IDX[@]} entries — $FLIPPED flipped, $SURVIVED survived — ${ELAPSED_S}s"
+# Final human-readable report: one verdict line per entry, then the summary
+# block (total / flipped / survived / mutation score / wall-clock). A SURVIVED
+# entry is a coverage signal, NOT a failure — the driver exits 0 (below) when
+# every entry produced a verdict, regardless of the flip/survive split.
+render_report "$RESULTS_TSV" "$ELAPSED_S"
 exit 0
