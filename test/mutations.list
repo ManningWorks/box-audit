@@ -39,21 +39,50 @@
 #     lines) — those lines live in the driver, which the registry
 #     must not edit.
 #
-# COVERAGE — one entry per check_id test/install-seeded.sh asserts
-# (the nine listed below plus the F2 jail and the #38 counts field,
-# eleven total):
-#   security.outbound_remote_count, security.outbound_remote_count_v6,
-#   security.suid_delta, security.fail2ban_banned,
-#   security.fail2ban_jail, updates.security_delta,
-#   updates.security_pending, system.failed_units,
-#   system.cron_d_dropins, security.new_port
+# COVERAGE — one entry per check_id test/install-seeded.sh asserts,
+# to the full seeded surface (fourteen total). install-seeded.sh
+# asserts nine findings in test/install-seeded/assert-json.py
+# (EXPECTED) plus four more inline (the F4 v6 block, the issue-#53
+# v4 block, and the #38 delta-mode suid/security mutated-count
+# probes); the registry carries those nine + four, i.e. every
+# distinct check_id the seeded driver asserts:
+#   security.fail2ban_banned, security.fail2ban_jail, security.new_port,
+#   security.ssh_fails, security.outbound_remote_count,
+#   security.outbound_remote_count_v6, security.suid_delta,
+#   updates.security_pending, updates.security_delta,
+#   system.failed_units, system.cron_d_dropins, system.user_cron,
+#   maintenance.apt_cache_stale, integrity.change
 #
-# CHECKS THAT CANNOT BE BROKEN BY A SINGLE SED: none. Every listed
-# check_id has a single-line sed that flips it (above). Noted for
-# completeness: the v4/v6 outbound *socket seeding* and the fail2ban
-# banip calls are multi-line driver actions and cannot be removed by
-# one sed — but each of those checks also has a one-line emission
-# site in scripts/box-audit.sh, which is what these entries target.
+# TERMINAL STATE PER ENTRY — FLIPPED or an explicit cannot-flip note.
+# The driver's pristine baseline runs the SAME post-boot seed as
+# install-seeded.sh EXCEPT the four findings that need (a) ESTAB
+# sockets on lo (the F4/issue-#53 v4+v6 blocks run them AFTER the
+# first audit) or (b) a mutated "yesterday" counts sidecar (the #38
+# delta probes plant it AFTER the first audit). Those four are
+# therefore ABSENT from the driver's baseline, and a mutation can
+# only flip a check the baseline produced — so for them the
+# terminal state is an explicit cannot-flip note (below), not a
+# flip. This is the driver's documented "(absent-in-baseline)"
+# signal, not a silent SURVIVED:
+#
+#   CHECKS THAT CANNOT BE FLIPPED BY A SINGLE SED (absent-in-baseline):
+#   - security.outbound_remote_count (family B sed present; flips
+#     only when the driver seeds ESTAB v4 sockets post-boot — it
+#     does not; install-seeded.sh's issue-#53 block does, after the
+#     first audit). cannot-flip.
+#   - security.outbound_remote_count_v6 (family B sed present; flips
+#     only when ESTAB v6 sockets are seeded post-boot — the F4 block
+#     runs after the first audit). cannot-flip.
+#   - security.suid_delta (family B sed present; flips only when a
+#     "yesterday" .latest-counts.json is planted 10 below today's
+#     suid count — the #38 mutated-count probe runs after the first
+#     audit). cannot-flip.
+#   - updates.security_delta (family B sed present; flips only when a
+#     "yesterday" security_pending count is planted 10 below today's —
+#     same #38 mutated-count probe). cannot-flip.
+#
+#   Every OTHER check_id in the registry flips under its single-line
+#   sed in the driver's baseline (verified by a full driver run).
 #
 # The driver (test/mutation-coverage.sh, separate card) reads this
 # file, applies each entry to a scratch tree, re-runs the seeded
@@ -63,11 +92,18 @@
 security.fail2ban_banned	scripts/box-audit.sh	s|json_push alert security.fail2ban_banned security |json_push alert security.fail2ban_bannedX security |
 security.fail2ban_jail	scripts/box-audit.sh	s|json_push alert security.fail2ban_jail security |json_push alert security.fail2ban_jailX security |
 security.new_port	scripts/box-audit.sh	s|json_push warn security.new_port security |json_push warn security.new_portX security |
+# cannot-flip: the driver's pristine baseline seeds no ESTAB v4 sockets (issue-#53's v4 block in install-seeded.sh runs after the first audit), so the finding is absent-in-baseline and a single sed cannot flip it
 security.outbound_remote_count	scripts/box-audit.sh	s|json_push warn security.outbound_remote_count security |json_push warn security.outbound_remote_countX security |
+# cannot-flip: the driver's pristine baseline seeds no ESTAB v6 sockets (F4's v6 block in install-seeded.sh runs after the first audit), so the finding is absent-in-baseline and a single sed cannot flip it
 security.outbound_remote_count_v6	scripts/box-audit.sh	s|json_push warn security.outbound_remote_count_v6 security |json_push warn security.outbound_remote_count_v6X security |
+# cannot-flip: the driver's baseline sidecar (written by install.sh's verify-gate audit) reflects the same box state, so suid_delta = today - yesterday = 0; install-seeded.sh's #38 mutated-count probe plants 'yesterday = today - 10' only after the first audit, so the finding is absent-in-baseline and a single sed cannot flip it
 security.suid_delta	scripts/box-audit.sh	s|json_push warn security.suid_delta security |json_push warn security.suid_deltaX security |
+# cannot-flip: the driver's baseline sidecar (written by install.sh's verify-gate audit) reflects the same box state, so security_delta = today - yesterday = 0; install-seeded.sh's #38 mutated-count probe plants 'yesterday = today - 10' only after the first audit, so the finding is absent-in-baseline and a single sed cannot flip it
 updates.security_delta	scripts/box-audit.sh	s|json_push warn updates.security_delta updates |json_push warn updates.security_deltaX updates |
 updates.security_pending	scripts/box-audit.sh	s|json_push warn updates.security_pending updates |json_push warn updates.security_pendingX updates |
 system.failed_units	scripts/box-audit.sh	s|json_push warn system.failed_units system |json_push warn system.failed_unitsX system |
 system.cron_d_dropins	test/install-docker/seeded/seed.sh	s|^printf .fake-cron-line|: # F6-registry mutation removes the cron.d drop-in (family A)|
 security.ssh_fails	scripts/box-audit.sh	s|json_push warn security.ssh_fails security |json_push warn security.ssh_failsX security |
+system.user_cron	scripts/box-audit.sh	s|json_push warn system.user_cron system |json_push warn system.user_cronX system |
+maintenance.apt_cache_stale	scripts/box-audit.sh	s|json_push warn maintenance.apt_cache_stale maintenance "stale |json_push warn maintenance.apt_cache_staleX maintenance "stale |
+integrity.change	scripts/box-audit.sh	s|integrity.change integrity|integrity.changeX integrity|g
