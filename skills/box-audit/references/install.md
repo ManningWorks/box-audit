@@ -29,6 +29,21 @@ sudo ./install.sh
    timer that fails silently every morning is the failure mode this whole
    procedure exists to prevent.
 
+## Fresh installs learn the box
+
+On a fresh, interactive install (TTY attached, not `--ci`, not
+`--no-init`), `install.sh` runs the script's own `--init` *before* the
+verify gate to snapshot the box's actual ports, timers, and `/etc/cron.d`
+entries into `/var/lib/box-audit/` — the baseline is real from minute one
+instead of the generic seeded defaults. The install summary reports what
+was learned. Pass `--no-init` to keep the seeded defaults. Upgrades never
+re-learn (hand-tuned allowlists survive), and `--ci` / container installs
+keep the default behavior. If the install was non-interactive (the common
+agent path) and the first report shows `security.new_port` findings for
+services you deliberately run, run `sudo box-audit --init` (or
+`sudo box-audit --accept-port N` for one port) — the finding names the
+exact command.
+
 ## Idempotency and upgrades
 
 The same command is the upgrade path. Targets are byte-compared before

@@ -43,3 +43,17 @@ jobs:
           fi
           echo "FAIL: seeded-driver exited 0 even with the cron drop-in removed — assertion gate has no teeth" >&2
           exit 1
+
+  # Issue #71: install-time baseline learning. A fresh interactive install
+  # (driven through a pty, since docker exec has no TTY) must learn the box's
+  # real ports/timers/cron.d; --no-init must skip it; upgrades must leave a
+  # hand-edited allowlist byte-identical; and a deliberately-unseeded open
+  # port must fire security.new_port with its --accept-port remedy. The
+  # minimal learn image keeps the box state fully controlled.
+  integration-learn:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run install-time learning (positive + negative variants)
+        run: bash test/install-learn.sh

@@ -145,7 +145,9 @@ Usage: $(/usr/bin/basename "$0") [OPTIONS]
                                SUID threshold = 30).
   --accept-port N              Append port N to ports-allowlist.txt.
   --accept-timer NAME          Append timer NAME to timers-baseline.txt.
+  --accept-cron-d NAME         Append cron.d entry NAME to cron-d-allowlist.txt.
   --outbound-threshold N       Write outbound-threshold.conf (single integer).
+  --suid-threshold N           Write suid-threshold.conf (single integer).
 
   History (read-only):
   --tail [N]                   List the last N daily snapshots (default 7).
@@ -179,9 +181,15 @@ EOF
                 --accept-timer)
                     [[ $# -ge 2 ]] || { echo "box-audit: --accept-timer requires a name" >&2; exit 2; }
                     MANAGE_MODE="accept-timer"; MANAGE_ARG="$2"; shift 2 ;;
+                --accept-cron-d)
+                    [[ $# -ge 2 ]] || { echo "box-audit: --accept-cron-d requires a name" >&2; exit 2; }
+                    MANAGE_MODE="accept-cron-d"; MANAGE_ARG="$2"; shift 2 ;;
                 --outbound-threshold)
                             [[ $# -ge 2 ]] || { echo "box-audit: --outbound-threshold requires an integer" >&2; exit 2; }
                             MANAGE_MODE="outbound-threshold"; MANAGE_ARG="$2"; shift 2 ;;
+                --suid-threshold)
+                    [[ $# -ge 2 ]] || { echo "box-audit: --suid-threshold requires an integer" >&2; exit 2; }
+                    MANAGE_MODE="suid-threshold"; MANAGE_ARG="$2"; shift 2 ;;
                         --tail)
                     # Optional arg: consume $2 only when it exists AND is not
                     # another flag. Bare `--tail` defaults to 7 (help text,
@@ -347,9 +355,21 @@ EOF
                         exit 2
                     fi
                     ;;
+                accept-cron-d)
+                    if [[ -z "$MANAGE_ARG" || "$MANAGE_ARG" =~ [[:space:]/] ]]; then
+                        echo "box-audit: --accept-cron-d requires a name (no spaces or slashes), got '$MANAGE_ARG'" >&2
+                        exit 2
+                    fi
+                    ;;
                 outbound-threshold)
                     if ! [[ "$MANAGE_ARG" =~ ^[1-9][0-9]*$ ]]; then
                         echo "box-audit: --outbound-threshold requires a positive integer, got '$MANAGE_ARG'" >&2
+                        exit 2
+                    fi
+                    ;;
+                suid-threshold)
+                    if ! [[ "$MANAGE_ARG" =~ ^[1-9][0-9]*$ ]]; then
+                        echo "box-audit: --suid-threshold requires a positive integer, got '$MANAGE_ARG'" >&2
                         exit 2
                     fi
                     ;;
@@ -411,9 +431,23 @@ for row in json.load(sys.stdin):
                         || /usr/bin/printf '%s.timer\n' "$tname" >> "$TIMERS_FILE"
                     echo "box-audit: added timer ${tname}.timer to $TIMERS_FILE"
                     ;;
+                accept-cron-d)
+                    # One name per line (the entry filename, no .cron.d/
+                    # prefix) — same shape --init writes to the file, so a
+                    # name added here and a name learned there dedupe by
+                    # exact line.
+                    [[ -f "$CRON_D_ALLOWLIST_FILE" ]] || /usr/bin/install -D -m 0644 /dev/null "$CRON_D_ALLOWLIST_FILE"
+                    /usr/bin/grep -qxF "$MANAGE_ARG" "$CRON_D_ALLOWLIST_FILE" 2>/dev/null \
+                        || /usr/bin/printf '%s\n' "$MANAGE_ARG" >> "$CRON_D_ALLOWLIST_FILE"
+                    echo "box-audit: added cron.d entry $MANAGE_ARG to $CRON_D_ALLOWLIST_FILE"
+                    ;;
                 outbound-threshold)
                     /usr/bin/printf '%s\n' "$MANAGE_ARG" > "$OUTBOUND_FILE"
                     echo "box-audit: set outbound threshold to $MANAGE_ARG (in $OUTBOUND_FILE)"
+                    ;;
+                suid-threshold)
+                    /usr/bin/printf '%s\n' "$MANAGE_ARG" > "$SUID_THRESHOLD_FILE"
+                    echo "box-audit: set SUID threshold to $MANAGE_ARG (in $SUID_THRESHOLD_FILE)"
                     ;;
                 *)
                     echo "box-audit: unknown manage mode '$MANAGE_MODE'" >&2
@@ -1055,7 +1089,7 @@ report_security() {
         if [[ $known -eq 0 ]]; then
             local proc
             proc=$(echo "$ss_output" | grep ":${port} " | grep -oP 'users:\(\("\K[^"]+' | head -1)
-            json_push warn security.new_port security "$port is open (not in baseline)${proc:+ [$proc]}"
+            json_push warn security.new_port security "$port is open (not in baseline)${proc:+ [$proc]} — expected? sudo box-audit --accept-port $port, or --init to re-learn"
         fi
     done
 
@@ -1141,13 +1175,15 @@ report_security() {
         outbound_remote_count_v6=${outbound_remote_count_v6:-0}
         outbound_remote_sample_v6=$(echo "$suspicious_ips_v6" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -v '^$' | /usr/bin/head -5 | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')
     fi
-    [[ $outbound_remote_count -gt $(get_outbound_threshold) ]] && json_push warn security.outbound_remote_count security "$outbound_remote_count non-LAN remote IP(s) connected: $outbound_remote_sample" "$outbound_remote_count"
+    local outbound_thr
+    outbound_thr=$(get_outbound_threshold)
+    [[ $outbound_remote_count -gt $outbound_thr ]] && json_push warn security.outbound_remote_count security "$outbound_remote_count non-LAN remote IP(s) connected: $outbound_remote_sample — too many? sudo box-audit --outbound-threshold <N> (currently $outbound_thr), or --init to re-learn" "$outbound_remote_count"
     # F4 (0.9.0): v6 parity. Same threshold knob as the combined check —
     # raising --outbound-threshold quiets both, so a box that tunes the
     # v4 side for alarm fatigue does not get a louder v6 twin. No v6 stack
     # (ss prints nothing, or nothing bracketed) leaves the count at 0 and
     # the check stays quiet: a parse failure must never read as a beacon.
-    [[ $outbound_remote_count_v6 -gt $(get_outbound_threshold) ]] && json_push warn security.outbound_remote_count_v6 security "$outbound_remote_count_v6 non-LAN IPv6 remote IP(s) connected: $outbound_remote_sample_v6" "$outbound_remote_count_v6"
+    [[ $outbound_remote_count_v6 -gt $outbound_thr ]] && json_push warn security.outbound_remote_count_v6 security "$outbound_remote_count_v6 non-LAN IPv6 remote IP(s) connected: $outbound_remote_sample_v6 — too many? sudo box-audit --outbound-threshold <N> (currently $outbound_thr), or --init to re-learn" "$outbound_remote_count_v6"
     # Delta finding — only fires if today's count is 2x AND 5+ above yesterday.
     # When yesterday's snapshot is missing the delta is mute and the absolute
     # threshold above is the only signal (graceful degradation: ~day 1 of use).
@@ -1174,7 +1210,9 @@ report_security() {
     suid_count=${suid_count:-0}
     # Baseline 18 measured 2026-09-14 on this box; flag if above the
     # per-box threshold (default 30, i.e. 50%+ growth).
-    [[ $suid_count -gt $(get_suid_threshold) ]] && json_push warn security.suid_count security "$suid_count SUID binaries on disk (baseline ~18-25) — review for unauthorised additions" "$suid_count"
+    local suid_thr
+    suid_thr=$(get_suid_threshold)
+    [[ $suid_count -gt $suid_thr ]] && json_push warn security.suid_count security "$suid_count SUID binaries on disk (baseline ~18-25) — review for unauthorised additions; expected? sudo box-audit --suid-threshold <N> (currently $suid_thr), or --init to re-learn" "$suid_count"
     # Delta: new SUID binaries are a classic rootkit persistence move. On
     # day 1 (no yesterday snapshot) the absolute check above is the only
     # signal; thereafter a +2 jump is more meaningful than +5 of 18.
@@ -1253,7 +1291,9 @@ report_system() {
     custom_count=$(echo "$custom_timers" | /usr/bin/wc -w)
     custom_count=${custom_count:-0}
     [[ $custom_count -gt 0 ]] && {
-        json_push warn system.custom_timers system "$custom_count non-standard timer(s): $(echo "$custom_timers" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -v '^$' | /usr/bin/head -3 | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')"
+        local timer_remedy
+        timer_remedy=$(echo "$custom_timers" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -v '^$' | /usr/bin/head -3 | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')
+        json_push warn system.custom_timers system "$custom_count non-standard timer(s): $timer_remedy — expected? sudo box-audit --accept-timer <name>, or --init to re-learn"
     }
 
     # User crontab — flag if a non-empty user crontab exists. (You schedule
@@ -1288,7 +1328,9 @@ report_system() {
     local ucron_count
     ucron_count=$(echo "$unexpected_cron" | /usr/bin/wc -w)
     ucron_count=${ucron_count:-0}
-    [[ $ucron_count -gt 0 ]] && json_push warn system.cron_d_dropins system "unexpected drop-in(s): $(echo "$unexpected_cron" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -v '^$' | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')"
+    local cron_d_listed
+    cron_d_listed=$(echo "$unexpected_cron" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -v '^$' | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')
+    [[ $ucron_count -gt 0 ]] && json_push warn system.cron_d_dropins system "unexpected drop-in(s): $cron_d_listed — expected? sudo box-audit --accept-cron-d <name>, or --init to re-learn"
 
     # Docker containers - use Docker's own health filter (containers with no
     # HEALTHCHECK defined are correctly ignored, not false-flagged)

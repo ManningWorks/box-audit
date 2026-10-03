@@ -61,14 +61,20 @@ class Expected(NamedTuple):
 
 
 EXPECTED: list[Expected] = [
-    Expected("security.new_port",          "warn",  r"9999"),
+    # Issue #71: every baseline-dependent finding now names its remedy in
+    # the message. The seeded assertions pin that the REMEDY text is
+    # present (not just the fact) — a regression that drops the
+    # self-documenting line fails the required gate here.
+    Expected("security.new_port",          "warn",
+             r"9999 is open \(not in baseline\).*--accept-port 9999.*--init to re-learn"),
     Expected("security.fail2ban_banned",   "alert", r"banned on sshd"),
     # F2 jail discovery: recidive is the only non-sshd jail with a banned IP,
     # so exactly one per-jail finding must appear (strict count). sshd is NOT
     # double-reported here — it stays on the fail2ban_banned floor above.
     Expected("security.fail2ban_jail",     "alert", r"banned on recidive"),
     Expected("security.ssh_fails",         "warn",  r"failed auth attempts"),
-    Expected("system.cron_d_dropins",      "warn",  r"0box-audit-test"),
+    Expected("system.cron_d_dropins",      "warn",
+             r"unexpected drop-in\(s\): 0box-audit-test.*--accept-cron-d.*--init to re-learn"),
     Expected("system.user_cron",           "warn",  r"root's crontab"),
     Expected("system.failed_units",        "warn",  r"box-audit-fail"),
     Expected("maintenance.apt_cache_stale","warn",  r"stale"),

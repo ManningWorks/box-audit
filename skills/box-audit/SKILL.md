@@ -1,6 +1,6 @@
 ---
 name: box-audit
-version: 0.9.2
+version: 0.10.0
 description: Run and interpret box-audit, a daily security + health audit for Linux boxes. Use when asked to check box health/security, run or schedule box-audit, install or upgrade it, read its latest.json report, triage its findings, or repair its timer/baseline. Installation is one command (install.sh), covered in references/install.md.
 ---
 
