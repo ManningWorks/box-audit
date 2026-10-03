@@ -715,4 +715,87 @@ print("yes" if hits else "no")
     fi
 done
 
+# --- PR #72 follow-up: functional coverage for the two new manage flags -----
+# --accept-cron-d NAME and --suid-threshold N ship in v0.10.0 (the remedy
+# lines reference them) but had no functional test — only --outbound-threshold
+# is functionally exercised in this file, and the other manage arms are
+# untested by convention. This block gives the two NEW flags smoke-level
+# functional teeth on the installed binary: the command runs, writes the
+# config, and reports; invalid input is rejected before the root gate; and the
+# write is idempotent. CONFIG_DIR is hardcoded (/var/lib/box-audit), so this
+# must run in the privileged container (the manage arms are root-gated) — the
+# same surface the --outbound-threshold F4 block above already uses. No restore
+# needed: this is the final block in the driver, and install-lib.sh's EXIT trap
+# tears the container down, so the mutated config can't leak to any later
+# assertion or the next (fresh) run.
+
+# --- --suid-threshold N: write + idempotency ---------------------------------
+SUID_SET_OUT="$(privileged_exec /usr/local/bin/box-audit --suid-threshold 42)"
+if [[ "$SUID_SET_OUT" != *"set SUID threshold to 42"* ]]; then
+    echo "test/install-seeded.sh: FAIL — --suid-threshold 42 did not report the set: $SUID_SET_OUT" >&2
+    exit 1
+fi
+SUID_VAL="$(privileged_exec cat /var/lib/box-audit/suid-threshold.conf | tail -1 | tr -d '[:space:]')"
+if [[ "$SUID_VAL" != "42" ]]; then
+    echo "test/install-seeded.sh: FAIL — suid-threshold.conf is '$SUID_VAL', expected 42" >&2
+    exit 1
+fi
+# Idempotent: re-running with the same value REWRITES (not appends) — the
+# file must hold exactly the single value, not a growing stack.
+privileged_exec /usr/local/bin/box-audit --suid-threshold 42 >/dev/null
+SUID_LINES="$(privileged_exec bash -c "grep -cE '^[1-9][0-9]*$' /var/lib/box-audit/suid-threshold.conf || true")"
+if [[ "$SUID_LINES" != "1" ]]; then
+    echo "test/install-seeded.sh: FAIL — --suid-threshold re-run produced $SUID_LINES value lines, expected 1 (append instead of rewrite)" >&2
+    exit 1
+fi
+echo "test/install-seeded.sh: --suid-threshold writes the value and is idempotent"
+
+# --- --suid-threshold N: invalid input rejected (negative) -------------------
+# Validated before the root gate, so a non-positive value is rejected with a
+# clear message and a non-zero exit — the manage arm's own teeth.
+if SUID_BAD_OUT="$(privileged_exec /usr/local/bin/box-audit --suid-threshold 0 2>&1)"; then
+    echo "test/install-seeded.sh: FAIL — --suid-threshold 0 exited 0 (must be rejected): $SUID_BAD_OUT" >&2
+    exit 1
+fi
+if [[ "$SUID_BAD_OUT" != *"requires a positive integer"* ]]; then
+    echo "test/install-seeded.sh: FAIL — --suid-threshold 0 rejection message wrong: $SUID_BAD_OUT" >&2
+    exit 1
+fi
+echo "test/install-seeded.sh: --suid-threshold rejects non-positive input"
+
+# --- --accept-cron-d NAME: append + idempotency -------------------------------
+# A unique name so it can't collide with anything the seeded image ships.
+CRON_ACCEPT_OUT="$(privileged_exec /usr/local/bin/box-audit --accept-cron-d zzztest-cron-d-entry)"
+if [[ "$CRON_ACCEPT_OUT" != *"added cron.d entry zzztest-cron-d-entry"* ]]; then
+    echo "test/install-seeded.sh: FAIL — --accept-cron-d did not report the append: $CRON_ACCEPT_OUT" >&2
+    exit 1
+fi
+if ! privileged_exec grep -qxF zzztest-cron-d-entry /var/lib/box-audit/cron-d-allowlist.txt; then
+    echo "test/install-seeded.sh: FAIL — zzztest-cron-d-entry not in cron-d-allowlist.txt after --accept-cron-d" >&2
+    exit 1
+fi
+# Idempotent: a second accept of the same name must not duplicate the line
+# (grep -qxF dedup in the manage arm).
+privileged_exec /usr/local/bin/box-audit --accept-cron-d zzztest-cron-d-entry >/dev/null
+CRON_DUP="$(privileged_exec bash -c "grep -cxF zzztest-cron-d-entry /var/lib/box-audit/cron-d-allowlist.txt || true")"
+if [[ "$CRON_DUP" != "1" ]]; then
+    echo "test/install-seeded.sh: FAIL — --accept-cron-d re-run produced $CRON_DUP entry lines, expected 1 (duplicate append)" >&2
+    exit 1
+fi
+echo "test/install-seeded.sh: --accept-cron-d appends the name and is idempotent"
+
+# --- --accept-cron-d NAME: invalid input rejected (negative) ------------------
+# A slash (path-like) is explicitly rejected by the manage arm.
+if CRON_BAD_OUT="$(privileged_exec /usr/local/bin/box-audit --accept-cron-d a/b 2>&1)"; then
+    echo "test/install-seeded.sh: FAIL — --accept-cron-d a/b exited 0 (must be rejected): $CRON_BAD_OUT" >&2
+    exit 1
+fi
+if [[ "$CRON_BAD_OUT" != *"no spaces or slashes"* ]]; then
+    echo "test/install-seeded.sh: FAIL — --accept-cron-d a/b rejection message wrong: $CRON_BAD_OUT" >&2
+    exit 1
+fi
+echo "test/install-seeded.sh: --accept-cron-d rejects path-like input"
+
+echo "test/install-seeded.sh: manage-flag functional coverage PASSED (--suid-threshold / --accept-cron-d)"
+
 echo "test/install-seeded.sh: seeded-container integration PASSED"

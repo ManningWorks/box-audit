@@ -34,7 +34,13 @@
 #      the seeded generic ports (22 53 80 443 631), not the learned 17777.
 #   4. an upgrade (non-fresh) install leaves a hand-edited allowlist
 #      byte-identical and does NOT run the learn step.
-#   5. shellcheck-clean is enforced by tier 1 across this file.
+#   5. `--learn` (no pty) forces the learn step on a fresh install — the
+#      deterministic test seam the flag exists for (docker exec has no TTY):
+#      a fresh non-interactive install that would NOT learn (no -t 0) learns
+#      the seeded box state when --learn is passed.
+#   6. `--ci --learn` does NOT learn — the force flag must not override the
+#      CI no-learn contract (the gate checks CI_MODE before LEARN_FORCE).
+#   7. shellcheck-clean is enforced by tier 1 across this file.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -90,6 +96,14 @@ done
 # exits with the child's code, so set -e still catches a failed install.
 pty_install() {
     docker exec "$CID" /bin/bash -c "script -qec 'cd /work && bash install.sh $*' /dev/null"
+}
+# plain_install <install-args...>: run install.sh WITHOUT a pty (docker exec
+# carries no TTY, stdin from /dev/null), so install.sh's interactive `-t 0`
+# gate is FALSE. This is the seam the `--learn` force flag exists to drive:
+# a fresh install that would NOT learn without `--learn`. Same set -e
+# propagation as pty_install (docker exec returns the child's code).
+plain_install() {
+    docker exec "$CID" /bin/bash -c "cd /work && bash install.sh $* </dev/null"
 }
 
 # --- 1. fresh interactive install LEARNS ------------------------------------
@@ -208,5 +222,70 @@ if grep -q "learned baseline (from live box state)" "$UPG_OUT"; then
     exit 1
 fi
 echo "test/install-learn.sh: upgrade left the hand-edited allowlist byte-identical and did not learn"
+
+# --- 5. --learn (no pty) FORCES the learn step on a fresh install -----------
+# The --learn force flag exists so the suites can drive the learn path
+# deterministically (docker exec has no TTY, so the interactive -t 0 gate
+# alone can't be hit in a plain docker-exec install). This is the positive
+# teeth for the forced branch: wipe to a genuinely fresh install, then install
+# via plain_install (NO pty, so -t 0 is FALSE and the box would NOT learn
+# without the flag). With --learn the learn step MUST run and the on-disk
+# config must hold the seeded box state (17777 / probe-timer / probe-learn-test
+# are still live from the seeds above), proving the forced branch is exercised
+# and not dead.
+privileged_exec /bin/bash -c 'rm -rf /var/lib/box-audit /usr/local/bin/box-audit /usr/local/share/box-audit'
+LEARNOUT="$(mktemp)"
+LIB_CLEANUP_PATHS+=("$LEARNOUT")
+plain_install --learn > "$LEARNOUT" 2>&1
+if ! grep -q "learned baseline (from live box state)" "$LEARNOUT"; then
+    echo "test/install-learn.sh: FAIL — --learn (no pty) fresh install did not learn" >&2
+    tail -30 "$LEARNOUT" >&2
+    exit 1
+fi
+echo "test/install-learn.sh: --learn forced the learn step on a fresh non-interactive install"
+# The forced learn must have captured the SEEDED box state (same three values
+# section 1 asserts), not the seeded generic defaults — proof the forced branch
+# ran --init against live state.
+if ! privileged_exec grep -qxF 17777 /var/lib/box-audit/ports-allowlist.txt; then
+    echo "test/install-learn.sh: FAIL — --learn learned ports-allowlist lacks seeded port 17777" >&2
+    privileged_exec cat /var/lib/box-audit/ports-allowlist.txt >&2 || true
+    exit 1
+fi
+if ! privileged_exec grep -qxF probe-timer.timer /var/lib/box-audit/timers-baseline.txt; then
+    echo "test/install-learn.sh: FAIL — --learn learned timers-baseline lacks seeded probe-timer.timer" >&2
+    privileged_exec cat /var/lib/box-audit/timers-baseline.txt >&2 || true
+    exit 1
+fi
+if ! privileged_exec grep -qxF probe-learn-test /var/lib/box-audit/cron-d-allowlist.txt; then
+    echo "test/install-learn.sh: FAIL — --learn learned cron-d-allowlist lacks seeded probe-learn-test" >&2
+    privileged_exec cat /var/lib/box-audit/cron-d-allowlist.txt >&2 || true
+    exit 1
+fi
+echo "test/install-learn.sh: --learn learned config matches the seeded box state (17777 / probe-timer / probe-learn-test)"
+
+# --- 6. --ci --learn does NOT learn (CI precedence over the force flag) -----
+# The learn gate is IS_FRESH_INSTALL && !CI_MODE && !NO_INIT && (-t 0 || LEARN_FORCE).
+# CI_MODE is checked before LEARN_FORCE, so --learn must NOT override the CI
+# no-learn contract: a fresh --ci install with --learn keeps the seeded generic
+# defaults (the CI branch of the gate, negative variant). Wipe to fresh first.
+privileged_exec /bin/bash -c 'rm -rf /var/lib/box-audit /usr/local/bin/box-audit /usr/local/share/box-audit'
+CI_LEARNOUT="$(mktemp)"; LIB_CLEANUP_PATHS+=("$CI_LEARNOUT")
+plain_install --ci --learn > "$CI_LEARNOUT" 2>&1
+if grep -q "learned baseline (from live box state)" "$CI_LEARNOUT"; then
+    echo "test/install-learn.sh: FAIL — --ci --learn still ran the learn step (CI must take precedence over the force flag)" >&2
+    tail -30 "$CI_LEARNOUT" >&2
+    exit 1
+fi
+if privileged_exec grep -qxF 17777 /var/lib/box-audit/ports-allowlist.txt; then
+    echo "test/install-learn.sh: FAIL — --ci --learn leaked the learned port 17777 into the allowlist" >&2
+    privileged_exec cat /var/lib/box-audit/ports-allowlist.txt >&2 || true
+    exit 1
+fi
+if ! privileged_exec /bin/bash -c 'grep -qx 22 /var/lib/box-audit/ports-allowlist.txt && grep -qx 631 /var/lib/box-audit/ports-allowlist.txt'; then
+    echo "test/install-learn.sh: FAIL — --ci --learn did not keep the seeded generic ports" >&2
+    privileged_exec cat /var/lib/box-audit/ports-allowlist.txt >&2 || true
+    exit 1
+fi
+echo "test/install-learn.sh: --ci --learn kept the seeded generic defaults (CI takes precedence over --learn)"
 
 echo "test/install-learn.sh: install-time learning PASSED"
