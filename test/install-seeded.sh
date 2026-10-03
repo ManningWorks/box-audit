@@ -576,7 +576,8 @@ fi
 # --- Issue #38 regression: delta-mode signal integrity ---------------------
 # What this section exercises today: two delta-mode assertions driven
 # against a live-var-fed sidecar. The sidecar is the .latest-counts.json
-# persist file that history_persist_live_counts writes from main()'s three
+# persist file in the history dir (located at $HISTORY_DIR/.latest-counts.json)
+# that history_persist_live_counts writes from main()'s three
 # script-scope counts (suid_count / outbound_count / security_pending) —
 # not from the snapshot's findings[]. Both assertions plant yesterday's
 # counts in the sidecar, re-run --json, and read the *_delta findings:
