@@ -13,12 +13,11 @@ last run? It observes; it never remediates. Every finding is a pointer for
 a human decision, not a trigger for action.
 
 The script lives at `/usr/local/bin/box-audit`. Output: text report
-(default) or JSON (`--json`). Latest JSON snapshot:
-`/var/log/box-audit/latest.json`. Exit codes: 0 = clear, 1 = findings,
-2 = bad flag, 75 = lock file unopenable (read-only lock dir — the run
-was refused, nothing audited). `--json` always exits 0 on a run that
-executes; a refused run exits 75 with no JSON. On an executing run,
-branch on the `status` field instead (`ok` vs `findings`).
+(default) or JSON (`--json`); the latest JSON snapshot lands at
+`/var/log/box-audit/latest.json`. On an executing `--json` run the exit
+code is always 0, so branch on the JSON `status` field (`ok` vs
+`findings`); a refused run exits 75 with no JSON. The full exit-code
+and lock semantics live in `references/cli.md`.
 
 Not installed yet, or upgrading? That's one command — `sudo ./install.sh`
 from a repo checkout. Prerequisites, the verify gate, and pitfalls are in
@@ -55,10 +54,9 @@ The daily run has usually already happened. Read
 is "how is the box this morning".
 
 **Done when:** you have either a fresh run's output or today's snapshot,
-and you know which one you're looking at. `latest.json` is overwritten on
-each run — stale data and fresh data look identical, so check the
-timestamp against the timer's last-fire time
-(`systemctl show box-audit.timer -p LastTriggerUSec`).
+and you know which one you're looking at — check the timestamp against
+the timer's last-fire time (`systemctl show box-audit.timer -p
+LastTriggerUSec`).
 
 ## 2. Read the findings
 
@@ -113,10 +111,9 @@ box-audit observes; it doesn't remediate. Agents handling this skill's
 output have a strong reflex to *do something* about findings — resist.
 Specifically:
 
-- **Don't restart services** that `needrestart` flags (`sshd`,
-  `fail2ban`, etc.). The user decides the maintenance window.
-- **Don't run `apt upgrade` or trigger unattended-upgrades by hand.**
-  Same reason.
+- **Don't restart `needrestart`-flagged services (`sshd`, `fail2ban`,
+  etc.) or run `apt upgrade` / trigger unattended-upgrades by hand.**
+  The user decides the maintenance window.
 - **Don't modify `/var/lib/box-audit/` baselines** directly. If a
   port/timer/threshold needs updating, suggest the matching manage
   flag (`--accept-port`, `--accept-timer`, `--outbound-threshold`) as
@@ -204,41 +201,7 @@ last-resort), `sudo rm /var/lib/box-audit/integrity-baseline.json` and the
 next run silently rebuilds it. That erases all remembered history: after
 this, drift from before the reset is invisible. Say so when doing it.
 
-## Developing box-audit
-
-The repo checkout is the source of truth for development: the three-tier
-test model and how to run it are in the repo README ("Testing" section),
-entry point `bash test/all.sh`. Nothing in this skill is needed to develop
-the tool.
-
-### Mutation coverage (F6) — a silent-gate regression net
-
-Beyond the three tiers there is an opt-in **named-mutation registry** that
-guards a specific regression class: a gate that *silently* stops firing
-without failing loudly. Two shipped incidents motivated it:
-
-- **v0.8.1 ProtectSystem trap** — `ProtectSystem=strict` without a writable
-  `/tmp` silently disabled the entire audit (clean `exit 0`, 0-byte
-  `latest.json`, no error signal). The `PrivateTmp=yes` carve-out in the
-  same unit is what makes `strict` load-bearing-safe.
-- **v0.9.1 lock-gate** — the single-instance guard conflated "lock file
-  could not be opened" with "another instance holds the lock"; under a
-  read-only lock dir the run `exit 0`'d with **zero checks run** while the
-  systemd unit reported `Result=success`. Now an unopenable lock fails the
-  run with exit 75 so the misconfiguration is visible instead of silent.
-
-Both are the same shape: the audit *looks* healthy while it audited nothing.
-The mutation-coverage driver exists so that shape is caught at the gate, not
-at the operator. It is an extension of the tier-2 surface (reuses
-`test/install-seeded.sh`'s seeded-container boot), **not a fourth tier**, and
-is opt-in — it does not run under `bash test/all.sh`.
-
-To run it: `bash test/mutation-coverage.sh` (full registry, the
-pre-release posture), `bash test/mutation-coverage.sh --entry <id>` (a
-subset, repeatable), or `bash test/mutation-coverage.sh --list` (no-container
-dry run). The driver has no `--help` flag; the usage block is the banner at
-the top of `test/mutation-coverage.sh`. CI runs a pinned 5-entry subset
-(`.github/workflows/mutation-coverage.yml`), not the full registry — see the
-repo README ("Testing") and AGENTS.md ("Testing convention") for the
-subset-vs-full and the report's FLIPPED/SURVIVED semantics.
-
+Developing the tool lives in the repo, not this skill: the three-tier
+test model and its entry point (`bash test/all.sh`) are in the README's
+"Testing" section, and the test conventions in AGENTS.md's "Testing
+convention". Nothing in this skill is needed to develop box-audit.
