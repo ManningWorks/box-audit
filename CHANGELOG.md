@@ -5,6 +5,23 @@ All notable changes to box-audit are documented here. The format follows
 grouped by kind, not by PR, and are written for the person deciding
 whether to upgrade.
 
+## [0.10.1] - 2026-10-03
+
+### Fixed
+
+- **Stale pre-#38 regression narrative in `test/install-seeded.sh`** —
+  the "Issue #38 regression: delta-mode signal integrity" block led with
+  12 lines of pre-#38 defect history under a title that read as a live
+  regression guard, so a reader concluded the test guarded a defect that
+  no longer exists (the findings[]-scanning persist loop was removed in
+  v0.7.1 / 94c250a, and since PR #68 the writer
+  `history_persist_live_counts` takes the three live counts straight from
+  `main()`'s script-scope vars). The header now leads with what the two
+  assertions actually exercise today (constant-count and mutated-count
+  delta runs against a live-var-fed sidecar) and names v0.7.1 / 94c250a as
+  the historical fix. Comment hygiene in the test file only — no behavior
+  change (issue #69).
+
 ## [0.10.0] - 2026-10-03
 
 ### Added

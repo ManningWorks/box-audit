@@ -574,26 +574,32 @@ else
 fi
 
 # --- Issue #38 regression: delta-mode signal integrity ---------------------
-# History: the ORIGINAL issue #38 defect — the persist sidecar sourcing
-# today's counts from the JSON snapshot's findings[] array, which only
-# carries a count when the corresponding absolute check tripped. On a
-# healthy seeded box (low SUID, no outbound, no security updates) every
-# one of the three is below threshold, so the sidecar recorded 0 — and
-# tomorrow's delta check computed today's-live - 0 = today's-live, firing
-# security.suid_delta / outbound_delta / security_delta every morning
-# forever. That was fixed in v0.7.1 (94c250a): the additive counts block
-# alongside findings[] is populated from the live measurement regardless
-# of threshold, and history_persist_live_counts now takes the same three
-# values straight from the script-scope vars instead of re-parsing the
-# snapshot.
+# What this section exercises today: two delta-mode assertions driven
+# against a live-var-fed sidecar. The sidecar is the .latest-counts.json
+# persist file that history_persist_live_counts writes from main()'s three
+# script-scope counts (suid_count / outbound_count / security_pending) —
+# not from the snapshot's findings[]. Both assertions plant yesterday's
+# counts in the sidecar, re-run --json, and read the *_delta findings:
 #
-# Two assertions:
+#   1. constant-count run: write today's live counts back as yesterday's,
+#      assert no *_delta finding fires for any of the three. This is the
+#      load-bearing direction: on a healthy box the day-over-day delta is 0.
+#   2. mutated-count run: write yesterday = today - 10, assert the
+#      corresponding *_delta finding fires (suid + security; outbound is
+#      skipped — it needs today > 5 AND today > 2x yesterday, which the
+#      seeded image can't reach).
 #
-#   1. constant-count run: after the first audit, write today's live
-#      count back as yesterday's, re-run --json, assert no delta finding
-#      fires for any of the three.
-#   2. mutated-count run: write yesterday = today - 10, re-run --json,
-#      assert the corresponding delta finding fires.
+# Background (historical, not a live defect): the original issue #38
+# defect was the persist sidecar re-deriving counts from findings[], which
+# only carries a count when the absolute check tripped — so a below-
+# threshold box recorded 0 and the next day's delta fired false suid_delta
+# / outbound_delta / security_delta every morning. That was fixed in v0.7.1
+# (94c250a): the additive `counts` block is populated from the live
+# measurement regardless of threshold, and history_persist_live_counts takes
+# the same three values straight from the script-scope vars. This test pins
+# the fixed behavior — it goes green on a live-var-fed sidecar and would
+# regress to false positives if the persist path ever fell back to scanning
+# findings[].
 #
 # The first capture (above, BA_JSON) already gave us today's counts. Read
 # them out, drive both scenarios, and check.
