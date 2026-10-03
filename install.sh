@@ -7,20 +7,33 @@
 # before writing). An existing box-audit.timer keeps its OnCalendar if the user
 # customized it (warned, not silently overwritten).
 #
-# One flag, --ci: for CI runs. Every install step is identical; the only
-# difference is that the final status line is also teed to
-# /var/log/box-audit/install.log. No config file, no uninstaller. Needs
-# bash + systemd + apt (Ubuntu/Debian). See README.md for the manual
-# fallback.
+# Flags:
+#   --ci        CI run. Every install step is identical; the only
+#               difference is that the final status line is also teed to
+#               /var/log/box-audit/install.log. Also suppresses install-
+#               time baseline learning (automation must never seed
+#               container noise into a baseline).
+#   --no-init   Opt out of install-time baseline learning: keep the
+#               seeded generic defaults instead of snapshotting the box.
+#   --learn     Force install-time baseline learning regardless of TTY.
+#               Test seam only — exists so the suites can drive the learn
+#               path deterministically (docker exec has no TTY). Not a
+#               documented user feature.
+# No config file, no uninstaller. Needs bash + systemd + apt
+# (Ubuntu/Debian). See README.md for the manual fallback.
 
 set -euo pipefail
 
 # --ci marks a CI run: identical install steps, final status teed to the
 # install log. Parsed before anything else so it works under `set -u`.
 CI_MODE=0
+NO_INIT=0     # --no-init: skip install-time baseline learning
+LEARN_FORCE=0 # --learn: force learning regardless of TTY (test seam)
 for arg in "$@"; do
     case "$arg" in
         --ci) CI_MODE=1 ;;
+        --no-init) NO_INIT=1 ;;
+        --learn) LEARN_FORCE=1 ;;
     esac
 done
 
@@ -292,6 +305,51 @@ grant_boxaudit_read_perms() {
     done
 }
 
+# Description: learn_baseline
+#
+# Install-time baseline learning (issue #71): snapshot the box's actual
+# state into /var/lib/box-audit so a fresh install on a non-vanilla box
+# produces a REAL baseline from minute one, not the generic seeded
+# defaults that flag every legitimately-running service as `new_port`
+# every morning.
+#
+# Single source of truth: this invokes the INSTALLED script's own
+# `box-audit --init` — the exact same operation an operator would run
+# by hand — rather than reimplementing the snapshot logic here. The
+# installer must not carry a second copy of what "learn the box" means;
+# --init already writes ports / timers / cron.d from live state and
+# resets the two thresholds.
+#
+# Called BEFORE the verify gate so the gate's report reflects the
+# post-learn baseline. The installer is root and $SCRIPT_DST was just
+# installed, so this runs directly (no sudo). Output is captured and
+# reprinted indented so the install summary can show what was learned.
+# Best-effort: a failure here must NOT fail the install — the verify
+# gate below still runs, and a missing baseline degrades gracefully the
+# way it always has. We return the learned summary as stdout.
+learn_baseline() {
+    local out
+    if ! out=$("$SCRIPT_DST" --init 2>&1); then
+        say "  learning baseline: skipped (box-audit --init failed): $out"
+        return 0
+    fi
+    say "  learned baseline (from live box state):"
+    # Echo the --init line(s) indented. The seeded vs unchanged report is
+    # the operator's signal for whether the box matched the seeded
+    # defaults or the snapshot actually changed something.
+    printf '%s\n' "$out" | sed 's/^/    /'
+    # Surface the learned contents (ports / timers / cron.d) so the
+    # install summary reports WHAT was learned, not just that it ran.
+    local ports timers crond
+    ports=$(grep -vE '^[[:space:]]*(#|$)' /var/lib/box-audit/ports-allowlist.txt 2>/dev/null | tr '\n' ' ' | sed -E 's/[[:space:]]+$//')
+    timers=$(grep -vE '^[[:space:]]*(#|$)' /var/lib/box-audit/timers-baseline.txt 2>/dev/null | tr '\n' ' ' | sed -E 's/[[:space:]]+$//')
+    crond=$(grep -vE '^[[:space:]]*(#|$)' /var/lib/box-audit/cron-d-allowlist.txt 2>/dev/null | tr '\n' ' ' | sed -E 's/[[:space:]]+$//')
+    say "    ports:   ${ports:-<none>}"
+    say "    timers:  ${timers:-<none>}"
+    say "    cron.d:  ${crond:-<none>}"
+    return 0
+}
+
 # install_file <src|content-mode> ... — compare-then-write helper.
 # Skips the write (and the daemon-reload trigger) when the target is already
 # byte-identical, so upgrades only touch what changed. Prints "unchanged",
@@ -354,11 +412,13 @@ install_file "$VERSION_MARKER" 0644 "$VERSION" || true
 if [[ $IS_FRESH_INSTALL -eq 1 ]]; then
     mkdir -p /var/lib/box-audit
     chmod 0755 /var/lib/box-audit
-    # Seed the allowlists only if they're missing. We don't introspect the
-    # running box to learn its ports/timers — the defaults below are a
-    # common Ubuntu desktop baseline, and `box-audit --init` (run later)
-    # replaces these with the box's actual state. The point is to start
-    # with values that produce zero false positives on a fresh install.
+    # Seed the allowlists only if they're missing. These defaults are a
+    # common Ubuntu desktop baseline and exist for the paths where the
+    # install does NOT learn the box (upgrades never touch these, and a
+    # fresh --ci / --no-init / non-interactive install keeps them). On a
+    # fresh interactive install the learn step below (issue #71) runs
+    # `box-audit --init` and replaces these with the box's actual state —
+    # the seeded values are the pre-learn floor, not the end state.
     if [[ ! -f /var/lib/box-audit/ports-allowlist.txt ]]; then
         printf '%s\n' \
             '# Ports that box-audit will NOT flag as "unexpected open".' \
@@ -405,6 +465,36 @@ if [[ $IS_FRESH_INSTALL -eq 1 ]]; then
             '30' \
             > /var/lib/box-audit/suid-threshold.conf
     fi
+    chmod 0644 /var/lib/box-audit/ports-allowlist.txt \
+              /var/lib/box-audit/timers-baseline.txt \
+              /var/lib/box-audit/outbound-threshold.conf \
+              /var/lib/box-audit/cron-d-allowlist.txt \
+              /var/lib/box-audit/suid-threshold.conf
+fi
+
+# 1d. Install-time baseline learning (issue #71). Fires ONLY on a fresh
+#     install that is (a) not CI, (b) not --no-init, and (c) interactive
+#     (stdin is a TTY) — OR forced with --learn (the deterministic test
+#     seam; docker exec has no TTY). This is the ONE deliberate write the
+#     installer makes to per-box state: it runs the installed script's own
+#     --init to snapshot the box's real ports / timers / cron.d, so the
+#     verify gate's report reflects the post-learn baseline.
+#
+#     Upgrades NEVER learn (IS_FRESH_INSTALL gates it) — there is no
+#     "is the config still stock?" heuristic (that inference class has
+#     bitten this repo before). CI / --no-init / non-interactive installs
+#     keep the seeded defaults exactly as before.
+LEARN=0
+if [[ $IS_FRESH_INSTALL -eq 1 && $CI_MODE -eq 0 && $NO_INIT -eq 0 ]]; then
+    if [[ -t 0 || $LEARN_FORCE -eq 1 ]]; then
+        LEARN=1
+    fi
+fi
+if [[ $LEARN -eq 1 ]]; then
+    learn_baseline
+    # --init rewrites the allowlists via `>` (preserving the 0644 mode the
+    # seed block set) and resets the two thresholds; re-assert the group-
+    # readable mode so the artifact perm model holds after the rewrite.
     chmod 0644 /var/lib/box-audit/ports-allowlist.txt \
               /var/lib/box-audit/timers-baseline.txt \
               /var/lib/box-audit/outbound-threshold.conf \
