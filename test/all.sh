@@ -74,6 +74,12 @@ run_tier "mutation-coverage-selftest" "test/fixtures/mutation-coverage/selftest.
 run_tier "install"            "test/install.sh" "box-audit-install:all"
 # Tier 2 — seeded container, eight-check assertion.
 run_tier "install-seeded"     "test/install-seeded.sh"
+# Tier 2 (issue #71) — install-time baseline learning: fresh interactive
+# install learns the box, --no-init skips it, upgrades never touch a
+# hand-edited allowlist, and the self-documenting remedy text survives
+# onto the installed binary. Its own minimal image keeps the box state
+# fully controlled (no fail2ban/docker/containerd noise).
+run_tier "install-learn"      "test/install-learn.sh"
 # Tier 3 — local pre-merge (skips itself on non-privileged hosts).
 run_tier "local-integration"  "test/local-integration.sh"
 

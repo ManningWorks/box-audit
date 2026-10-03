@@ -91,6 +91,19 @@ real next-run time) — non-zero exit on any failure. Re-runs only touch
 files that changed, and a customized timer schedule is preserved with a
 warning, never clobbered.
 
+**Fresh installs learn your box.** On a fresh, interactive install (a TTY
+is attached, and you're not in CI), `install.sh` snapshots the box's actual
+state — the listening ports, active timers, and `/etc/cron.d` entries —
+before the verify gate, so the baseline is real from minute one instead of
+the generic seeded defaults. This is the same operation `box-audit --init`
+performs; the installer runs it and reports what it learned. Pass
+`--no-init` to opt out and keep the seeded generic defaults. Upgrades never
+re-learn (your hand-tuned allowlists survive untouched), and CI/container
+installs keep the default behavior exactly. If you installed with `--no-init`
+or on a non-interactive path and see `security.new_port` findings for
+services you deliberately run, run `sudo box-audit --init` (or accept a
+single port with `sudo box-audit --accept-port N`).
+
 Dependencies: `sudo apt install -y needrestart fail2ban python3`
 (docker only if you run containers and want the health check). Install
 them before or after — the audit degrades those checks gracefully and

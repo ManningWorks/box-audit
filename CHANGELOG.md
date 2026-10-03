@@ -5,6 +5,43 @@ All notable changes to box-audit are documented here. The format follows
 grouped by kind, not by PR, and are written for the person deciding
 whether to upgrade.
 
+## [0.10.0] - 2026-10-03
+
+### Added
+
+- **Install-time baseline learning** — a fresh, interactive install (TTY
+  attached, not `--ci`, not `--no-init`) now snapshots the box's actual
+  state before the verify gate, so the baseline is real from minute one
+  instead of the generic seeded defaults that flagged every
+  legitimately-running service (`syncthing`, `tailscaled`, a dev server)
+  as `security.new_port` every morning. The installer invokes the
+  installed script's own `--init` (single source of truth — no
+  reimplementation) and reports what it learned (ports, timers, cron.d
+  entries) in the install summary. `--no-init` opts out; upgrades never
+  re-learn (no stock-config heuristic); CI/container installs keep today's
+  behavior exactly. A `--learn` force flag exists solely as the
+  deterministic test seam (docker exec carries no TTY).
+- **Self-documenting findings** — every baseline-dependent finding now
+  appends one remedy line naming the exact resolving command and `--init`
+  as the re-learn escape: `new_port` → `--accept-port N`, unexpected timer
+  → `--accept-timer NAME`, unexpected cron.d entry → `--accept-cron-d
+  NAME`, outbound threshold → `--outbound-threshold N`, SUID threshold →
+  `--suid-threshold N`. The text rides the existing `message` field (JSON
+  `findings[].message` / the text report's line), so the cron consumer is
+  untouched.
+- **`--accept-cron-d NAME` and `--suid-threshold N`** — the two manage
+  commands the remedy lines reference, closing the loop so every
+  self-documenting finding names a command that actually exists. Both
+  follow the existing manage-flag shape (root-gated, arg validated first,
+  idempotent append / single-integer write).
+
+### Notes
+
+- `security.outbound_remote_count` and `security.outbound_remote_count_v6`
+  share the outbound threshold knob and both carry the remedy. The
+  `outbound_delta` and `suid_delta` findings are delta-mode (today vs
+  yesterday), not baseline-dependent, and are intentionally unchanged.
+
 ## [0.9.2] - 2026-09-28
 
 ### Added
