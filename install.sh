@@ -465,11 +465,28 @@ if [[ $IS_FRESH_INSTALL -eq 1 ]]; then
             '30' \
             > /var/lib/box-audit/suid-threshold.conf
     fi
+    # Accept-reasons sidecar (issue #78). Seeded empty (a comment header only,
+    # no reason records) so the file exists with the right perm from a fresh
+    # install — reasons accumulate only when an operator accepts a value with
+    # --reason. install.sh never writes records here; it only pre-creates the
+    # file. Unlike the five allowlists/thresholds above, --init deliberately
+    # does NOT read or write this file: preservation across a --init rewrite
+    # is structural (the init path never knows the sidecar exists), not logic.
+    if [[ ! -f /var/lib/box-audit/accept-reasons.txt ]]; then
+        printf '%s\n' \
+            '# Why each accepted value was accepted (issue #78).' \
+            '# One record per line: <allowlist> <value> <YYYY-MM-DD> <reason>.' \
+            '# Written by: sudo box-audit --accept-<port|timer|cron-d> <value> --reason TEXT.' \
+            '# Read with: sudo box-audit --show-reasons (marks (stale) records).' \
+            '# --init never reads or writes this file — annotations survive re-init.' \
+            > /var/lib/box-audit/accept-reasons.txt
+    fi
     chmod 0644 /var/lib/box-audit/ports-allowlist.txt \
               /var/lib/box-audit/timers-baseline.txt \
               /var/lib/box-audit/outbound-threshold.conf \
               /var/lib/box-audit/cron-d-allowlist.txt \
-              /var/lib/box-audit/suid-threshold.conf
+              /var/lib/box-audit/suid-threshold.conf \
+              /var/lib/box-audit/accept-reasons.txt
 fi
 
 # 1d. Install-time baseline learning (issue #71). Fires ONLY on a fresh

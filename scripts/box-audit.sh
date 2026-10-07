@@ -146,6 +146,11 @@ Usage: $(/usr/bin/basename "$0") [OPTIONS]
   --accept-port N              Append port N to ports-allowlist.txt.
   --accept-timer NAME          Append timer NAME to timers-baseline.txt.
   --accept-cron-d NAME         Append cron.d entry NAME to cron-d-allowlist.txt.
+  --reason TEXT                Record WHY, alongside any accept flag above.
+                               Lands in accept-reasons.txt (never read or
+                               written by --init). Re-accepting the same value
+                               with a new reason replaces the old record.
+                               Alone (no accept flag) is a usage error.
   --outbound-threshold N       Write outbound-threshold.conf (single integer).
   --suid-threshold N           Write suid-threshold.conf (single integer).
 
@@ -161,6 +166,10 @@ Usage: $(/usr/bin/basename "$0") [OPTIONS]
                                boxaudit gid, and which of the invoking
                                user's own long-running processes lack it?
                                Read-only; never restarts anything.
+  --show-reasons               Dump the accept-reasons.txt sidecar, marking
+                               records whose value is no longer in its
+                               allowlist with (stale). Read-only; it prints,
+                               it never edits the sidecar.
 
 Exit codes: 0 = all clear (or manage-op success), 1 = findings present,
              2 = bad CLI flag, 75 = lock file unopenable (read-only lock
@@ -184,6 +193,15 @@ EOF
                 --accept-cron-d)
                     [[ $# -ge 2 ]] || { echo "box-audit: --accept-cron-d requires a name" >&2; exit 2; }
                     MANAGE_MODE="accept-cron-d"; MANAGE_ARG="$2"; shift 2 ;;
+                --reason)
+                    # Rides an accept flag (issue #78): records WHY a value was
+                    # accepted in the accept-reasons.txt sidecar. Validated
+                    # against an accept flag after the full parse (below) — at
+                    # this point we only capture the text; "with an accept
+                    # flag" can't be decided until the whole arg list is known.
+                    # Free text, single-line (newlines stripped in reason_upsert).
+                    [[ $# -ge 2 ]] || { echo "box-audit: --reason requires a reason text" >&2; exit 2; }
+                    REASON_TEXT="$2"; REASON_SET=1; shift 2 ;;
                 --outbound-threshold)
                             [[ $# -ge 2 ]] || { echo "box-audit: --outbound-threshold requires an integer" >&2; exit 2; }
                             MANAGE_MODE="outbound-threshold"; MANAGE_ARG="$2"; shift 2 ;;
@@ -231,9 +249,32 @@ EOF
                     # way ("stale" is a finding, not a failure). One line in
                     # the parser, one dispatch block near --tail/--diff.
                     CHECK_GROUPS_MODE=1; shift ;;
+                --show-reasons)
+                    # Issue #78: read-only dump of the accept-reasons.txt
+                    # sidecar, annotating records whose value is no longer in
+                    # its allowlist with "(stale)". Observe-never-remediate —
+                    # it prints, it never edits the sidecar (deleting a stale
+                    # record stays a human decision). Exits 0 either way.
+                    SHOW_REASONS_MODE=1; shift ;;
                 *) /usr/bin/echo "Unknown arg: $1 (try --help)" >&2; exit 2 ;;
             esac
         done
+        # --reason is only valid riding an accept flag (issue #78). At parse
+        # time it captured the text; the "with an accept flag" half can only be
+        # decided once the whole arg list is parsed. Loud failure (exit 2),
+        # same posture as the accept-flag arg validation — a script/CI caller
+        # that passes --reason without an accept flag must see it, not have it
+        # silently recorded nowhere. An unset MANAGE_MODE (bare --reason) falls
+        # through to the reject branch too.
+        if [[ -n "${REASON_SET:-}" ]]; then
+            case "${MANAGE_MODE:-}" in
+                accept-port|accept-timer|accept-cron-d) : ;;
+                *)
+                    echo "box-audit: --reason requires an accept flag (--accept-port / --accept-timer / --accept-cron-d)" >&2
+                    exit 2
+                    ;;
+            esac
+        fi
 
         # --- Per-box config lookups -----------------------------------------------
         # /var/lib/box-audit/ holds per-box state: ports-allowlist.txt,
@@ -252,12 +293,24 @@ EOF
         OUTBOUND_FILE="$CONFIG_DIR/outbound-threshold.conf"
         CRON_D_ALLOWLIST_FILE="$CONFIG_DIR/cron-d-allowlist.txt"
         SUID_THRESHOLD_FILE="$CONFIG_DIR/suid-threshold.conf"
+        # Accept-reason sidecar (issue #78). One record per line,
+        # "<allowlist-filename> <value> <YYYY-MM-DD> <free text to EOL>",
+        # e.g. "ports-allowlist.txt 8080 2026-10-06 dev server on loopback".
+        # Written by the accept arms when --reason is given; read by
+        # --show-reasons. The init) arm deliberately does NOT read or write
+        # this file — preservation across --init is structural, not logic —
+        # and it is therefore left OUT of config_hashes below (which fingerprints
+        # exactly the five files --init rewrites, no more).
+        REASONS_FILE="$CONFIG_DIR/accept-reasons.txt"
         # Content fingerprints of the five config files, one digest per line
         # in a fixed order, 'missing' for a file that does not exist. --init
         # hashes the set before and after its rewrite: identical outputs mean
         # every file already held exactly what --init would have written, so
         # the run was a no-op and can say so. String-based (not mtime) so an
-        # identical re-seed never reads as a change.
+        # identical re-seed never reads as a change. REASONS_FILE is NOT
+        # fingerprinted: it is the one per-box config the init) arm never
+        # touches, so folding it in would couple the no-op report to a file
+        # init has no business rewriting.
         config_hashes() {
             local f
             for f in "$PORTS_FILE" "$TIMERS_FILE" "$OUTBOUND_FILE" \
@@ -336,6 +389,75 @@ EOF
             fi
             note_default_used
             echo "30"
+        }
+        # reason_upsert <allowlist-basename> <value> <reason> (issue #78) —
+        # write ONE current reason record for a (allowlist, value) pair into
+        # the accept-reasons.txt sidecar. Re-accepting the same value with a
+        # new reason REPLACES the existing record (one current reason per
+        # accepted value); records for other (allowlist, value) pairs are
+        # left untouched. The free text is collapsed to a single line so the
+        # record stays "<allowlist> <value> <YYYY-MM-DD> <text to EOL>".
+        #
+        # The record's first two fields are matched field-anchored (awk
+        # $1/$2), never substring — the same token-match discipline as
+        # gid_is_in_groups: value 80 must not clobber a record for 8080, and
+        # a timer named "a.timer" must not clobber "a.timer.timer". Values
+        # carry no spaces (accept-timer/cron-d reject [[:space:]/]; the port
+        # is an integer), so the two fields are unambiguous.
+        reason_upsert() {
+            local allowlist_file="$1" value="$2" reason="$3"
+            # Collapse the reason to a clean single line (newlines/tabs to
+            # spaces, runs of whitespace to one space, trimmed) so the record
+            # format holds: one record per line, free text to EOL.
+            reason="$(/usr/bin/printf '%s' "$reason" | /usr/bin/tr '\n\r\t' '   ' \
+                | /usr/bin/sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+            local date record
+            date="$(/usr/bin/date +%Y-%m-%d)"
+            record="$allowlist_file $value $date $reason"
+            if [[ -f "$REASONS_FILE" ]]; then
+                local kept
+                kept="$(/usr/bin/awk -v a="$allowlist_file" -v v="$value" \
+                    '!(NF>=2 && $1==a && $2==v)' "$REASONS_FILE")"
+                if [[ -n "$kept" ]]; then
+                    /usr/bin/printf '%s\n%s\n' "$kept" "$record" > "$REASONS_FILE"
+                else
+                    /usr/bin/printf '%s\n' "$record" > "$REASONS_FILE"
+                fi
+            else
+                /usr/bin/printf '%s\n' "$record" > "$REASONS_FILE"
+            fi
+        }
+        # show_reasons — read-only dump of the accept-reason sidecar (issue #78).
+        # Prints each record; a record whose value is no longer a whole line in
+        # its allowlist (grep -qxF) is annotated "(stale)". Observe-never-
+        # remediate: it prints, it never edits the sidecar — deleting a stale
+        # record stays a human decision. A missing sidecar is a successful empty
+        # answer (exit 0), same posture as --tail with no history.
+        show_reasons() {
+            if [[ ! -r "$REASONS_FILE" ]]; then
+                echo "box-audit: no accept-reasons sidecar at $REASONS_FILE (record a reason with: --accept-<port|timer|cron-d> <value> --reason '...')"
+                return 0
+            fi
+            local allowlist value rest fpath stale
+            while read -r allowlist value rest; do
+                [[ -z "${allowlist:-}" ]] && continue
+                case "$allowlist" in
+                    ports-allowlist.txt)  fpath="$PORTS_FILE" ;;
+                    timers-baseline.txt)  fpath="$TIMERS_FILE" ;;
+                    cron-d-allowlist.txt) fpath="$CRON_D_ALLOWLIST_FILE" ;;
+                    *) fpath="" ;;
+                esac
+                stale=""
+                if [[ -z "$fpath" ]]; then
+                    stale="(stale)"
+                elif [[ ! -f "$fpath" ]]; then
+                    stale="(stale)"
+                elif ! /usr/bin/grep -qxF "$value" "$fpath" 2>/dev/null; then
+                    stale="(stale)"
+                fi
+                echo "$allowlist $value $rest${stale:+ $stale}"
+            done < "$REASONS_FILE"
+            return 0
         }
         main_manage() {
             # Validate the argument FIRST so a bad value is reported regardless of
@@ -423,6 +545,13 @@ for row in json.load(sys.stdin):
                     /usr/bin/grep -qxF "$MANAGE_ARG" "$PORTS_FILE" 2>/dev/null \
                         || /usr/bin/printf '%s\n' "$MANAGE_ARG" >> "$PORTS_FILE"
                     echo "box-audit: added port $MANAGE_ARG to $PORTS_FILE"
+                    # issue #78: when --reason rode, record why (sidecar upsert,
+                    # keyed on the same value token the allowlist holds). Absent
+                    # --reason, nothing is written — behavior identical to today.
+                    if [[ -n "${REASON_SET:-}" ]]; then
+                        reason_upsert "ports-allowlist.txt" "$MANAGE_ARG" "$REASON_TEXT"
+                        echo "box-audit: recorded reason for port $MANAGE_ARG in $REASONS_FILE"
+                    fi
                     ;;
                 accept-timer)
                     local tname="${MANAGE_ARG%.timer}"
@@ -430,6 +559,13 @@ for row in json.load(sys.stdin):
                     /usr/bin/grep -qxF "${tname}.timer" "$TIMERS_FILE" 2>/dev/null \
                         || /usr/bin/printf '%s.timer\n' "$tname" >> "$TIMERS_FILE"
                     echo "box-audit: added timer ${tname}.timer to $TIMERS_FILE"
+                    # issue #78: the sidecar value matches the allowlist's own
+                    # value grammar (<name>.timer), so --show-reasons' stale
+                    # check (grep -qxF) lines up.
+                    if [[ -n "${REASON_SET:-}" ]]; then
+                        reason_upsert "timers-baseline.txt" "${tname}.timer" "$REASON_TEXT"
+                        echo "box-audit: recorded reason for timer ${tname}.timer in $REASONS_FILE"
+                    fi
                     ;;
                 accept-cron-d)
                     # One name per line (the entry filename, no .cron.d/
@@ -440,6 +576,12 @@ for row in json.load(sys.stdin):
                     /usr/bin/grep -qxF "$MANAGE_ARG" "$CRON_D_ALLOWLIST_FILE" 2>/dev/null \
                         || /usr/bin/printf '%s\n' "$MANAGE_ARG" >> "$CRON_D_ALLOWLIST_FILE"
                     echo "box-audit: added cron.d entry $MANAGE_ARG to $CRON_D_ALLOWLIST_FILE"
+                    # issue #78: record why, keyed on the cron.d name (the same
+                    # value token the allowlist holds).
+                    if [[ -n "${REASON_SET:-}" ]]; then
+                        reason_upsert "cron-d-allowlist.txt" "$MANAGE_ARG" "$REASON_TEXT"
+                        echo "box-audit: recorded reason for cron.d entry $MANAGE_ARG in $REASONS_FILE"
+                    fi
                     ;;
                 outbound-threshold)
                     /usr/bin/printf '%s\n' "$MANAGE_ARG" > "$OUTBOUND_FILE"
@@ -712,6 +854,14 @@ except Exception:
 
         if [[ -n "${CHECK_GROUPS_MODE:-}" ]]; then
             check_stale_groups
+            exit $?
+        fi
+
+        # --show-reasons is a read-only sidecar dump (issue #78); same
+        # dispatch path as the other read-only probes. Defined above with the
+        # per-box config helpers it reads; dispatch here before the audit runs.
+        if [[ -n "${SHOW_REASONS_MODE:-}" ]]; then
+            show_reasons
             exit $?
         fi
 

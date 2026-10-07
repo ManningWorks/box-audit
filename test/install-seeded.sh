@@ -803,6 +803,73 @@ if [[ "$CRON_BAD_OUT" != *"no spaces or slashes"* ]]; then
 fi
 echo "test/install-seeded.sh: --accept-cron-d rejects path-like input"
 
-echo "test/install-seeded.sh: manage-flag functional coverage PASSED (--suid-threshold / --accept-cron-d)"
+# --- issue #78: --reason sidecar survives a real --init (the load-bearing test) ----
+# The sidecar (accept-reasons.txt) is the ONE per-box config the init) arm must
+# never touch. Preservation is structural — init does not know the file exists —
+# so the proof must be against a REAL overwrite, not a mock. Two assertions:
+#
+#   1. SURVIVAL: accept a port with a reason, run --init (which regenerates
+#      ports-allowlist.txt from live state via `>`), and assert the sidecar is
+#      BYTE-IDENTICAL (sha256 equal) across the overwrite. This is the test
+#      that would have caught the original false "survives --init" claim.
+#   2. TEETH (negative variant, per AGENTS.md): prove the --init really
+#      OVERWROTE the allowlist — the accepted-but-not-listening port must be
+#      GONE from the regenerated ports-allowlist.txt. Without this the survival
+#      assertion could pass vacuously (init no-op'ing instead of rewriting), so
+#      the survival is only meaningful against a confirmed rewrite.
+#
+# The accepted port (47777) is deliberately NOT a listening port, so --init's
+# live-state regeneration drops it from the allowlist — which also makes the
+# sidecar record STALE, doubling as the (stale)-annotation proof below.
+RSN_SIDE="/var/lib/box-audit/accept-reasons.txt"
+RSN_PORT=47777
+# Start from a clean sidecar so the before/after hashes are this block's own.
+privileged_exec /bin/bash -c "rm -f $RSN_SIDE" >/dev/null
+ACCEPT_REASON_OUT="$(privileged_exec /usr/local/bin/box-audit --accept-port $RSN_PORT --reason 'tier-2 load-bearing: must survive --init')"
+if [[ "$ACCEPT_REASON_OUT" != *"added port $RSN_PORT"* || "$ACCEPT_REASON_OUT" != *"recorded reason for port $RSN_PORT"* ]]; then
+    echo "test/install-seeded.sh: FAIL — --accept-port --reason did not report both the append and the reason record: $ACCEPT_REASON_OUT" >&2
+    exit 1
+fi
+if ! privileged_exec grep -q "ports-allowlist.txt $RSN_PORT " "$RSN_SIDE"; then
+    echo "test/install-seeded.sh: FAIL — accept-reasons.txt lacks the $RSN_PORT record after accept-with-reason" >&2
+    privileged_exec cat "$RSN_SIDE" >&2 || true
+    exit 1
+fi
+BEFORE_HASH="$(privileged_exec /bin/bash -c "sha256sum $RSN_SIDE | awk '{print \$1}'")"
+# Run the real overwrite: --init regenerates the allowlists from live state.
+privileged_exec /usr/local/bin/box-audit --init >/dev/null 2>&1 || {
+    echo "test/install-seeded.sh: FAIL — --init (reason-survival run) exited non-zero" >&2
+    exit 1
+}
+AFTER_HASH="$(privileged_exec /bin/bash -c "sha256sum $RSN_SIDE | awk '{print \$1}'")"
+if [[ -z "$BEFORE_HASH" || "$BEFORE_HASH" != "$AFTER_HASH" ]]; then
+    echo "test/install-seeded.sh: FAIL — accept-reasons sidecar CHANGED across a real --init (before=$BEFORE_HASH after=$AFTER_HASH). --init must never read or write the sidecar." >&2
+    privileged_exec cat "$RSN_SIDE" >&2 || true
+    exit 1
+fi
+echo "test/install-seeded.sh: accept-reasons sidecar is byte-identical across a real --init (survival)"
+# TEETH: confirm --init actually overwrote the allowlist — the not-listening
+# accepted port must have been dropped from the regenerated ports-allowlist.txt.
+# If this port were still present, the survival above could be a vacuous no-op
+# rather than survival-across-overwrite, so this is the gate's teeth.
+if privileged_exec grep -qxF "$RSN_PORT" /var/lib/box-audit/ports-allowlist.txt; then
+    echo "test/install-seeded.sh: FAIL — $RSN_PORT still in ports-allowlist.txt after --init; the overwrite did not regenerate from live state (survival assertion would be vacuous)" >&2
+    exit 1
+fi
+echo "test/install-seeded.sh: --init regenerated the allowlist and dropped the non-listening accepted port (survival is against a real overwrite)"
+# (stale) annotation: with $RSN_PORT dropped from the allowlist, --show-reasons
+# must flag its record as stale. Read-only; exits 0 either way.
+SHOW_REASONS_OUT="$(privileged_exec /usr/local/bin/box-audit --show-reasons)"
+if [[ "$SHOW_REASONS_OUT" != *"ports-allowlist.txt $RSN_PORT "* || "$SHOW_REASONS_OUT" != *"(stale)"* ]]; then
+    echo "test/install-seeded.sh: FAIL — --show-reasons did not mark the dropped $RSN_PORT record (stale): $SHOW_REASONS_OUT" >&2
+    exit 1
+fi
+if [[ "$SHOW_REASONS_OUT" != *"must survive --init"* ]]; then
+    echo "test/install-seeded.sh: FAIL — --show-reasons dropped the reason text: $SHOW_REASONS_OUT" >&2
+    exit 1
+fi
+echo "test/install-seeded.sh: --show-reasons marks the dropped record (stale) and preserves the reason text"
+
+echo "test/install-seeded.sh: manage-flag functional coverage PASSED (--suid-threshold / --accept-cron-d / --reason)"
 
 echo "test/install-seeded.sh: seeded-container integration PASSED"

@@ -5,6 +5,46 @@ All notable changes to box-audit are documented here. The format follows
 grouped by kind, not by PR, and are written for the person deciding
 whether to upgrade.
 
+## [0.11.0] - 2026-10-07
+
+### Added
+
+- **`--reason TEXT` for the accept flags** — when an operator accepts a
+  finding (`--accept-port 8080 --reason "dev server on loopback"`,
+  `--accept-timer NAME --reason …`, `--accept-cron-d NAME --reason …`), the
+  reason now lands in a dedicated sidecar,
+  `/var/lib/box-audit/accept-reasons.txt`, keyed to the accepted value — so
+  six months later the *why* is still on disk and the next operator doesn't
+  re-investigate a decision that's already been made. The sidecar is
+  **never read or written by `--init`** (that is the load-bearing property):
+  `--init` still regenerates the three allowlists by full overwrite from
+  live state, so annotations survive a re-init *by construction*, not by
+  merge logic that could silently re-accept stale history. Re-accepting the
+  same value with a new reason replaces the existing record (one current
+  reason per accepted value); accepting without `--reason` leaves any
+  existing record untouched, so the current workflow is unchanged. A `--reason`
+  passed without an accept flag is a loud usage error (exit 2) so a script
+  or CI caller can't pass it and have it silently recorded nowhere. The sidecar
+  record is one line each: `<allowlist> <value> <YYYY-MM-DD> <free text to EOL>`
+  (issue #78).
+- **`--show-reasons`** — a read-only diagnostic that dumps the accept-reason
+  sidecar, annotating records whose value is no longer a whole line in its
+  allowlist with `(stale)`. Observe-never-remediate: it prints, it never edits
+  the sidecar — deleting a stale record stays a human decision (the
+  `--check-groups` precedent). A missing sidecar is a successful empty answer
+  (exit 0).
+
+### Notes
+
+- The accept-reason sidecar is a new per-box config file, so it moves through
+  the repo's three-site per-box checklist: the `REASONS_FILE` variable in
+  `scripts/box-audit.sh` (next to `PORTS_FILE`/etc., and deliberately left OUT
+  of `config_hashes()` so the `--init` no-op report isn't coupled to a file
+  init never rewrites), the `install.sh` seeding block (seeded empty — a
+  comment header only — since reasons accumulate only on accept), and the
+  trailing `chmod 0644` list in `install.sh`. `README.md` documentation of the
+  new flags is intentionally out of scope here.
+
 ## [0.10.1] - 2026-10-03
 
 ### Fixed

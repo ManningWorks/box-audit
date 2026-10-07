@@ -159,6 +159,43 @@ if [[ "$VERSION_OUT" != *"+replay"* ]]; then
 fi
 phase_ok "audit" "$AUDIT_START"
 
+# --- phase: --show-reasons installed-binary contract (issue #78) --------------
+# Tier 3's surface is the INSTALLED binary (/usr/local/bin/box-audit), so this
+# is where the new read-only diagnostic is exercised on that same surface:
+# accept a value with a reason, --show-reasons prints it, and after the value
+# is removed from its allowlist the record is annotated (stale). The value
+# (port 49999) is not a listening port, so removing it from the allowlist is a
+# plain line edit (not an --init); the (stale) path is the one the operator
+# hits after pruning a now-dead acceptance. Read-only: --show-reasons must not
+# modify the sidecar (its sha is asserted stable across two runs).
+RSN_START=$(date +%s)
+phase_start "show-reasons"
+RSN_SIDE="/var/lib/box-audit/accept-reasons.txt"
+privileged_exec /bin/bash -c "rm -f $RSN_SIDE" >/dev/null
+if ! privileged_exec /usr/local/bin/box-audit --accept-port 49999 --reason 'tier-3 installed-binary contract'; then
+    phase_fail "show-reasons" "$RSN_START" "--accept-port --reason (installed binary) exited non-zero"
+fi
+SR_OUT="$(privileged_exec /usr/local/bin/box-audit --show-reasons)"
+if [[ "$SR_OUT" != *"ports-allowlist.txt 49999 "* || "$SR_OUT" != *"tier-3 installed-binary contract"* ]]; then
+    phase_fail "show-reasons" "$RSN_START" "--show-reasons did not print the recorded reason: $SR_OUT"
+fi
+# Read-only proof: two runs are byte-identical and the sidecar is untouched.
+SR_HASH_BEFORE="$(privileged_exec /bin/bash -c "sha256sum $RSN_SIDE | awk '{print \$1}'")"
+privileged_exec /usr/local/bin/box-audit --show-reasons >/dev/null
+SR_HASH_AFTER="$(privileged_exec /bin/bash -c "sha256sum $RSN_SIDE | awk '{print \$1}'")"
+if [[ "$SR_HASH_BEFORE" != "$SR_HASH_AFTER" ]]; then
+    phase_fail "show-reasons" "$RSN_START" "--show-reasons modified the sidecar (must be read-only)"
+fi
+# (stale): remove the accepted value from its allowlist; the record must now
+# carry (stale). 49999 was accepted (in the allowlist), so this edit models an
+# operator pruning a no-longer-needed acceptance.
+privileged_exec /bin/bash -c "sed -i '/^49999$/d' /var/lib/box-audit/ports-allowlist.txt"
+SR_STALE_OUT="$(privileged_exec /usr/local/bin/box-audit --show-reasons)"
+if [[ "$SR_STALE_OUT" != *"ports-allowlist.txt 49999 "* || "$SR_STALE_OUT" != *"(stale)"* ]]; then
+    phase_fail "show-reasons" "$RSN_START" "--show-reasons did not mark the removed value (stale): $SR_STALE_OUT"
+fi
+phase_ok "show-reasons" "$RSN_START"
+
 # --- phase: stale-group warning (issue #31) ---------------------------------
 # The install adds the invoking user to the boxaudit group; every process
 # that user started beforehand keeps its old group list until restart.
