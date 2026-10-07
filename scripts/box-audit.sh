@@ -440,7 +440,12 @@ EOF
             fi
             local allowlist value rest fpath stale
             while read -r allowlist value rest; do
-                [[ -z "${allowlist:-}" ]] && continue
+                # Skip blank lines and the # doc-header lines install.sh seeds
+                # into the sidecar on a fresh box: a record's first field is an
+                # allowlist filename (never #), so a #-prefixed line is a
+                # comment, not a record, and printing it as "(stale)" produces
+                # phantom stale records (PR #79 MEDIUM follow-up).
+                [[ -z "${allowlist:-}" || "${allowlist:0:1}" == "#" ]] && continue
                 case "$allowlist" in
                     ports-allowlist.txt)  fpath="$PORTS_FILE" ;;
                     timers-baseline.txt)  fpath="$TIMERS_FILE" ;;

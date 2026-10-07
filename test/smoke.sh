@@ -155,6 +155,31 @@ elif [[ $EUID -ne 0 ]]; then
         REASON_SKIP="no root and no passwordless sudo"
     fi
 fi
+# --- freshly-seeded (comment-only) sidecar: --show-reasons phantom-stale ----
+# Regression for the PR #79 MEDIUM finding. install.sh seeds
+# /var/lib/box-audit/accept-reasons.txt with FIVE # doc-header lines on every
+# fresh box (no records yet). --show-reasons must print NONE of them and zero
+# (stale) markers — the comment-only state is exactly what a freshly installed
+# box has, and it was the untested surface every other tier rm -f's away,
+# which is how the phantom-record bug got through. Gated identically to the
+# write-path block below (CONFIG_DIR is the hardcoded /var/lib/box-audit, so
+# seeding it needs root or passwordless sudo); the dir is removed again so the
+# write-path block below starts from the same fresh state as before.
+if [[ -n "$REASON_SKIP" ]]; then
+    ok "--show-reasons fresh-seed (comment-only) check skipped: $REASON_SKIP"
+else
+    SEED_PREFIX=()
+    [[ $EUID -ne 0 ]] && SEED_PREFIX=(sudo)
+    "${SEED_PREFIX[@]}" /bin/mkdir -p /var/lib/box-audit
+    "${SEED_PREFIX[@]}" /bin/sh -c 'printf "%s\n" "# Why each accepted value was accepted (issue #78)." "# One record per line: <allowlist> <value> <YYYY-MM-DD> <reason>." "# Written by: sudo box-audit --accept-<port|timer|cron-d> <value> --reason TEXT." "# Read with: sudo box-audit --show-reasons (marks (stale) records)." "# --init never reads or writes this file — annotations survive re-init." > /var/lib/box-audit/accept-reasons.txt'
+    SEED_OUT="$( "${SEED_PREFIX[@]}" bash "$SCRIPT" --show-reasons 2>/dev/null )"
+    if [[ -z "$SEED_OUT" ]]; then
+        ok "--show-reasons on a freshly-seeded (comment-only) sidecar prints nothing (zero phantom (stale) records)"
+    else
+        fail "--show-reasons on a comment-only sidecar leaked doc-header lines (want empty): $SEED_OUT"
+    fi
+    "${SEED_PREFIX[@]}" rm -rf /var/lib/box-audit
+fi
 if [[ -n "$REASON_SKIP" ]]; then
     ok "--reason accept write path skipped: $REASON_SKIP (tier 2 covers the load-bearing survival)"
 else
