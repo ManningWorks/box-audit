@@ -118,6 +118,115 @@ else
     "${INIT_PREFIX[@]}" rm -rf /var/lib/box-audit
 fi
 
+# --- --reason / --show-reasons (issue #78) ----------------------------------
+# Two parts. The non-root-safe assertions run on EVERY box (CI-safe): a bare
+# --reason is a usage error (exit 2, before the root gate), a missing sidecar
+# is a clean empty answer, and help documents the new flags. The root-gated
+# write-path assertions (accept-with-reason writes the sidecar, re-accept
+# upserts, accept-without-reason preserves) mirror the --init idempotency
+# block's root/skip gating above — CONFIG_DIR is the hardcoded
+# /var/lib/box-audit, so the write path needs root; the load-bearing
+# --init-survival teeth live in tier 2 (test/install-seeded.sh), which runs
+# as root inside the container.
+check "--reason without an accept flag exits 2" '^2$' bash "$SCRIPT" --reason "orphan reason"
+if [[ "$ERR" == *"requires an accept flag"* ]]; then
+    ok "--reason without an accept flag names the requirement on stderr"
+else
+    fail "--reason-without-accept stderr missing the requirement (got: $ERR)"
+fi
+check "--show-reasons on a missing sidecar exits 0" '^0$' bash "$SCRIPT" --show-reasons
+if [[ "$OUT" == *"no accept-reasons sidecar"* || -z "$OUT" ]]; then
+    ok "--show-reasons missing sidecar is a clean empty answer (not an error)"
+else
+    fail "--show-reasons missing sidecar not a clean empty answer (got: $OUT)"
+fi
+check "--help documents the new flags" '^0$' bash "$SCRIPT" --help
+if [[ "$OUT" == *"--reason TEXT"* && "$OUT" == *"--show-reasons"* ]]; then
+    ok "--help documents --reason and --show-reasons"
+else
+    fail "--help missing --reason/--show-reasons documentation"
+fi
+# Root-gated write path — same gating as the --init idempotency block above.
+REASON_SKIP=""
+if [[ -e /var/lib/box-audit ]]; then
+    REASON_SKIP="/var/lib/box-audit already exists (live install — not touched)"
+elif [[ $EUID -ne 0 ]]; then
+    if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true >/dev/null 2>&1; then
+        REASON_SKIP="no root and no passwordless sudo"
+    fi
+fi
+# --- freshly-seeded (comment-only) sidecar: --show-reasons phantom-stale ----
+# Regression for the PR #79 MEDIUM finding. install.sh seeds
+# /var/lib/box-audit/accept-reasons.txt with FIVE # doc-header lines on every
+# fresh box (no records yet). --show-reasons must print NONE of them and zero
+# (stale) markers — the comment-only state is exactly what a freshly installed
+# box has, and it was the untested surface every other tier rm -f's away,
+# which is how the phantom-record bug got through. Gated identically to the
+# write-path block below (CONFIG_DIR is the hardcoded /var/lib/box-audit, so
+# seeding it needs root or passwordless sudo); the dir is removed again so the
+# write-path block below starts from the same fresh state as before.
+if [[ -n "$REASON_SKIP" ]]; then
+    ok "--show-reasons fresh-seed (comment-only) check skipped: $REASON_SKIP"
+else
+    SEED_PREFIX=()
+    [[ $EUID -ne 0 ]] && SEED_PREFIX=(sudo)
+    "${SEED_PREFIX[@]}" /bin/mkdir -p /var/lib/box-audit
+    "${SEED_PREFIX[@]}" /bin/sh -c 'printf "%s\n" "# Why each accepted value was accepted (issue #78)." "# One record per line: <allowlist> <value> <YYYY-MM-DD> <reason>." "# Written by: sudo box-audit --accept-<port|timer|cron-d> <value> --reason TEXT." "# Read with: sudo box-audit --show-reasons (marks (stale) records)." "# --init never reads or writes this file — annotations survive re-init." > /var/lib/box-audit/accept-reasons.txt'
+    SEED_OUT="$( "${SEED_PREFIX[@]}" bash "$SCRIPT" --show-reasons 2>/dev/null )"
+    if [[ -z "$SEED_OUT" ]]; then
+        ok "--show-reasons on a freshly-seeded (comment-only) sidecar prints nothing (zero phantom (stale) records)"
+    else
+        fail "--show-reasons on a comment-only sidecar leaked doc-header lines (want empty): $SEED_OUT"
+    fi
+    "${SEED_PREFIX[@]}" rm -rf /var/lib/box-audit
+fi
+if [[ -n "$REASON_SKIP" ]]; then
+    ok "--reason accept write path skipped: $REASON_SKIP (tier 2 covers the load-bearing survival)"
+else
+    REASON_PREFIX=()
+    [[ $EUID -ne 0 ]] && REASON_PREFIX=(sudo)
+    # Ensure the config dir exists (the accept arms create the files inside it
+    # but not the dir itself; the --init block above leaves it absent on a
+    # fresh box). We clean it up again at the end so the suite stays fresh.
+    "${REASON_PREFIX[@]}" /bin/mkdir -p /var/lib/box-audit
+    "${REASON_PREFIX[@]}" /bin/sh -c 'rm -f /var/lib/box-audit/accept-reasons.txt'
+    if check "--accept-port with --reason exits 0" '^0$' "${REASON_PREFIX[@]}" bash "$SCRIPT" --accept-port 39999 --reason "smoke test reason"; then
+        if "${REASON_PREFIX[@]}" grep -qxF "39999" /var/lib/box-audit/ports-allowlist.txt 2>/dev/null \
+           && "${REASON_PREFIX[@]}" grep -q "ports-allowlist.txt 39999" /var/lib/box-audit/accept-reasons.txt 2>/dev/null; then
+            ok "--accept-port --reason wrote the port and its sidecar record"
+        else
+            fail "--accept-port --reason did not write the port/sidecar"
+        fi
+    fi
+    # Re-accept the same value with a new reason: the sidecar must hold ONE
+    # current record (upsert), not a duplicate.
+    "${REASON_PREFIX[@]}" bash "$SCRIPT" --accept-port 39999 --reason "updated reason" >/dev/null 2>&1
+    DUP_COUNT="$("${REASON_PREFIX[@]}" grep -c "ports-allowlist.txt 39999 " /var/lib/box-audit/accept-reasons.txt 2>/dev/null || true)"
+    if [[ "$DUP_COUNT" == "1" ]]; then
+        ok "re-accept with --reason upserts (one current record per accepted value)"
+    else
+        fail "re-accept with --reason produced $DUP_COUNT records for 39999 (want 1 — upsert broke)"
+    fi
+    # Accept another value WITHOUT --reason: it must not create a sidecar
+    # record for itself, and the existing record must survive untouched.
+    BEFORE_HASH="$("${REASON_PREFIX[@]}" sha256sum /var/lib/box-audit/accept-reasons.txt 2>/dev/null | awk '{print $1}')"
+    "${REASON_PREFIX[@]}" bash "$SCRIPT" --accept-port 39998 >/dev/null 2>&1
+    AFTER_HASH="$("${REASON_PREFIX[@]}" sha256sum /var/lib/box-audit/accept-reasons.txt 2>/dev/null | awk '{print $1}')"
+    if [[ -n "$BEFORE_HASH" && "$BEFORE_HASH" == "$AFTER_HASH" ]] \
+       && ! "${REASON_PREFIX[@]}" grep -q "ports-allowlist.txt 39998 " /var/lib/box-audit/accept-reasons.txt 2>/dev/null; then
+        ok "accept without --reason leaves an existing sidecar record untouched (no new record)"
+    else
+        fail "accept without --reason altered the sidecar (or created a record for the no-reason value)"
+    fi
+    # --show-reasons prints the recorded reason.
+    if "${REASON_PREFIX[@]}" bash "$SCRIPT" --show-reasons 2>/dev/null | grep -q "ports-allowlist.txt 39999 .{8,} smoke\|updated"; then
+        ok "--show-reasons prints the recorded reason"
+    else
+        fail "--show-reasons did not print the 39999 record"
+    fi
+    "${REASON_PREFIX[@]}" rm -rf /var/lib/box-audit
+fi
+
 # --- --tail: optional arg, must not crash under set -u ----------------------
 check "bare --tail exits 0" '^0$' bash "$SCRIPT" --tail
 if [[ -z "$ERR" ]]; then ok "bare --tail stderr empty"; else fail "bare --tail stderr not empty: $ERR"; fi
