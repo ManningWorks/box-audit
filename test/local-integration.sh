@@ -168,7 +168,7 @@ phase_ok "audit" "$AUDIT_START"
 # plain line edit (not an --init); the (stale) path is the one the operator
 # hits after pruning a now-dead acceptance. Read-only: --show-reasons must not
 # modify the sidecar (its sha is asserted stable across two runs).
-RSN_START=$(date +%s)
+RSN_START=$(date +%s%N)
 phase_start "show-reasons"
 RSN_SIDE="/var/lib/box-audit/accept-reasons.txt"
 privileged_exec /bin/bash -c "rm -f $RSN_SIDE" >/dev/null
