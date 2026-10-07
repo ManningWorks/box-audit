@@ -115,3 +115,14 @@ workers must refuse and point at this section.
 - Install artifacts land `root:boxaudit` group-readable (0640/0750);
   integrity baseline is excluded from that. Don't change perms without
   revisiting the installer's group story.
+
+### Evidence integrity
+
+Assert the original source of evidence, not a re-claim of the
+original. Any verification script, summary writer, or test harness in
+this repo must assert the thing itself — the captured artifact's
+contents, the live variable, the command's actual stdout — never a
+derived copy of it (a snapshot's counts block, a summary's claim, a
+parameter's name). A pass that only proves the harness ran is a
+FAIL. Every new gate gets the negative variant that proves its
+teeth (see Testing convention).
