@@ -1,4 +1,4 @@
-FROM jrei/systemd-ubuntu:26.04
+FROM jrei/systemd-ubuntu:26.10
 
 # Install.sh needs python3 for the verify gate's JSON parse.
 RUN apt-get update && apt-get install -y --no-install-recommends \
